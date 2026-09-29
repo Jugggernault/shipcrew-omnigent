@@ -293,7 +293,7 @@ export function ShipReportPanel({ mission }: { mission: Mission }) {
           {ship.note && <p className="text-xs text-warning">{ship.note}</p>}
           <div className="flex justify-end">{report && <CopyReportButton text={report} />}</div>
           <div
-            className="min-h-0 flex-1 overflow-auto prose prose-sm max-w-none dark:prose-invert"
+            className="min-h-0 flex-1 overflow-auto prose prose-sm max-w-none dark:prose-invert prose-code:before:content-none prose-code:after:content-none"
             data-testid="ship-report"
           >
             {report ? (

@@ -11,6 +11,56 @@ live end-to-end run: 2026-09-29.
 ![Card held for a human merge approval (APPROVALS.md)](board-approval.png)
 ![Drawer with the Approve merge action](drawer-approval.png)
 
+## Round 4 integration: ship + verify/speed together (2026-09-29)
+
+Branch `shipcrew-round3` = `shipcrew` + `shipcrew-ship` + `shipcrew-qaspeed`
+(bundles: `v3-round3` = `v0.2` + `v3-ship` + `v3-qaspeed`). One Alembic head
+(`sc0004sh`; qaspeed added no revision). Conflicts were docs, the planner
+step 6 (verify rules kept, "do not plan a deploy task" kept), the README role
+table and the validator case list (both sets kept: 152 cases per bundle).
+
+Integration fixes: verify roles (qa/security) now store their `Decisions:`
+list too (`VerifyLoop.after_turn`), so the report lists them; the report
+dialog no longer shows typography backticks around inline code; the board
+header wraps its actions instead of squeezing the status chip under the
+command box.
+
+![Ship report on the board after the local end-to-end](report.png)
+![Board after the end-to-end: Shipped chip, 3 cards merged](board-e2e.png)
+
+### Verified live (port 16798, own state dir, fake gh + fake vercel, real Claude)
+
+Tiny CommonJS repo (`node --test`) with a bare `origin`, PRD in
+`.shipcrew/prd.md` (2 features), mission with `auto_run` + `auto_ship`, the
+fake deployment served by `python -m http.server` on 16799
+(`SHIPCREW_SHIP_ALLOW_PRIVATE_URLS=1`, fake-vercel `url` =
+`http://127.0.0.1:16799/`). Nothing reached GitHub or Vercel.
+
+1. `POST /plan`: the planner imported 3 tasks (2 developer + ONE final `qa`
+   verify task with the security items folded in; no devops task) and 4 plan
+   decisions. Auto run queued them.
+2. slugify -> PR #4 (CI green, reviewer approve, merged), titleCase + index
+   (depends on it) -> PR #5 merged, qa verify wrote tests -> PR #6
+   tests-only, review skipped, merged.
+3. The same tick shipped: preflight `vercel whoami`, then the devops session
+   ran `whoami`, `link --yes --project smoke-strings`, `deploy --prod --yes`
+   (no approval card), `DEPLOYED: http://127.0.0.1:16799/`; the server GET
+   the URL (200 in the http log) -> **Shipped** ~20 s after the last merge.
+   Ship worktree and branch removed.
+4. Report: $2.04 total (tasks $1.78, deploy $0.26), wall time 3 min 12 s,
+   task table with PR links, decisions of the plan / each task / the deploy,
+   no findings, no interventions. Plan request to Shipped: ~4 min.
+
+### Known issues (integration)
+
+- The server caches `index.html` at start: after `pnpm --filter web build`
+  the running server serves stale asset names (blank board) until restart.
+- vitest on Node 26 still needs `NODE_OPTIONS=--no-experimental-webstorage`
+  (see Checks): without it 1409 upstream tests fail on `localStorage`.
+- All earlier round 4 gaps stand (auto ship once; devops asks only in the
+  Inbox; verify PR with red CI can only end blocked; no real Vercel or
+  GitHub run of the ship stage yet).
+
 ## Round 4: ship stage, report, decisions (2026-09-29)
 
 ![Board after a ship: status chip with the verified URL, Ship again, Report](board-shipped.png)
@@ -508,6 +558,20 @@ server side is `omnigent/shipcrew/router.py` and the client side is
   454 passed.
 - Bundles: `build_agents.py --check`, `validate_agents.py` from this worktree:
   10 bundles valid, 117 guardrail cases each, MCP set asserted per bundle.
+
+## Checks (round 4 integration, 2026-09-29)
+
+- **Backend:** `ruff check` / `ruff format --check` (omnigent/shipcrew,
+  tests/shipcrew, scripts/shipcrew_fake_*.py); `pyrefly check` (project
+  config) 0 errors; `pytest tests/shipcrew tests/server/test_shipcrew_mount.py
+  tests/policies/test_registry.py tests/server/routes/test_policy_registry.py
+  tests/server/routes/test_sessions_yolo_launch_args.py`: 678 passed;
+  `pre-commit run --files <changed vs shipcrew>` passed.
+- **Web:** `pnpm lint`, `pnpm type-check`, `pnpm build`; `vitest run src/board
+  src/pages src/shell --maxWorkers=4` with
+  `NODE_OPTIONS=--no-experimental-webstorage`: 4150 passed, 2 expected fail.
+- **Bundles:** `build_agents.py --check` fresh; `validate_agents.py` from this
+  checkout: 10 bundles valid, 152 guardrail cases each.
 
 ## Checks (integration, 2026-09-29)
 

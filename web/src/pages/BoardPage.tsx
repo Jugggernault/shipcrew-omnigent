@@ -365,8 +365,8 @@ export function BoardPage() {
         paddingBottom: "var(--omnigent-inset-bottom)",
       }}
     >
-      <header className="flex items-start justify-between gap-4 px-6 pt-5">
-        <div className="min-w-0">
+      <header className="flex flex-wrap items-start justify-between gap-x-4 gap-y-2 px-6 pt-5">
+        <div className="min-w-0 flex-[1_1_20rem]">
           <div className="flex items-center gap-2">
             <h1 className="text-2xl font-semibold">Board</h1>
             {mission && <MissionStatusChip mission={mission} tasks={tasks} />}
@@ -392,7 +392,7 @@ export function BoardPage() {
           {mission && <MissionShipNotice mission={mission} />}
         </div>
         {mission && (
-          <div className="flex shrink-0 flex-wrap items-center justify-end gap-1.5">
+          <div className="flex min-w-0 flex-wrap items-center justify-end gap-1.5">
             <MissionCommandBox onCommand={(text) => command(mission, text)} />
             <RunAllTasksButton
               count={backlogCount}
