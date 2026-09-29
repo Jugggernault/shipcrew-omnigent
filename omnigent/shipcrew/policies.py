@@ -1,6 +1,6 @@
 """Guardrail policies for the shipcrew role bundles.
 
-Three :class:`FunctionPolicy` factories, registered through
+Four :class:`FunctionPolicy` factories, registered through
 :data:`POLICY_REGISTRY` so uploaded bundles may use them:
 
 * :func:`shell_allowlist` -- a per-role shell allowlist. A shell command runs
@@ -16,10 +16,13 @@ Three :class:`FunctionPolicy` factories, registered through
   Reads are never gated. The shipcrew server injects ``root`` and
   ``owned_paths`` into the bundle when it starts a task; without them the
   policy abstains.
+* :func:`test_writes_only` -- verify roles (qa, security) write test files
+  and their report only; any other write is DENY.
 * :func:`push_guard` -- the orchestrator may push only task branches named
   ``shipcrew/<8 hex>-<slug>``, every push segment explicitly.
 
-These policies only return ALLOW or ASK (the push guard also DENY); the
+These policies only return ALLOW or ASK (the push guard and the test-writes
+guard also DENY); the
 catastrophic DENY set stays in omnigent's ``blast_radius`` and the shipcrew CEL
 fragments. Evaluation is most-restrictive-wins across policies.
 """
@@ -103,6 +106,18 @@ DEFAULT_FREE_PATHS: tuple[str, ...] = (
     "/dev/null",
     "/dev/stdout",
     "/dev/stderr",
+)
+
+# Test files a verify role (qa, security) may write. test/, tests/ and e2e/
+# only at the top level: a tests/ folder deep in the app could be imported by it.
+DEFAULT_TEST_GLOBS: tuple[str, ...] = (
+    "test/**",
+    "tests/**",
+    "e2e/**",
+    "**/__tests__/**",
+    "**/__snapshots__/**",
+    "**/*.test.*",
+    "**/*.spec.*",
 )
 
 DEFAULT_BRANCH_PATTERN = r"shipcrew/[0-9a-f]{8}-[a-z0-9]+(?:-[a-z0-9]+)*"
@@ -888,34 +903,149 @@ def owned_paths(
         command = _shell_command(event)
         if command is None:
             return _ALLOW
-        segments = parse_command(command, strict=False)
-        if segments is None:
+        targets = _shell_targets(command, root_abs)
+        if targets is None:
             return _ALLOW  # unanalyzable: shell_allowlist asks for it
-        cwd = root_abs
-        for seg in segments:
-            argv = seg.argv
-            if argv[:1] == ["cd"]:
-                dest = _positionals(argv[1:])
-                if not dest or dest[0] == "-" or "$" in dest[0] or dest[0].startswith("~"):
-                    cwd = None
-                elif posixpath.isabs(dest[0]):
-                    cwd = posixpath.normpath(dest[0])
-                elif cwd is not None:
-                    cwd = posixpath.normpath(posixpath.join(cwd, dest[0]))
-                continue
-            seg_cwd = cwd
-            if argv[:1] == ["git"] and len(argv) > 2 and argv[1] == "-C":
-                base = argv[2]
-                seg_cwd = (
-                    posixpath.normpath(base)
-                    if posixpath.isabs(base)
-                    else (posixpath.normpath(posixpath.join(cwd, base)) if cwd else None)
-                )
-                argv = ["git", *argv[3:]]
-            for target in [*seg.writes, *shell_write_targets(argv)]:
-                why = _check(target, seg_cwd)
-                if why:
-                    return _ask(why)
+        for target, seg_cwd in targets:
+            why = _check(target, seg_cwd)
+            if why:
+                return _ask(why)
+        return _ALLOW
+
+    return _evaluate
+
+
+def _shell_targets(command: str, root: str | None) -> list[tuple[str, str | None]] | None:
+    """``(target, cwd)`` for every file a shell command writes; ``None`` if unanalyzable.
+
+    ``cd`` and ``git -C`` are tracked; *cwd* is ``None`` once it is unknown.
+    """
+    segments = parse_command(command, strict=False)
+    if segments is None:
+        return None
+    out: list[tuple[str, str | None]] = []
+    cwd = root
+    for seg in segments:
+        argv = seg.argv
+        if argv[:1] == ["cd"]:
+            dest = _positionals(argv[1:])
+            if not dest or dest[0] == "-" or "$" in dest[0] or dest[0].startswith("~"):
+                cwd = None
+            elif posixpath.isabs(dest[0]):
+                cwd = posixpath.normpath(dest[0])
+            elif cwd is not None:
+                cwd = posixpath.normpath(posixpath.join(cwd, dest[0]))
+            continue
+        seg_cwd = cwd
+        if argv[:1] == ["git"] and len(argv) > 2 and argv[1] == "-C":
+            base = argv[2]
+            seg_cwd = (
+                posixpath.normpath(base)
+                if posixpath.isabs(base)
+                else (posixpath.normpath(posixpath.join(cwd, base)) if cwd else None)
+            )
+            argv = ["git", *argv[3:]]
+        out += [(t, seg_cwd) for t in [*seg.writes, *shell_write_targets(argv)]]
+    return out
+
+
+def is_test_path(path: str, test_globs: Sequence[str] = DEFAULT_TEST_GLOBS) -> bool:
+    """Whether a repo-relative *path* is a test file (see :data:`DEFAULT_TEST_GLOBS`)."""
+    norm = posixpath.normpath(path.strip().replace("\\", "/")).lstrip("/")
+    return norm not in ("", ".") and _GlobSet(test_globs).match(norm)
+
+
+def test_writes_only(
+    *,
+    role: str = "this role",
+    test_globs: Sequence[str] | None = None,
+    extra_paths: Sequence[str] | None = None,
+    root: str | None = None,
+    free_paths: Sequence[str] | None = None,
+    reason: str | None = None,
+) -> _Evaluator:
+    """Factory: DENY every write that is not a test file (verify roles: qa, security).
+
+    Judged on the write tools and on shell write targets (redirections, ``cp``
+    / ``mv`` / ``rm``, ``git checkout <path>``, formatters, dependency
+    changes). Ownership is not checked here: :func:`owned_paths` still asks
+    for a test file outside the task's owned paths.
+
+    :param role: Role name for the refusal text.
+    :param test_globs: Writable test globs, repo-relative (default
+        :data:`DEFAULT_TEST_GLOBS`).
+    :param extra_paths: Other writable repo-relative globs (the role's report
+        file, e.g. ``.shipcrew/qa.json``).
+    :param root: Absolute task worktree (injected like the owned-paths
+        contract). Unknown: an absolute path is judged by its trailing
+        components (``/any/where/e2e/a.spec.ts`` is a test file).
+    :param free_paths: Always-writable build output and scratch (default
+        :data:`DEFAULT_FREE_PATHS`, which includes ``/tmp``).
+    :returns: An evaluator ``fn(event, config)``; reads always ALLOW.
+    """
+    writable = _GlobSet([*(DEFAULT_TEST_GLOBS if test_globs is None else test_globs),
+                         *(extra_paths or ())])  # fmt: skip
+    free_all = list(DEFAULT_FREE_PATHS if free_paths is None else free_paths)
+    free_rel = _GlobSet(p for p in free_all if not p.startswith("/"))
+    free_abs = _GlobSet(p for p in free_all if p.startswith("/"))
+    root_abs = posixpath.normpath(root) if root else None
+    shown = ", ".join([*(DEFAULT_TEST_GLOBS if test_globs is None else test_globs),
+                       *(extra_paths or ())])  # fmt: skip
+    suffix = f" {reason}" if reason else ""
+
+    def _rel_ok(rel: str) -> bool:
+        if _WILDCARD.search(rel):
+            literal = rel[: _WILDCARD.search(rel).start()]  # type: ignore[union-attr]
+            directory = literal.rsplit("/", 1)[0] if "/" in literal else ""
+            return bool(directory) and (
+                writable.covers_tree(directory) or free_rel.covers_tree(directory)
+            )
+        return free_rel.match(rel) or writable.match(rel)
+
+    def _ok(target: str, cwd: str | None) -> bool:
+        if "$" in target or target.startswith("~"):
+            return False
+        if posixpath.isabs(target):
+            absolute = posixpath.normpath(target)
+        elif cwd is not None:
+            absolute = posixpath.normpath(posixpath.join(cwd, target))
+        else:
+            return _rel_ok(posixpath.normpath(target))
+        if root_abs is not None and (
+            absolute == root_abs or absolute.startswith(root_abs.rstrip("/") + "/")
+        ):
+            return _rel_ok(posixpath.relpath(absolute, root_abs))
+        if free_abs.match(absolute) or (
+            _WILDCARD.search(absolute) and free_abs.covers_tree(posixpath.dirname(absolute))
+        ):
+            return True
+        if root_abs is not None:
+            return False  # outside the worktree
+        parts = absolute.strip("/").split("/")
+        return any(_rel_ok("/".join(parts[i:])) for i in range(1, len(parts)))
+
+    def _deny(target: str) -> _Json:
+        return {
+            "result": "DENY",
+            "reason": f"The {role} writes test files only ({shown}); `{target}` is not one. "
+            "Report the defect with file:line and a repro instead of fixing it: the board "
+            f"turns your findings into a fix task.{suffix}",
+        }
+
+    def _evaluate(event: _Json, config: _Json | None = None) -> _Json:  # noqa: ARG001
+        paths = _write_tool_paths(event)
+        if paths is not None:
+            for path in paths:
+                if not _ok(path, root_abs):
+                    return _deny(path)
+            return _ALLOW
+        command = _shell_command(event)
+        if command is None:
+            return _ALLOW
+        targets = _shell_targets(command, root_abs)
+        for target, cwd in targets or []:
+            if not _ok(target, cwd):
+                return _deny(target)
         return _ALLOW
 
     return _evaluate
@@ -1077,6 +1207,24 @@ POLICY_REGISTRY: list[dict[str, object]] = [
                 "owned_paths": {**_STRING_LIST, "description": "Owned globs (repo-relative)."},
                 "root": {"type": "string", "description": "Absolute task worktree path."},
                 "shared_paths": _STRING_LIST,
+                "free_paths": _STRING_LIST,
+                "reason": {"type": "string"},
+            },
+        },
+    },
+    {
+        "handler": "omnigent.shipcrew.policies.test_writes_only",
+        "kind": "factory",
+        "name": "shipcrew: Test Writes Only",
+        "description": "Verify roles (qa, security) may write test files and their report "
+        "only; every other write is refused.",
+        "params_schema": {
+            "type": "object",
+            "properties": {
+                "role": {"type": "string", "default": "this role"},
+                "test_globs": {**_STRING_LIST, "description": "Writable test globs."},
+                "extra_paths": {**_STRING_LIST, "description": "Other writable globs."},
+                "root": {"type": "string", "description": "Absolute task worktree path."},
                 "free_paths": _STRING_LIST,
                 "reason": {"type": "string"},
             },

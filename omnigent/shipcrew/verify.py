@@ -35,6 +35,7 @@ from collections.abc import Iterable, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from omnigent.shipcrew.policies import DEFAULT_TEST_GLOBS, is_test_path
 from omnigent.shipcrew.store import Task
 
 if TYPE_CHECKING:
@@ -45,45 +46,12 @@ VERIFY_ROLES = frozenset({"qa", "security"})
 MAX_FIX_CYCLES = 2
 FIX_KEY_PREFIX = "fix:"
 VERIFY_HOLD_PREFIX = "verification still failing"
-# Test files a verify task may write (repo-relative). test/, tests/ and e2e/
-# only at the top level: a tests/ folder deep in the app could be imported by it.
-TEST_GLOBS: tuple[str, ...] = (
-    "test/**",
-    "tests/**",
-    "e2e/**",
-    "**/__tests__/**",
-    "**/__snapshots__/**",
-    "**/*.test.*",
-    "**/*.spec.*",
-)
+TEST_GLOBS = DEFAULT_TEST_GLOBS
 # Report files a verify role writes next to its tests.
 REPORT_FILES = {"qa": ".shipcrew/qa.json", "security": ".shipcrew/security.md"}
 _SERIOUS = ("blocker", "major")
 _REPORT_MAX_CHARS = 6000
 _MAX_FINDINGS_SHOWN = 30
-
-
-def _glob_regex(glob: str) -> re.Pattern[str]:
-    out, i = "", 0
-    while i < len(glob):
-        if glob.startswith("**/", i):
-            out, i = out + "(?:.*/)?", i + 3
-        elif glob.startswith("**", i):
-            out, i = out + ".*", i + 2
-        elif glob[i] == "*":
-            out, i = out + "[^/]*", i + 1
-        else:
-            out, i = out + re.escape(glob[i]), i + 1
-    return re.compile(out)
-
-
-_TEST_PATTERNS = tuple(_glob_regex(g) for g in TEST_GLOBS)
-
-
-def is_test_path(path: str) -> bool:
-    """Whether a repo-relative path is a test file a verify task may write."""
-    norm = posixpath.normpath(path.strip().replace("\\", "/")).lstrip("/")
-    return any(p.fullmatch(norm) for p in _TEST_PATTERNS)
 
 
 def verify_writable(role: str, path: str) -> bool:
