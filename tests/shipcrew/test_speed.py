@@ -317,7 +317,7 @@ class TestSeedNodeModules:
 
         repo, wt = _checkout(tmp_path)
         seeded: list[tuple[str, str]] = []
-        monkeypatch.setattr(sessions_mod, "seed_node_modules", lambda r, w: seeded.append((r, w)))
+        monkeypatch.setattr(sessions_mod, "prepare_worktree", lambda r, w: seeded.append((r, w)))
 
         async def fake_worktree(conn: object, request: RootSessionRequest) -> str:
             return str(wt)

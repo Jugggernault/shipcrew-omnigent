@@ -148,8 +148,10 @@ def fix_task_body(
         "## What to do",
         "Reproduce each finding (the repro command is in the finding or the report), fix the "
         "cause, and add a regression test for each one (a unit test that calls the route "
-        "handler or lib function directly, e2e only when a browser is required). Run the whole "
-        "suite in one command before you finish.",
+        "handler or lib function directly, e2e only when a browser is required). Fix the minor "
+        "findings too when that is cheap and inside your files (a missing favicon, a wrong "
+        "label); list any you leave in your Decisions. Run the whole suite in one command "
+        "before you finish.",
     ]
     return "\n".join(lines)
 
@@ -296,7 +298,8 @@ class VerifyLoop:
             role="developer",
             owned_paths=with_own_tests(
                 f"Fix: {task.title}",
-                fix_owned_paths(serious(findings) or findings, test_files, task.owned_paths),
+                # Every finding's file, minor ones too: the fix fixes them when cheap.
+                fix_owned_paths(findings, test_files, task.owned_paths),
             ),
         )
         await self._svc.update_fields(fix.id, plan_key=fix_key(task.id, cycle), status="ready")

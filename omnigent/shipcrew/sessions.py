@@ -27,7 +27,7 @@ from typing import Any, Protocol
 
 import httpx
 
-from omnigent.shipcrew.deps_seed import seed_node_modules
+from omnigent.shipcrew.worktree_prep import prepare_worktree
 
 _logger = logging.getLogger(__name__)
 
@@ -124,6 +124,8 @@ class SessionSnapshot:
     agent_replied: bool = False
     # ``{"policy": ..., "preview": ...}`` of the first open approval prompt.
     pending_ask: dict[str, str] | None = None
+    # Its ``elicitation_id``: one intervention per prompt, however often it is polled.
+    pending_ask_id: str | None = None
 
 
 class SessionService(Protocol):
@@ -372,9 +374,10 @@ class OmnigentSessionService:
         host_id, conn = await self._resolve_host(request.acting_user)
         workspace = request.workspace or await self._task_worktree(conn, request)
         if request.workspace is None:
-            # Skip the agent's dependency install when the main checkout's
+            # Keep tool-written AGENTS.md / CLAUDE.md out of commits, and skip
+            # the agent's dependency install when the main checkout's
             # node_modules matches the worktree's lockfile (best effort).
-            await asyncio.to_thread(seed_node_modules, request.repo_path, workspace)
+            await asyncio.to_thread(prepare_worktree, request.repo_path, workspace)
         bundle = await asyncio.to_thread(
             bundle_agent_dir,
             request.agent_dir,
@@ -741,10 +744,13 @@ def snapshot_from_payload(payload: dict[str, Any]) -> SessionSnapshot:
     # Claude-native background shells / agents keep the task in flight.
     if status == "idle" and (payload.get("background_task_count") or 0) > 0:
         status = "running"
+    first = next((e for e in pending if ask_summary(e)), None)
+    ask_id = first.get("elicitation_id") if isinstance(first, dict) else None
     return SessionSnapshot(
         status=status,
         awaiting_human=bool(pending),
-        pending_ask=next((a for a in map(ask_summary, pending) if a), None),
+        pending_ask=ask_summary(first) if first is not None else None,
+        pending_ask_id=str(ask_id) if ask_id else None,
         cost_usd=float(cost) if isinstance(cost, int | float) else None,
         error=str(error.get("message") or error) if isinstance(error, dict) else None,
     )

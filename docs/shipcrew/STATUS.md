@@ -11,6 +11,73 @@ live end-to-end run: 2026-09-29.
 ![Card held for a human merge approval (APPROVALS.md)](board-approval.png)
 ![Drawer with the Approve merge action](drawer-approval.png)
 
+## Round 6: zero approvals for normal work (2026-09-29)
+
+Branch `shipcrew-round6` (bundles: shipcrew `v3-round6`). Live run 2 (real
+GitHub + Vercel, Next.js polls app) merged 7/7 with ~14 approval cards; every
+remaining card is now an ALLOW case in `validate_agents.py` (with its role),
+next to the negative cases. Kept: the DENY set, the push guard, the `.env`
+ban, the CI workflow gate, owned paths, the reviewer's no-writes, verify roles
+add tests only.
+
+- **Vetted variables as arguments** (`policies.shell_allowlist`): besides
+  read-only commands, a vetted name (`PORT`, `CHROMIUM_PATH`, `CI`,
+  `NODE_ENV`, `HOME`, `TMPDIR`, ...) may be a plain argument of any
+  allowlisted command when the command does not assign it, it is not the
+  program or an option name, and the program writes no file / git state
+  (`git`, `cp`/`mv`/`rm`/`mkdir`/`tee`, `sed`, `find`... still ask). The
+  command is matched with the `:-` default (or a typical value) in place, so
+  `sort ${X:--o/tmp/x}` is still refused. `pnpm exec next start -p
+  ${PORT:-3000}`, `pkill -f "next start -p ${PORT:-3000}"` pass for qa /
+  security. `${PIPESTATUS[n]}` / `$PIPESTATUS` are special parameters.
+- **curl to the local app** (`curl_output_targets`, new bundle group
+  `local_http` for builders, scaffolder, qa, security): localhost /
+  127.0.0.1 / [::1] / 0.0.0.0, any port and method, `-H`, inline `-d`, `-w`,
+  `-s`, `-i`; `-o FILE` is a write target (owned paths / test writes judge it,
+  also when the URL holds an unexpanded `$PORT`); file reads (`-d @f`, `-T`,
+  `-F f=@f`, `-H @f`) only for a relative path inside the cwd that is no
+  `.env*`. Refused: other hosts, `-K`, `-c`, `-D`, `--trace`, `-O`, proxies,
+  unix sockets, `--resolve`, `-n`, unknown options.
+- **sed as a pipe filter** (`@sed:sed_filter` in `read_only`): stdin only, no
+  file operand, no `-i`/`-f`/`-s`; `s` (no `w`/`e` flag), `y`, `p d q =`...,
+  blocks and addresses; no `r R w W e a i c`; a delimiter inside a bracket
+  expression is refused.
+- **Manifest companions**: owning `package.json` by name also owns
+  `pnpm-workspace.yaml`, `.npmrc`, `.nvmrc`, `.node-version` next to it (live
+  guard and the PR loop's `paths_outside_owned`).
+- **Agent notes never committed** (`omnigent/shipcrew/worktree_prep.py`):
+  before a session starts in a task / ship / reviewer / integrator worktree,
+  `/AGENTS.md` and `/CLAUDE.md` go into the repo's `info/exclude` (`git
+  rev-parse --git-path info/exclude`, shared by all worktrees) unless the repo
+  tracks them (Next 16 `next dev` / `next build` write them).
+- **Loop children seeded** (`prepare_worktree`, `deps_seed.seed_node_modules(
+  fallbacks=)`): reviewer and integrator workspaces go through the same
+  preparation as task worktrees in `PrLoop._start_child`; the reviewer's
+  checkout falls back to the task worktree's `node_modules` (same head, same
+  lockfile) when the main checkout's does not match. A running main-checkout
+  install is waited for (90 s) and never copied half-written.
+- **Child interventions counted** (`SessionSnapshot.pending_ask_id`,
+  `store.record_intervention`, `pr_loop._note_child_ask`): a reviewer or
+  integrator ask is recorded on the task once per `elicitation_id` (reason
+  `reviewer: <policy>: <preview>`, `role` field; the card stays in Review);
+  the report's summary counts them ("n in reviewer/integrator sessions") and
+  each entry shows the role.
+- **Fix tasks fix cheap minors** (`verify.py`): a fix task owns the files of
+  every finding (minor included) and its body asks to fix minor findings when
+  cheap (a missing favicon).
+- **Bundles** (shipcrew `v3-round6`): COMMON: Edit/Write tools instead of
+  `sed -i` with complex regexes, the vetted-variable rule, `NO_COLOR=1` /
+  `--reporter=dot` instead of stripping ANSI, Playwright's `webServer` rather
+  than a hand-started server and curl (last resort). qa / security ROLE:
+  demo script through the Playwright suite, security items as route-handler
+  unit tests. developer ROLE: a `Fix:` task also fixes cheap minor findings.
+  228 validator cases per bundle (215 feature contract + 13 Foundation).
+
+Known gaps: a devops (ship) session ask is still not in the report; a
+reviewer/integrator ask still does not move the card (it is only counted);
+the agent-notes exclude covers the repo root only (`app/AGENTS.md` would be a
+real file).
+
 ## Round 5: zero approvals for safe work (2026-09-29)
 
 Branch `shipcrew-round4` (bundles: shipcrew `v3-round4`). Driven by the
@@ -736,6 +803,23 @@ server side is `omnigent/shipcrew/router.py` and the client side is
   454 passed.
 - Bundles: `build_agents.py --check`, `validate_agents.py` from this worktree:
   10 bundles valid, 117 guardrail cases each, MCP set asserted per bundle.
+
+## Checks (round 6, 2026-09-29)
+
+- **Backend:** `ruff check` / `ruff format --check` (omnigent/shipcrew,
+  tests/shipcrew); `pyrefly check` (project config) 0 errors; `pytest
+  tests/shipcrew tests/server/test_shipcrew_mount.py
+  tests/server/test_shipcrew_child_runner.py tests/policies/test_registry.py
+  tests/server/routes/test_policy_registry.py
+  tests/server/routes/test_sessions_yolo_launch_args.py
+  tests/test_native_policy_hook.py`: 1033 passed. New: `test_round6.py`
+  (every live command, the negatives, companions, agent-notes exclude, seed
+  fallbacks and the busy-install guard, child interventions in store and
+  report), reviewer seed + reviewer-ask cases in `test_pr_loop.py`, the
+  minor-findings fix case in `test_verify.py`. No upstream file touched.
+- **Bundles:** `build_agents.py --check` fresh; `validate_agents.py` from this
+  worktree: 10 bundles valid, 228 guardrail cases each.
+- **Live:** none on this branch (no mission run).
 
 ## Checks (round 5, 2026-09-29)
 

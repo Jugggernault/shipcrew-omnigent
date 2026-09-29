@@ -8,8 +8,11 @@ Five :class:`FunctionPolicy` factories, registered through
   allowlist; anything else is ASK (an approval card in the Inbox, which moves
   the board card to Intervention). Unanalyzable commands (command
   substitution, heredocs, unbalanced quotes) are ASK too. ``$?``-style
-  special parameters always pass; ``$VAR`` only in read-only commands and for
-  vetted names; ``sed -i`` / ``perl -pi`` substitutions are modelled as writes.
+  special parameters and ``${PIPESTATUS[n]}`` always pass; ``$VAR`` only for
+  vetted names, in read-only commands or as a plain argument of a command
+  that writes nothing; ``sed -i`` / ``perl -pi`` substitutions and ``curl
+  -o`` are modelled as writes, ``sed`` as a stdin filter and ``curl`` to a
+  local host are built-in matchers.
 * :func:`owned_paths` -- the task's ``owned_paths`` contract. File writes
   (``Write`` / ``Edit`` / ``sys_os_write`` / shell redirections / ``cp``,
   ``mv``, ``rm``, ``git mv`` ... / formatter ``--write`` / dependency changes)
@@ -181,6 +184,9 @@ EXPANSION_MARK = "\x00"
 _MARKED_NAME = re.compile(EXPANSION_MARK + r"\{?([A-Za-z_][A-Za-z0-9_]*)")
 # ``$?``, ``$#``, ``$$``, ``$!``: always a number, harmless anywhere.
 _SPECIAL_PARAMS = frozenset("?#$!")
+# ``${PIPESTATUS[0]}`` / ``${PIPESTATUS[@]}`` / ``$PIPESTATUS``: exit codes of
+# the last pipeline, numbers like ``$?``.
+_PIPESTATUS = re.compile(r"\{PIPESTATUS(?:\[(?:\d+|@|\*)\])?\}|PIPESTATUS(?![A-Za-z0-9_\[])")
 _PARAM_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 # ``${NAME}``, ``${NAME:-literal}``, ``${NAME-literal}``, ``${?}``.
 _BRACED_PARAM = re.compile(
@@ -342,6 +348,12 @@ def _scan_expansions(text: str) -> tuple[str, str]:
                 i += 2
                 word_start = False
                 continue
+            status = _PIPESTATUS.match(text, i + 1)
+            if status is not None:
+                out.append(text[i : status.end()])
+                i = status.end()
+                word_start = False
+                continue
             name = _PARAM_NAME.match(text, i + 1)
             braced = _BRACED_PARAM.match(text, i + 1) if nxt == "{" else None
             if name is None and braced is None:
@@ -408,7 +420,7 @@ def parse_command(
     a ``$`` itself). With ``params=True`` plain parameter expansions are
     parsed: each segment lists them in :attr:`Segment.expanded` and its
     ``argv`` / ``writes`` words carry :data:`EXPANSION_MARK` for their ``$``
-    (the shell allowlist then only accepts them in read-only commands).
+    (the shell allowlist then judges them, see :func:`shell_allowlist`).
     Newlines separate commands like ``;``.
     """
     text = command.replace("\\\n", " ")
@@ -517,47 +529,143 @@ def _write_tool_paths(event: _Json) -> list[str] | None:
 # ── Allowlist ────────────────────────────────────────────────────────────────
 
 _LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "[::1]", "0.0.0.0"})
-_CURL_VALUE_FLAGS = frozenset(
+# curl options with no value that only change what is printed or how it connects.
+_CURL_SHORT_FLAGS = frozenset("sSiIfLvkgG46Nq#")
+_CURL_LONG_FLAGS = frozenset(
     {
-        "-H", "--header", "-d", "--data", "--data-raw", "--data-binary", "--data-urlencode",
-        "--json", "-X", "--request", "-A", "--user-agent", "-e", "--referer", "-b", "--cookie",
-        "-F", "--form", "-w", "--write-out", "-m", "--max-time", "--connect-timeout",
-        "--retry", "--retry-delay", "--retry-max-time", "-u", "--user", "-r", "--range",
+        "--silent", "--show-error", "--include", "--head", "--fail", "--fail-with-body",
+        "--location", "--verbose", "--insecure", "--globoff", "--compressed", "--http1.0",
+        "--http1.1", "--http2", "--ipv4", "--ipv6", "--no-buffer", "--no-progress-meter",
+        "--progress-bar", "--get", "--raw", "--no-keepalive", "--create-dirs", "--disable",
+        "--no-sessionid", "--tr-encoding", "--path-as-is",
     }
 )  # fmt: skip
-_CURL_BANNED = re.compile(
-    r"^(-o|--output|-O|--remote-name|--remote-name-all|-T|--upload-file|-K|--config|"
-    r"-c|--cookie-jar|-D|--dump-header|--trace|--trace-ascii|--stderr|-x|--proxy|"
-    r"--unix-socket|--abstract-unix-socket|--resolve|--connect-to)(=|$)"
-)
+# Short options that take a value (stuck ``-XPOST`` or the next word).
+_CURL_SHORT_VALUE = frozenset("HdXAebFwmuroT")
+_CURL_LONG_VALUE: dict[str, str] = {
+    "--header": "H", "--data": "d", "--data-ascii": "d", "--data-binary": "d",
+    "--data-raw": "raw", "--data-urlencode": "urlencode", "--json": "d", "--request": "X",
+    "--user-agent": "A", "--referer": "e", "--cookie": "b", "--form": "F",
+    "--form-string": "raw", "--write-out": "w", "--max-time": "m", "--connect-timeout": "m",
+    "--retry": "m", "--retry-delay": "m", "--retry-max-time": "m", "--max-redirs": "m",
+    "--expect100-timeout": "m", "--user": "u", "--range": "r", "--output": "o",
+    "--upload-file": "T", "--url": "url",
+}  # fmt: skip
 _URL = re.compile(r"^(?:https?://)?(?P<host>\[[^\]]+\]|[^/:?#]+)(?::\d+)?(?:[/?#].*)?$")
+_ENV_FILE = re.compile(r"(^|/)\.env(\.[^/]*)?$")
 
 
-def _curl_localhost(args: list[str]) -> bool:
-    """``curl`` whose every URL is a local host and that writes no file."""
+def _local_file(path: str) -> bool:
+    """A file curl may read (``-d @f``, ``-T f``): relative, inside the cwd, not a secret.
+
+    ``.env*`` files are refused (their values would reach the model through
+    the local server's echo); ``.env.example`` too, for simplicity.
+    """
+    norm = posixpath.normpath(path) if path else ""
+    return bool(norm) and not (
+        posixpath.isabs(norm)
+        or norm == ".."
+        or norm.startswith(("../", "~", "-"))
+        or "$" in norm
+        or _ENV_FILE.search(norm)
+    )
+
+
+def _curl_value_ok(kind: str, value: str) -> bool:
+    """Whether the value of a curl option reads no file outside the worktree."""
+    if kind in ("d", "H", "w"):  # ``@file`` reads a file (``-H @f``: curl >= 7.55)
+        return not value.startswith("@") or _local_file(value[1:])
+    if kind == "urlencode":  # ``name@file`` / ``@file`` read a file, ``name=x`` is literal
+        eq, at = value.find("="), value.find("@")
+        return at < 0 or (0 <= eq < at) or _local_file(value[at + 1 :])
+    if kind == "F":  # ``name=@file`` / ``name=<file`` read a file
+        _, _, content = value.partition("=")
+        if content.startswith(("@", "<")):
+            return _local_file(content[1:].split(";", 1)[0])
+        return True
+    if kind == "b":  # ``-b name=value`` is a cookie, ``-b file`` reads a cookie file
+        return "=" in value
+    if kind == "T":
+        return _local_file(value)
+    return True
+
+
+def _local_url(arg: str) -> bool:
+    match = _URL.match(arg)
+    return match is not None and match.group("host").lower() in _LOCAL_HOSTS
+
+
+def curl_output_targets(args: list[str]) -> list[str] | None:
+    """The files a local ``curl`` writes (``-o FILE``), ``None`` when it is not modelled.
+
+    Every URL must be a local host (``localhost``, ``127.0.0.1``, ``[::1]``,
+    ``0.0.0.0``, any port, any method). Headers, inline data, ``-w``, ``-s``,
+    ``-i`` ... are free; ``-d @file`` / ``-T file`` / ``-F f=@file`` only for a
+    relative file inside the cwd that is no ``.env*``; ``-b`` only as
+    ``name=value``. Refused: remote hosts, ``-K``/``--config``, ``-c`` (cookie
+    jar), ``-D``/``--trace`` (files), ``-O`` (remote name), proxies,
+    ``--unix-socket``, ``--resolve``/``--connect-to``, ``-n`` (.netrc) and any
+    option not listed here.
+    """
+    targets: list[str] = []
     urls = 0
     i = 0
     while i < len(args):
         arg = args[i]
-        if _CURL_BANNED.match(arg) or (
-            arg.startswith("-")
-            and not arg.startswith("--")
-            and len(arg) > 2
-            and any(c in "oOTKcDx" for c in arg[1:])
-        ):
-            return False
-        if arg in _CURL_VALUE_FLAGS:
+        if arg.startswith("--"):
+            if arg in _CURL_LONG_FLAGS:
+                i += 1
+                continue
+            kind = _CURL_LONG_VALUE.get(arg)
+            if kind is None or i + 1 >= len(args):
+                return None
+            value = args[i + 1]
             i += 2
-            continue
-        if arg.startswith("-"):
+        elif arg.startswith("-") and len(arg) > 1:
+            kind = value = None
+            for j, c in enumerate(arg[1:], 1):
+                if c in _CURL_SHORT_FLAGS:
+                    continue
+                if c not in _CURL_SHORT_VALUE:
+                    return None
+                kind = c
+                value = arg[j + 1 :] or None
+                break
+            if kind is None:
+                i += 1
+                continue
+            if value is None:
+                if i + 1 >= len(args):
+                    return None
+                value = args[i + 1]
+                i += 2
+            else:
+                i += 1
+        else:
+            if not _local_url(arg):
+                return None
+            urls += 1
             i += 1
             continue
-        match = _URL.match(arg)
-        if match is None or match.group("host").lower() not in _LOCAL_HOSTS:
-            return False
-        urls += 1
-        i += 1
-    return urls > 0
+        if kind == "url":
+            if not _local_url(value):
+                return None
+            urls += 1
+        elif kind == "o":
+            targets.append(value)
+        elif not _curl_value_ok(kind, value):
+            return None
+    return targets if urls else None
+
+
+def _curl_localhost(args: list[str]) -> bool:
+    """``curl`` whose every URL is a local host (see :func:`curl_output_targets`).
+
+    Output files are write targets (:func:`shell_write_targets`): the
+    owned-paths and test-writes guards judge them, ``/dev/null`` and ``/tmp``
+    are always fine.
+    """
+    return curl_output_targets(args) is not None
 
 
 _SED_ADDRESS = re.compile(r"(\d+|\$)(,(\d+|\$))?")
@@ -642,6 +750,159 @@ def _sed_in_place(args: list[str]) -> bool:
     return in_place and bool(scripts) and bool(files) and all(map(_safe_sed_script, scripts))
 
 
+# sed commands that only transform the stream: no r/R (read a file), w/W
+# (write one), e (run a command), a/i/c (text arguments, not modelled).
+_SED_FILTER_COMMANDS = frozenset("pdDnNPhHgGxlq=Qz")
+_SED_FILTER_S_FLAGS = frozenset("gIiMmp0123456789")
+_SED_FILTER_OPTIONS = frozenset(
+    {"-n", "--quiet", "--silent", "-E", "-r", "--regexp-extended", "-u", "--unbuffered",
+     "-z", "--null-data", "--posix", "--sandbox", "--debug"}
+)  # fmt: skip
+
+
+def _sed_regex_end(script: str, i: int, delim: str) -> int | None:
+    """Index just past the unescaped *delim* closing a regex that starts at *i*.
+
+    A bracket expression holding the delimiter (``[/]``) is refused: sed
+    implementations disagree on whether it ends the regex there.
+    """
+    while i < len(script):
+        c = script[i]
+        if c == "\\":
+            i += 2
+            continue
+        if c == "[":
+            first = i + 1 + (script.startswith("^", i + 1))
+            close = script.find("]", first + 1 if script.startswith("]", first) else first)
+            if close < 0 or delim in script[i + 1 : close]:
+                return None
+            i = close + 1
+            continue
+        if c == "\n":
+            return None
+        if c == delim:
+            return i + 1
+        i += 1
+    return None
+
+
+def _sed_address(script: str, i: int) -> int | None:
+    """Index past one sed address (``12``, ``$``, ``/re/[IM]``, ``\\%re%``) at *i*, or *i*."""
+    if i < len(script) and script[i] == "$":
+        return i + 1
+    digits = re.match(r"\d+(~\d+)?", script[i:])
+    if digits:
+        return i + digits.end()
+    if i < len(script) and script[i] in "/\\":
+        delim, start = ("/", i + 1) if script[i] == "/" else (script[i + 1 : i + 2], i + 2)
+        if not delim or delim in "\n\\":
+            return None
+        end = _sed_regex_end(script, start, delim)
+        if end is None:
+            return None
+        while end < len(script) and script[end] in "IM":
+            end += 1
+        return end
+    return i
+
+
+def safe_sed_filter_script(script: str) -> bool:
+    """A sed script that only rewrites its input stream.
+
+    Commands: ``s`` (flags ``g I i M m p`` and a number; never ``w`` or
+    ``e``), ``y``, ``p d D n N P h H g G x l = z q Q`` (``q``/``Q`` with an
+    optional exit code), ``{ }`` blocks, ``!``, addresses and ranges. No
+    ``r R w W e`` commands (they read or write files, or run a command) and
+    no ``a i c`` text commands.
+    """
+    i, count, depth = 0, 0, 0
+    n = len(script)
+    while True:
+        while i < n and script[i] in " \t\n;":
+            i += 1
+        if i >= n:
+            return count > 0 and depth == 0
+        if script[i] == "}":
+            depth -= 1
+            if depth < 0:
+                return False
+            i += 1
+            continue
+        end = _sed_address(script, i)
+        if end is None:
+            return False
+        if end != i and end < n and script[end] == ",":
+            second = _sed_address(script, end + 1)
+            if second is None or second == end + 1:
+                return False
+            end = second
+        i = end
+        while i < n and script[i] in " \t!":
+            i += 1
+        if i >= n:
+            return False
+        cmd = script[i]
+        if cmd == "{":
+            depth += 1
+            i += 1
+            continue
+        if cmd in "sy":
+            delim = script[i + 1 : i + 2]
+            if not delim or delim in "\\\n" or delim.isspace():
+                return False
+            mid = _sed_regex_end(script, i + 2, delim)
+            end = _delimited(script, mid, delim) if mid is not None else None
+            if end is None or "\n" in script[i:end]:
+                return False
+            i = end
+            if cmd == "s":
+                while i < n and script[i] in _SED_FILTER_S_FLAGS:
+                    i += 1
+        elif cmd in _SED_FILTER_COMMANDS:
+            i += 1
+            if cmd in "qQ":
+                while i < n and script[i].isdigit():
+                    i += 1
+        else:
+            return False
+        count += 1
+        while i < n and script[i] in " \t":
+            i += 1
+        if i < n and script[i] not in "\n;}":
+            return False
+
+
+def _sed_filter(args: list[str]) -> bool:
+    """``sed [-n] [-E] [-e SCRIPT]... [SCRIPT]`` reading stdin only (a pipe filter).
+
+    No file operand (a file is read by the other sed entries, never here), no
+    ``-i``/``-f``/``-s``, and every script passes :func:`safe_sed_filter_script`.
+    """
+    scripts: list[str] = []
+    rest: list[str] = []
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg in ("-e", "--expression"):
+            if i + 1 >= len(args):
+                return False
+            scripts.append(args[i + 1])
+            i += 2
+            continue
+        if arg in _SED_FILTER_OPTIONS or (
+            len(arg) > 2 and arg[0] == "-" and arg[1] != "-" and set(arg[1:]) <= set("nEruz")
+        ):
+            i += 1
+            continue
+        if arg.startswith("-"):
+            return False
+        rest.append(arg)
+        i += 1
+    if not scripts and rest:
+        scripts.append(rest.pop(0))
+    return bool(scripts) and not rest and all(map(safe_sed_filter_script, scripts))
+
+
 _PERL_DELIMS = frozenset("/|#!,:~%")
 _PERL_FLAGS = frozenset("gimsx")
 _PERL_CODE = re.compile(r"\(\?\??\{|\(\*\{")
@@ -714,6 +975,7 @@ def _perl_in_place(args: list[str]) -> bool:
 _BUILTIN_MATCHERS: dict[str, Callable[[list[str]], bool]] = {
     "curl_localhost": _curl_localhost,
     "sed_in_place": _sed_in_place,
+    "sed_filter": _sed_filter,
     "perl_in_place": _perl_in_place,
 }
 
@@ -795,7 +1057,8 @@ def compile_pattern(source: str) -> _Pattern:
       A final ``$`` word forbids any remaining argument.
     * ``"re:<regex>"`` -- a Python regex matched at the start of the
       normalized command (words joined by one space).
-    * ``"@curl:curl_localhost"`` -- a built-in matcher for the program.
+    * ``"@curl:curl_localhost"`` -- a built-in matcher for the program
+      (``curl_localhost``, ``sed_in_place``, ``sed_filter``, ``perl_in_place``).
     """
     text = source.strip()
     if text.startswith("re:"):
@@ -820,6 +1083,61 @@ def compile_pattern(source: str) -> _Pattern:
     return _Pattern(source=source, words=tuple(words), banned=tuple(banned), exact=exact)
 
 
+# A vetted variable's value, for matching a command that expands it: the
+# ``${NAME:-literal}`` default when there is one, else a typical value.
+_EXPANSION_PLACEHOLDER: dict[str, str] = {
+    "PORT": "3000",
+    "CHROMIUM_PATH": "/usr/bin/chromium",
+    "HOME": "/home/user",
+    "PWD": "/work",
+    "OLDPWD": "/work",
+    "TMPDIR": "/tmp",
+    "RUNNER_TEMP": "/tmp",
+}
+_MARKED_PARAM = re.compile(
+    EXPANSION_MARK
+    + r"(?:\{(?P<braced>[A-Za-z_][A-Za-z0-9_]*)(?::?-(?P<default>[\w./:@%+,=-]*))?\}"
+    r"|(?P<bare>[A-Za-z_][A-Za-z0-9_]*))"
+)
+# Commands that write files or git state: an expanded word there may be a path
+# or an option the allowlist never saw, whatever the variable.
+_EXPANSION_WRITERS = frozenset(
+    {"git", "mkdir", "touch", "cp", "mv", "rm", "rmdir", "chmod", "chown", "ln", "tee",
+     "truncate", "unlink", "install", "rsync", "tar", "unzip", "dd"}
+) | _EXPANSION_UNSAFE_PROGRAMS  # fmt: skip
+
+
+def _substitute_expansions(word: str) -> str:
+    """*word* with each marked expansion replaced by its default / placeholder value."""
+    return _MARKED_PARAM.sub(
+        lambda m: (
+            m["default"]
+            if m["default"] is not None
+            else _EXPANSION_PLACEHOLDER.get(m["braced"] or m["bare"], "x")
+        ),
+        word,
+    )
+
+
+def _expansion_smuggles(argv: list[str]) -> bool:
+    """Whether an expansion in *argv* could change which program or option runs.
+
+    True for an expansion in the program word (``$X test``, ``npx $X``), in
+    an option name (``--$X``, ``-$X``; a value after ``=`` is fine), or
+    anywhere in a command that writes files or git state
+    (:data:`_EXPANSION_WRITERS`).
+    """
+    if not argv:
+        return False
+    head = argv[1:2] if argv[0] == "npx" else argv[:1]
+    if any(EXPANSION_MARK in w for w in (argv[0], *head)):
+        return True
+    program = head[0] if head else argv[0]
+    if program in _EXPANSION_WRITERS and any(EXPANSION_MARK in w for w in argv):
+        return True
+    return any(w.startswith("-") and EXPANSION_MARK in w.split("=", 1)[0] for w in argv)
+
+
 def _scratch_target(target: str) -> bool:
     norm = posixpath.normpath(target)
     return norm in ("/dev/null", "/dev/stdout", "/dev/stderr") or norm.startswith("/tmp/")
@@ -841,12 +1159,21 @@ def shell_allowlist(
     when every simple command does. Variables:
 
     * ``$?`` / ``$#`` / ``$$`` / ``$!`` are numbers: always fine.
-    * ``$NAME`` / ``${NAME}`` / ``${NAME:-literal}`` in a command word: the
-      command must match an expansion-safe *read_only* entry (see
-      :attr:`_Pattern.expansion_safe`), and ``NAME`` must be an *env_allow* /
-      *expand_allow* name or assigned earlier in the command. In the value
-      of a vetted env prefix (``PORT=${PORT:-3000} npx playwright test``)
-      only the name rule applies. A write target with an expansion asks.
+    * ``${PIPESTATUS[n]}`` is a number too.
+    * ``$NAME`` / ``${NAME}`` / ``${NAME:-literal}`` in a command word:
+      ``NAME`` must be an *env_allow* / *expand_allow* name or assigned
+      earlier in the command. In an expansion-safe *read_only* command (see
+      :attr:`_Pattern.expansion_safe`) that is enough. In any other
+      allowlisted command (``npx next start -p ${PORT:-3000}``, ``curl
+      localhost:$PORT/x``, ``pkill -f "next start -p $PORT"``) the name must
+      also not be assigned in the command (its value then comes from the
+      session's environment), the expansion must be a plain argument (not the
+      program, not an option name) of a command that writes no file or git
+      state (:func:`_expansion_smuggles`), and the command must match with
+      the ``:-`` default (or a typical value) in place of the expansion. In
+      the value of a vetted env prefix (``PORT=${PORT:-3000} npx playwright
+      test``) only the name rule applies. A write target with an expansion
+      asks.
     * A bare assignment (``S=/tmp/x;``) of a name that is not vetted makes
       every later command of the chain read-only-only; names that change
       what runs (``PATH``, ``LD_*``, ``GIT_*``, ``NODE_*`` ...) ask.
@@ -921,12 +1248,27 @@ def shell_allowlist(
                 if seg.writes:
                     return _ask(f"`{seg.text}`")
                 continue
-            if not any(p.matches(seg.argv) for p in patterns):
-                return _ask(f"`{seg.text}`")
             argv_expanded = any(EXPANSION_MARK in a for a in seg.argv)
-            if (argv_expanded or read_only_after) and not any(p.matches(seg.argv) for p in safe):
-                why = "expands a variable" if argv_expanded else "runs after a shell variable"
-                return _ask(f"`{seg.text}` ({why}; only read-only commands may)")
+            if not argv_expanded:
+                if not any(p.matches(seg.argv) for p in patterns):
+                    return _ask(f"`{seg.text}`")
+                if read_only_after and not any(p.matches(seg.argv) for p in safe):
+                    return _ask(
+                        f"`{seg.text}` (runs after a shell variable; only read-only commands may)"
+                    )
+                continue
+            if any(p.matches(seg.argv) for p in safe) and any(
+                p.matches(seg.argv) for p in patterns
+            ):
+                continue  # an expansion-safe read-only command: any vetted or assigned name
+            # Elsewhere only a vetted name the command does not assign (its value
+            # comes from the session's environment, or the ``:-`` default), as
+            # a plain argument, and never in a file / git writer.
+            untrusted = sorted({n for n in seg.expanded if n in assigned})
+            if read_only_after or untrusted or _expansion_smuggles(seg.argv):
+                return _ask(f"`{seg.text}` (expands a variable; only read-only commands may)")
+            if not any(p.matches([_substitute_expansions(a) for a in seg.argv]) for p in patterns):
+                return _ask(f"`{seg.text}`")
         return _ALLOW
 
     return _evaluate
@@ -1129,6 +1471,20 @@ def shell_write_targets(argv: list[str]) -> list[str]:
             return parts[1]
         # Not the modelled form: every positional may be a file it rewrites.
         return _positionals(args, frozenset({"-e", "-E", "-M", "-I"}))
+    if prog == "curl":
+        modelled = curl_output_targets(args)
+        if modelled is not None:
+            return modelled
+        # Not the modelled form (e.g. ``localhost:$PORT`` as the guards see it
+        # unexpanded): every ``-o`` value, conservatively.
+        found: list[str] = []
+        for i, arg in enumerate(args):
+            if arg in ("-o", "--output") and i + 1 < len(args):
+                found.append(args[i + 1])
+            elif arg.startswith("-") and not arg.startswith("--") and "o" in arg[1:]:
+                rest = arg[arg.index("o", 1) + 1 :]
+                found.append(rest or (args[i + 1] if i + 1 < len(args) else ""))
+        return [t for t in found if t]
     if prog == "uniq":
         pos = _positionals(args, frozenset({"-f", "--skip-fields", "-s", "--skip-chars", "-w",
                                             "--check-chars"}))  # fmt: skip
@@ -1191,16 +1547,21 @@ def shell_removal_targets(argv: list[str]) -> list[str]:
     return []
 
 
-# Owning a manifest by name owns its lockfiles: a dependency change rewrites both.
+# Owning a manifest by name owns its lockfiles and the package-manager files
+# next to it: a dependency change or a toolchain setup rewrites them together
+# (``pnpm add`` can touch ``pnpm-workspace.yaml``, pnpm 10 writes
+# ``onlyBuiltDependencies`` there).
 _LOCKFILES_OF: dict[str, tuple[str, ...]] = {
     "package.json": ("package-lock.json", "npm-shrinkwrap.json", "pnpm-lock.yaml", "yarn.lock",
-                     "bun.lock", "bun.lockb"),
+                     "bun.lock", "bun.lockb", "pnpm-workspace.yaml", ".npmrc", ".nvmrc",
+                     ".node-version"),
     "pyproject.toml": ("uv.lock", "poetry.lock"),
 }  # fmt: skip
 
 
 def _with_lockfiles(owned_list: Sequence[str]) -> list[str]:
-    """*owned_list* plus the lockfiles next to every manifest it owns by exact name."""
+    """*owned_list* plus the lockfiles and package-manager files next to every
+    manifest it owns by exact name (see :data:`_LOCKFILES_OF`)."""
     out = list(owned_list)
     for entry in owned_list:
         norm = _norm_glob(entry)

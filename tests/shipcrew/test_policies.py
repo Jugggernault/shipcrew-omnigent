@@ -119,7 +119,8 @@ class TestPatterns:
             (["https://example.com"], False),
             (["http://localhost@evil.com/"], False),
             (["http://localhost:3000@evil.com/"], False),
-            (["-o", "/tmp/x", "http://localhost"], False),
+            (["-o", "/tmp/x", "http://localhost"], True),  # a write target (test_round6)
+            (["-o", "/tmp/x", "https://example.com"], False),
             (["-sO", "http://localhost/f"], False),
             (["--config", "x", "http://localhost"], False),
             (["-s"], False),

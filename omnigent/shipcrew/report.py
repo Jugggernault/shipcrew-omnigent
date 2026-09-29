@@ -109,11 +109,13 @@ def build_report(mission: Mission, tasks: Sequence[Task]) -> str:
         for entry in task.interventions:
             key = str(entry.get("policy") or "other")
             per_policy[key] = per_policy.get(key, 0) + 1
+    from_children = sum(1 for t in tasks for e in t.interventions if e.get("role"))
     if per_policy:
         counts = ", ".join(
             f"{_inline(name)} {n}" for name, n in sorted(per_policy.items(), key=lambda i: -i[1])
         )
-        lines.append(f"- **Human interventions:** {sum(per_policy.values())} ({counts})")
+        children = f"; {from_children} in reviewer/integrator sessions" if from_children else ""
+        lines.append(f"- **Human interventions:** {sum(per_policy.values())} ({counts}{children})")
     else:
         lines.append("- **Human interventions:** 0")
     lines.append("")
@@ -212,7 +214,9 @@ def build_report(mission: Mission, tasks: Sequence[Task]) -> str:
                 if policy and preview
                 else _inline(entry.get("reason") or "")
             )
-            lines.append(f"- **{_inline(task.title)}** ({when}): {what}")
+            role = entry.get("role")
+            where = f"{when}, {_inline(role)}" if role else when
+            lines.append(f"- **{_inline(task.title)}** ({where}): {what}")
             count += 1
     if not count:
         lines.append("_None: the crew needed no human._")

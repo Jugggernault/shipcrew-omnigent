@@ -26,6 +26,7 @@ import filecmp
 import logging
 import shutil
 import subprocess
+from collections.abc import Sequence
 from pathlib import Path
 
 _logger = logging.getLogger(__name__)
@@ -82,14 +83,35 @@ def _unshare(dest: Path) -> None:
             shutil.rmtree(path, ignore_errors=True)
 
 
-def seed_node_modules(repo_path: str, workspace: str) -> str | None:
-    """Copy ``<repo>/node_modules`` into a new worktree when the lockfiles match.
+def seed_node_modules(
+    repo_path: str,
+    workspace: str,
+    *,
+    fallbacks: Sequence[str] = (),
+    skip_primary: bool = False,
+) -> str | None:
+    """Copy ``node_modules`` into a new worktree from a checkout with the same lockfile.
 
-    :param repo_path: The mission repo's main checkout, e.g. ``"/work/app"``.
-    :param workspace: The task worktree, e.g. ``"/work/.worktrees/shipcrew-1a2b"``.
+    :param repo_path: The mission repo's main checkout, e.g. ``"/work/app"``;
+        tried first.
+    :param workspace: The new worktree, e.g. ``"/work/.worktrees/shipcrew-1a2b"``.
+    :param fallbacks: Other checkouts tried in order when the main one does not
+        match (e.g. the task worktree for its reviewer's checkout of the same head).
+    :param skip_primary: Do not copy from *repo_path* (its install is running).
     :returns: ``"reflink"`` or ``"hardlink"`` when seeded, ``None`` when
         skipped (no lockfile match, not gitignored, already present) or failed.
     """
+    sources = [*([] if skip_primary else [repo_path]), *fallbacks]
+    for source in sources:
+        method = _seed_from(source, workspace)
+        if method is not None:
+            return method
+        if Path(workspace, "node_modules").exists():
+            return None  # already present (or someone else seeded it)
+    return None
+
+
+def _seed_from(repo_path: str, workspace: str) -> str | None:
     repo, dest_root = Path(repo_path), Path(workspace)
     src, dest = repo / "node_modules", dest_root / "node_modules"
     try:
