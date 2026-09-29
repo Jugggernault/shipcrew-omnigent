@@ -1,0 +1,43 @@
+# Installed by shipcrew. Job name `ci` is the required status check on main: keep it.
+name: ci
+on:
+  pull_request:
+  push:
+    branches: [main]
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  ci:
+    # Self-hosted runner later: set the repo variable SHIPCREW_RUNNER (e.g. "self-hosted").
+    runs-on: ${{ vars.SHIPCREW_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 30
+    env:
+      CI: "1"
+      CHROMIUM_PATH: /usr/bin/google-chrome  # preinstalled on GitHub runners: no Playwright download
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: npm }
+      - run: npm ci --no-audit --no-fund
+      - run: npm run --if-present lint
+      - run: npm run --if-present typecheck
+      - run: npm run --if-present test
+      - run: npm run build
+      - run: npm audit --omit=dev --audit-level=high
+      - name: e2e (production build)
+        run: if [ -f playwright.config.ts ]; then npx playwright test; fi
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with: { name: playwright-report, path: playwright-report, retention-days: 7 }
+
+  codeql:
+    # Code scanning is free on public repos only; private repos need GitHub Advanced Security.
+    if: ${{ !github.event.repository.private }}
+    runs-on: ubuntu-latest
+    permissions: { security-events: write, contents: read }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: github/codeql-action/init@v3
+        with: { languages: javascript-typescript }
+      - uses: github/codeql-action/analyze@v3
