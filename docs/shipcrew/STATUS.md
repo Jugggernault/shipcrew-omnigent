@@ -59,6 +59,29 @@ live end-to-end run: 2026-09-29.
   suite, e2e and dev servers only when needed, batched reads, no polling,
   install once), scaffolder on pnpm with `packageManager`.
 
+**Live run** (port 16791, own state dir, fake gh, bundles of shipcrew
+`v3-qaspeed`, real Claude sessions): a CommonJS cart library with a planted bug
+(`cartTotal` ignores `qty`) and one qa task (owned `test/**`).
+
+1. 20:13:50 qa started. 6 tool calls: one batched read, one `npm test`, it
+   added `cartTotal multiplies price by qty` + empty-cart tests to
+   `test/cart.test.js`, wrote `.shipcrew/qa.json`, committed (no prompt), and
+   ended with a findings block (`src/cart.js:4`, blocker, repro) and
+   `FAIL: 1 failures`.
+2. 20:14:43 the board created `Fix: Verify the cart` (developer, owned
+   `src/cart.js`, `test/cart.test.js`, body = finding + qa.json + `git checkout
+   shipcrew-tests/aa5f40e3-1 -- test/cart.test.js`), qa card back to Ready
+   waiting on it.
+3. The developer (5 tool calls) took the tests, fixed the reduce, ran the suite
+   once, committed. One approval card: the old workflows regex asked for
+   `git checkout ... && cat ...; ls .github/workflows` (a read). Approved by
+   hand; that false positive is now fixed (`workflows_guard`).
+4. 20:16:43 PR #1 CI green, reviewer APPROVE, merged. The qa card restarted on
+   the merged code, passed, added one more test: PR #2, tests-only, so the
+   reviewer was skipped ("review skipped: tests-only diff with CI green"),
+   merged 20:17:29. `npm test` on main: 5 pass, 0 fail. Total cost $1.04,
+   3 min 40 s end to end.
+
 Measured on this machine (ext4, so the hardlink path; Next 15 + React 19 +
 vitest + eslint + faker, 391 MB, ~13k files):
 
@@ -283,8 +306,13 @@ regression test.
   waits on an approval card the task stays in Review (contract: Intervention);
   the ask only shows in the sidebar ("Needs response") and the Inbox. The
   reviewer test-runner allowlist removes the common case.
-- **`workflows_approval` false positive**: a chain such as `git fetch -q
-  origin; ls .github/workflows` asks, although it only reads.
+- **`workflows_approval` false positive**: fixed in round 4 (python
+  `workflows_guard`, per simple command).
+- **Verify follow-ups**: a verify PR whose CI goes red sends the logs to the
+  verify agent, which can only change tests (a real app defect then ends as
+  blocked, not as a fix task). Fix tasks own only the files the findings name,
+  so a fix that needs another file asks once. The node_modules seed covers the
+  root `node_modules` only (not workspace packages).
 - **Loop children never time out**: a reviewer, integrator or planner that
   never answers keeps the card in Review (or `plan.status=running`).
 - **Transient status**: for one tick between review and the approval hold the
