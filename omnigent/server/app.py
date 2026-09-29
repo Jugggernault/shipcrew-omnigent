@@ -3100,6 +3100,10 @@ def create_app(
         prefix="/v1",
         tags=["sessions"],
     )
+    # shipcrew fork: board API + scheduler (all code under omnigent/shipcrew/).
+    from omnigent.shipcrew.router import mount_shipcrew
+
+    mount_shipcrew(app, conversation_store=conversation_store, auth_provider=auth_provider)
     app.include_router(
         create_imports_router(
             conversation_store,
