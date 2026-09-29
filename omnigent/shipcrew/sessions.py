@@ -15,9 +15,11 @@ import dataclasses
 import io
 import json
 import logging
+import re
 import tarfile
 import tempfile
 import threading
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
@@ -56,6 +58,7 @@ class RootSessionRequest:
     acting_user: str | None = None
     base_branch: str | None = None
     labels: dict[str, str] = field(default_factory=dict)
+    owned_paths: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -99,8 +102,41 @@ class SessionService(Protocol):
         ...
 
 
-def bundle_agent_dir(agent_dir: Path) -> bytes:
-    """Pack an agent bundle directory as the ``tar.gz`` omnigent accepts."""
+# Placeholder lines of the bundles' owned-paths policy (agents/_shared/policies/
+# owned_paths.yaml): the task contract is written over them at start.
+_OWNED_PATHS_SLOT = re.compile(
+    r"^(?P<indent>[ \t]*)owned_paths:[^\n]*# @task\.owned_paths[ \t]*$", re.M
+)
+_ROOT_SLOT = re.compile(r"^(?P<indent>[ \t]*)root:[^\n]*# @task\.root[ \t]*$", re.M)
+
+
+def inject_task_contract(config_text: str, *, owned_paths: Sequence[str], root: str) -> str:
+    """Fill the owned-paths policy slots of a bundle ``config.yaml``.
+
+    The values are written as JSON, which YAML reads as flow scalars. A config
+    without the slots (a role with no owned-paths policy) is returned as is.
+    """
+    if not owned_paths or _OWNED_PATHS_SLOT.search(config_text) is None:
+        return config_text
+    text = _OWNED_PATHS_SLOT.sub(
+        lambda m: f"{m['indent']}owned_paths: {json.dumps(list(owned_paths))}", config_text
+    )
+    return _ROOT_SLOT.sub(lambda m: f"{m['indent']}root: {json.dumps(root)}", text)
+
+
+def bundle_agent_dir(
+    agent_dir: Path,
+    *,
+    owned_paths: Sequence[str] = (),
+    workspace: str | None = None,
+) -> bytes:
+    """Pack an agent bundle directory as the ``tar.gz`` omnigent accepts.
+
+    :param owned_paths: The task's owned globs; with *workspace* they are
+        injected into the bundle's owned-paths guardrail (see
+        :func:`inject_task_contract`).
+    :param workspace: Absolute path of the task worktree.
+    """
     from omnigent.spec import materialize_bundle
 
     if not (agent_dir / "config.yaml").is_file():
@@ -109,6 +145,14 @@ def bundle_agent_dir(agent_dir: Path) -> bytes:
     # materialize_bundle dereferences symlinks (the orchestrator's agents/<role>).
     with tempfile.TemporaryDirectory() as tmp:
         root = materialize_bundle(agent_dir, Path(tmp) / "bundle")
+        if owned_paths and workspace:
+            config = root / "config.yaml"
+            config.write_text(
+                inject_task_contract(
+                    config.read_text(encoding="utf-8"), owned_paths=owned_paths, root=workspace
+                ),
+                encoding="utf-8",
+            )
         with tarfile.open(fileobj=buf, mode="w:gz") as tar:
             for path in sorted(root.rglob("*")):
                 rel = path.relative_to(root)
@@ -251,9 +295,14 @@ class OmnigentSessionService:
         return created.workspace or created.worktree_path
 
     async def create_root_session(self, request: RootSessionRequest) -> str:
-        bundle = await asyncio.to_thread(bundle_agent_dir, request.agent_dir)
         host_id, conn = await self._resolve_host(request.acting_user)
         workspace = await self._task_worktree(conn, request)
+        bundle = await asyncio.to_thread(
+            bundle_agent_dir,
+            request.agent_dir,
+            owned_paths=request.owned_paths,
+            workspace=workspace,
+        )
         await asyncio.to_thread(_pretrust_claude_workspace, workspace)
         metadata = {
             "title": request.title[:200],

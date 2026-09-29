@@ -49,4 +49,6 @@ BUILTIN_POLICY_MODULES = [
     # Legacy alias module — registers old omnigent.inner.nessie.policies.*
     # handler paths so deployed bundles that pre-date the rename still work.
     "omnigent.inner.nessie.policies",
+    # shipcrew fork: role-bundle shell allowlists, owned paths, push guard.
+    "omnigent.shipcrew.policies",
 ]
