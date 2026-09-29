@@ -61,6 +61,12 @@ function serve(input: RequestInfo | URL, init?: RequestInit): Response {
   const body = typeof init?.body === "string" ? (JSON.parse(init.body) as unknown) : undefined;
   requests.push({ method, url, body });
   if (url === "/v1/shipcrew/missions") return json({ missions });
+  if (url === "/v1/sessions/projects") {
+    return json([
+      { id: "proj_1", name: "Billing launch" },
+      { id: "proj_2", name: "Docs site" },
+    ]);
+  }
   if (url === "/v1/shipcrew/missions/mission_1/plan" && method === "POST") {
     const planned: Mission = {
       ...missions[0],
@@ -663,5 +669,63 @@ describe("BoardPage", () => {
       body: { message: "Paginate the invoice list" },
     });
     expect(column("running").getByText("Billing page")).toBeInTheDocument();
+  });
+
+  describe("mission project", () => {
+    beforeEach(() => {
+      missions = [
+        makeMission({ project_id: "proj_1" }),
+        makeMission({ id: "mission_2", title: "Docs site", project_id: "proj_2" }),
+      ];
+    });
+
+    function selectedTab(): HTMLElement {
+      const tabs = within(screen.getByRole("tablist"));
+      const selected = tabs.getAllByRole("tab").find((tab) => tab.ariaSelected === "true");
+      if (!selected) throw new Error("no selected mission tab");
+      return selected;
+    }
+
+    it("selects the mission of ?project= (the sidebar's board link)", async () => {
+      renderBoard("/board?project=proj_2");
+      await screen.findByRole("tablist");
+      expect(selectedTab()).toHaveTextContent("Docs site");
+    });
+
+    it("prefers ?mission= over ?project=", async () => {
+      renderBoard("/board?mission=mission_1&project=proj_2");
+      await screen.findByRole("tablist");
+      expect(selectedTab()).toHaveTextContent("Billing launch");
+    });
+
+    it("falls back to the first mission for an unknown project", async () => {
+      renderBoard("/board?project=nope");
+      await screen.findByRole("tablist");
+      expect(selectedTab()).toHaveTextContent("Billing launch");
+    });
+
+    it("links the header back to the project's sessions", async () => {
+      renderBoard("/board?mission=mission_2");
+      const link = await screen.findByTestId("mission-project-link");
+      expect(link).toHaveTextContent("Sessions in Docs site");
+      expect(link).toHaveAttribute("href", "/?project=Docs%20site");
+    });
+
+    it("drops ?project= once another mission tab is picked", async () => {
+      renderBoard("/board?project=proj_2");
+      await screen.findByRole("tablist");
+      fireEvent.click(screen.getByRole("tab", { name: "Billing launch" }));
+      await waitFor(() =>
+        expect(screen.getByTestId("location")).toHaveTextContent("/board?mission=mission_1"),
+      );
+      expect(selectedTab()).toHaveTextContent("Billing launch");
+    });
+
+    it("has no project link for a mission without a project", async () => {
+      missions = [makeMission()];
+      renderBoard("/board");
+      await screen.findByRole("tablist");
+      expect(screen.queryByTestId("mission-project-link")).not.toBeInTheDocument();
+    });
   });
 });

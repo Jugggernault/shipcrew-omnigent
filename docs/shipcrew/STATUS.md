@@ -11,6 +11,67 @@ live end-to-end run: 2026-09-29.
 ![Card held for a human merge approval (APPROVALS.md)](board-approval.png)
 ![Drawer with the Approve merge action](drawer-approval.png)
 
+## Projects: one mission = one omnigent project (2026-09-29)
+
+Branch `shipcrew-projects`. Every mission owns an omnigent first-class project
+(sidebar folder), so its sessions are grouped instead of a flat list, and the
+project row gets an "Open board" hover action.
+
+![Sidebar: the mission's project with its sessions and the Open board action](project-board-hover.png)
+
+- **Project per mission** (`omnigent/shipcrew/projects.py`): created when the
+  mission is created, lazily for older missions on the first session start
+  (one lock per mission, so parallel starts create one project). Owned by the
+  mission owner, created through omnigent's own `/v1/projects` API in-process
+  (`OmnigentSessionService.list_projects/create_project/rename_project`). Name
+  = mission title (<= 94 chars); a clash adopts an unlinked folder of that name,
+  else `Title (2)`, `(3)`... Stored as `Mission.project_id` (migration
+  `sc0005pj` after `sc0004sh`; one shipcrew head). Best effort: a projects
+  failure logs and the session is created unfiled, never blocked.
+- **Every session is filed**: planner, task root sessions, reviewer/integrator
+  children and the devops ship session carry `project_id` in the multipart
+  `POST /v1/sessions` metadata (upstream already accepts it). Children stay
+  sub-agent sessions, so they remain nested under their parent (not listed in
+  the folder). A project deleted meanwhile (404) retries the create unfiled.
+- **Rename**: `PATCH /missions/{id}` accepts `title`; the project follows unless
+  the new name is taken (then it keeps its old name). Nothing ever deletes a
+  project; a project the user deleted is replaced on the next session start.
+- **API**: `project_id` in the mission payload; `GET /missions?project_id=`;
+  `GET /project-links` = `[{project_id, mission_id, title}]` of the caller's
+  visible missions (same ACL as the board: other users' missions never show).
+- **Sidebar** (`web/src/board/ProjectBoardButton.tsx`, `projectLinks.ts`):
+  one cached `project-links` query (no retries; 404 = no shipcrew = no icons);
+  a `KanbanSquare` ghost icon button (tooltip "Open board", aria-label
+  "Open board for <project>") first in the project header's controls cluster,
+  revealed on hover and on focus-within like "New session in project"; links
+  to `/board?mission=<id>`. Label-only folders and non-mission projects get
+  nothing.
+- **Board**: selects the mission from `?mission=`, else `?project=<project id>`,
+  else the first; the header links back to the project ("Sessions in <name>",
+  `/?project=<name>`, the project-scoped composer whose sidebar row is active).
+
+### Verified live (port 16811, own state dir, fake gh + fake vercel, real Claude)
+
+Mission "Tiny strings" (1-feature PRD, auto run + auto ship): the project was
+created with the mission; the planner, the task root, its reviewer child
+(`kind=sub_agent`, hidden under its parent) and the ship session all had the
+mission's `project_id`; the flat Sessions list stayed empty. Chromium
+(Playwright, `/usr/bin/chromium`): the hover icon is visible on hover and on
+keyboard focus (opacity 1 both), Enter opens `/board?mission=<id>`, the header
+link goes back to `/?project=Tiny%20strings`. Renaming the mission renamed the
+project. (The devops agent refused the fake deploy URL this time, "looks like
+a stub": ship failed, unrelated to projects.)
+
+### Known issues (projects)
+
+- The board's header link opens the project-scoped composer; the sidebar
+  folder is highlighted but not force-expanded (expansion is sidebar state).
+- Missions shared with no owner (`owner_user_id` NULL, single-user) create the
+  project in the single-user scope; in multi-user mode a project belongs to the
+  mission owner only, so a collaborator never sees it (projects have no ACL).
+- The links cache refreshes on board mission updates, window focus and every
+  30 s; a mission created from another tab shows its icon after that.
+
 ## Round 4 integration: ship + verify/speed together (2026-09-29)
 
 Branch `shipcrew-round3` = `shipcrew` + `shipcrew-ship` + `shipcrew-qaspeed`
@@ -559,6 +620,21 @@ server side is `omnigent/shipcrew/router.py` and the client side is
 - Bundles: `build_agents.py --check`, `validate_agents.py` from this worktree:
   10 bundles valid, 117 guardrail cases each, MCP set asserted per bundle.
 
+## Checks (projects, 2026-09-29)
+
+- **Backend:** `ruff check` / `ruff format --check` (omnigent/shipcrew,
+  tests/shipcrew, tests/server/test_shipcrew_mount.py); `pyrefly check`
+  (project config) 0 errors; `pytest tests/shipcrew
+  tests/server/test_shipcrew_mount.py tests/policies/test_registry.py
+  tests/server/routes/test_policy_registry.py
+  tests/server/routes/test_sessions_yolo_launch_args.py`: 698 passed (new:
+  `test_projects.py`, the real-app `/v1/projects` test in the mount test).
+- **Web:** `pnpm lint`, `pnpm type-check`, `pnpm --filter web build`, prettier;
+  `vitest run src/board src/pages src/shell --maxWorkers=4` with
+  `NODE_OPTIONS=--no-experimental-webstorage`: 4164 passed, 2 expected fail
+  (new: `ProjectBoardButton.test.tsx` through the real Sidebar,
+  `projectLinks.test.ts`, BoardPage `?project=` selection + header link).
+
 ## Checks (round 4 integration, 2026-09-29)
 
 - **Backend:** `ruff check` / `ruff format --check` (omnigent/shipcrew,
@@ -598,7 +674,10 @@ server side is `omnigent/shipcrew/router.py` and the client side is
 - `omnigent/server/app.py`: 4 lines that call `mount_shipcrew(...)`.
 - `pyproject.toml`: 1 package-data line.
 - `web/src/App.tsx`: a lazy `/board` route (+5 lines).
-- `web/src/shell/Sidebar.tsx`: the Board nav item (+3 lines).
+- `web/src/shell/Sidebar.tsx`: the Board nav item (+3 lines), and the project
+  row "Open board" action: `ProjectFolderActions` gets `projectId` and renders
+  `<ProjectBoardButton>` (+6 lines; the button renders nothing for projects
+  that are not a mission's, logic in `web/src/board/`).
 - `omnigent/policies/builtins/__init__.py`: registers `omnigent.shipcrew.policies`
   in `BUILTIN_POLICY_MODULES` (+2 lines), so uploaded bundles may use the
   shipcrew guardrails.

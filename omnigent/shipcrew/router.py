@@ -101,6 +101,8 @@ class PlanBody(BaseModel):
 class PatchMissionBody(BaseModel):
     auto_run: bool | None = None
     auto_ship: bool | None = None
+    # A rename also renames the mission's project when that name is free.
+    title: str | None = Field(default=None, min_length=1, max_length=512)
 
 
 class CommandBody(BaseModel):
@@ -134,10 +136,25 @@ def create_shipcrew_router(
         return await asyncio.to_thread(get_service)
 
     @router.get("/missions")
-    async def list_missions(request: Request) -> dict[str, Any]:
+    async def list_missions(request: Request, project_id: str | None = None) -> dict[str, Any]:
         user_id = require_user(request, auth_provider)
         missions = await (await _svc()).list_missions_for(user_id)
+        if project_id is not None:
+            missions = [m for m in missions if m.project_id == project_id]
         return {"missions": [m.to_api() for m in missions]}
+
+    @router.get("/project-links")
+    async def project_links(request: Request) -> dict[str, Any]:
+        """Which of the caller's omnigent projects belong to a mission (sidebar)."""
+        user_id = require_user(request, auth_provider)
+        missions = await (await _svc()).list_missions_for(user_id)
+        return {
+            "links": [
+                {"project_id": m.project_id, "mission_id": m.id, "title": m.title}
+                for m in missions
+                if m.project_id
+            ]
+        }
 
     @router.post("/missions")
     async def create_mission(request: Request, body: CreateMissionBody) -> dict[str, Any]:
@@ -154,6 +171,8 @@ def create_shipcrew_router(
         user_id = require_user(request, auth_provider)
         service = await _svc()
         mission = await service.authorize_mission(mission_id, user_id)
+        if body.title is not None and body.title.strip() and body.title != mission.title:
+            mission = await service.rename_mission(mission_id, body.title.strip(), user_id)
         if body.auto_run is not None:
             mission = await service.set_auto_run(mission_id, body.auto_run)
         if body.auto_ship is not None:

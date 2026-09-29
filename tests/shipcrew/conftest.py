@@ -19,6 +19,8 @@ from omnigent.shipcrew.router import mount_shipcrew
 from omnigent.shipcrew.service import ShipcrewService
 from omnigent.shipcrew.sessions import (
     ChildSessionRequest,
+    ProjectNameTaken,
+    ProjectRef,
     RootSessionRequest,
     SessionServiceError,
     SessionSnapshot,
@@ -43,6 +45,37 @@ class FakeSessions:
     messages: list[tuple[str, str]] = field(default_factory=list)
     children: list[ChildSessionRequest] = field(default_factory=list)
     agent_texts: dict[str, str | None] = field(default_factory=dict)
+    # omnigent projects per owner (``None`` = single user): id -> name.
+    projects: dict[str | None, dict[str, str]] = field(default_factory=dict)
+    project_calls: list[tuple[str, str | None, str]] = field(default_factory=list)
+    fail_projects: str | None = None
+
+    async def list_projects(self, *, acting_user: str | None) -> list[ProjectRef]:
+        if self.fail_projects is not None:
+            raise SessionServiceError(self.fail_projects)
+        owned = self.projects.get(acting_user, {})
+        return [ProjectRef(id=pid, name=name) for pid, name in owned.items()]
+
+    async def create_project(self, name: str, *, acting_user: str | None) -> ProjectRef:
+        owned = self.projects.setdefault(acting_user, {})
+        if name in owned.values():
+            raise ProjectNameTaken("name taken")
+        pid = f"proj{sum(len(v) for v in self.projects.values()) + 1}"
+        owned[pid] = name
+        self.project_calls.append(("create", acting_user, name))
+        return ProjectRef(id=pid, name=name)
+
+    async def rename_project(
+        self, project_id: str, name: str, *, acting_user: str | None
+    ) -> ProjectRef | None:
+        owned = self.projects.get(acting_user, {})
+        if project_id not in owned:
+            return None
+        if any(n == name and p != project_id for p, n in owned.items()):
+            raise ProjectNameTaken("name taken")
+        owned[project_id] = name
+        self.project_calls.append(("rename", acting_user, name))
+        return ProjectRef(id=project_id, name=name)
 
     async def create_root_session(self, request: RootSessionRequest) -> str:
         if self.fail_create is not None:

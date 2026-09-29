@@ -17,7 +17,10 @@
  * - The ship stage: a status chip (Planning / Building / Shipping / Shipped
  *   <url> / Ship failed), "Ship now", and the server's report (deploy link,
  *   rendered Markdown, copy); the planner's decisions fold under the header.
- * - The selected mission and task live in `?mission=` / `?task=`.
+ * - The selected mission and task live in `?mission=` / `?task=`; a sidebar
+ *   project row's board link may pass `?project=<project id>` instead, which
+ *   selects that project's mission. The header links back to the project's
+ *   sessions (one mission = one omnigent project).
  */
 
 import { useCallback, useMemo, useRef, useState } from "react";
@@ -72,6 +75,7 @@ import {
   ShipButton,
   ShipReportPanel,
 } from "@/board/MissionShip";
+import { MissionProjectLink } from "@/board/MissionProjectLink";
 import { NewMissionDialog } from "@/board/NewMissionDialog";
 import { NewTaskForm } from "@/board/NewTaskForm";
 import { TaskCard } from "@/board/TaskCard";
@@ -89,6 +93,7 @@ import {
 import { Spinner } from "@/components/ui/spinner";
 import { showToast } from "@/components/ui/toast";
 import { syncToast } from "@/board/syncReport";
+import { PROJECT_QUERY_PARAM, selectMission } from "@/board/projectLinks";
 import { useViewerId } from "@/hooks/useViewerId";
 import { useSearchParams } from "@/lib/routing";
 import { cn } from "@/lib/utils";
@@ -122,8 +127,11 @@ export function BoardPage() {
   const viewerId = useViewerId();
   const missionsQuery = useMissions();
   const missions = missionsQuery.data ?? EMPTY_MISSIONS;
-  const requestedMission = searchParams.get(MISSION_QUERY_PARAM);
-  const mission = missions.find((item) => item.id === requestedMission) ?? missions[0] ?? null;
+  const mission = selectMission(
+    missions,
+    searchParams.get(MISSION_QUERY_PARAM),
+    searchParams.get(PROJECT_QUERY_PARAM),
+  );
   const missionId = mission?.id ?? null;
 
   const tasksQuery = useMissionTasks(missionId);
@@ -160,7 +168,10 @@ export function BoardPage() {
           const next = new URLSearchParams(current);
           if (value === null) next.delete(key);
           else next.set(key, value);
-          if (key === MISSION_QUERY_PARAM) next.delete(TASK_QUERY_PARAM);
+          if (key === MISSION_QUERY_PARAM) {
+            next.delete(TASK_QUERY_PARAM);
+            next.delete(PROJECT_QUERY_PARAM);
+          }
           return next;
         },
         { replace: key === TASK_QUERY_PARAM },
@@ -379,6 +390,7 @@ export function BoardPage() {
             ) : (
               <span>No missions yet</span>
             )}
+            {mission && <MissionProjectLink mission={mission} />}
             {mission && !tasksQuery.live && (
               <span className="text-xs" title="Live updates unavailable; refreshing periodically">
                 · polling

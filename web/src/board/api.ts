@@ -18,6 +18,7 @@ import type {
   Task,
   TaskPatch,
 } from "./types";
+import { syncProjectLink } from "./projectLinks";
 
 const BASE = "/v1/shipcrew";
 /** Poll interval for the task list while the SSE stream is not connected. */
@@ -164,6 +165,7 @@ export function requestTaskChanges(taskId: string, message: string): Promise<Tas
 
 /** Insert or replace one mission in the cached mission list. */
 export function upsertCachedMission(queryClient: QueryClient, mission: Mission): void {
+  syncProjectLink(queryClient, mission);
   queryClient.setQueryData<Mission[]>(missionsQueryKey, (current) => {
     if (!current) return [mission];
     const index = current.findIndex((item) => item.id === mission.id);
@@ -355,6 +357,7 @@ export function useCreateMission() {
   return useMutation({
     mutationFn: createMission,
     onSuccess: (mission) => {
+      syncProjectLink(queryClient, mission);
       queryClient.setQueryData<Mission[]>(missionsQueryKey, (current) => [
         ...(current ?? []).filter((item) => item.id !== mission.id),
         mission,

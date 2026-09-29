@@ -54,6 +54,7 @@ class Mission:
     ship_verify_until: float | None = None
     ship_decisions: list[str] = field(default_factory=list)
     ship_cost_usd: float = 0.0
+    project_id: str | None = None
 
     def to_api(self) -> dict[str, Any]:
         """Serialize to the shared API contract shape."""
@@ -70,6 +71,7 @@ class Mission:
                 "error": self.plan_error,
                 "imported_count": self.plan_imported_count,
             },
+            "project_id": self.project_id,
             "auto_run": self.auto_run,
             "plan_decisions": list(self.plan_decisions),
             "auto_ship": self.auto_ship,
@@ -208,6 +210,7 @@ def _mission(row: SqlMission) -> Mission:
         ship_verify_until=row.ship_verify_until,
         ship_decisions=[str(d) for d in row.ship_decisions or []],
         ship_cost_usd=float(row.ship_cost_usd or 0.0),
+        project_id=row.project_id,
     )
 
 
@@ -293,6 +296,8 @@ _TASK_FIELDS = frozenset(
 )
 _MISSION_FIELDS = frozenset(
     {
+        "title",
+        "project_id",
         "status",
         "plan_status",
         "plan_session_id",

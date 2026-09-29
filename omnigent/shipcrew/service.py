@@ -17,6 +17,7 @@ from omnigent.shipcrew.issue_sync import GitHubSync
 from omnigent.shipcrew.models import TASK_STATUSES
 from omnigent.shipcrew.planner import PlanRunner
 from omnigent.shipcrew.pr_loop import PrLoop, default_base_ref, is_loop_hold
+from omnigent.shipcrew.projects import MissionProjects
 from omnigent.shipcrew.sessions import (
     RootSessionRequest,
     SessionService,
@@ -118,6 +119,7 @@ class ShipcrewService:
         self.planner = PlanRunner(self)
         self.github = GitHubSync(self)
         self.ship = ShipRunner(self)
+        self.projects = MissionProjects(self)
 
     async def _call(self, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
         return await asyncio.to_thread(fn, *args, **kwargs)
@@ -137,9 +139,36 @@ class ShipcrewService:
     async def create_mission(
         self, title: str, repo_path: str, repo_url: str | None, owner: str | None
     ) -> Mission:
-        return await self._call(
+        """Create the mission and its omnigent project (best effort)."""
+        mission = await self._call(
             self.store.create_mission, title, repo_path, repo_url, owner_user_id=owner
         )
+        if await self.projects.project_for(mission, owner) is not None:
+            mission = await self.require_mission(mission.id)
+        return mission
+
+    async def set_mission_project(self, mission_id: str, project_id: str | None) -> Mission:
+        """Store the mission's omnigent project (``mission.updated``)."""
+        mission = await self._call(self.store.update_mission, mission_id, project_id=project_id)
+        if mission is None:
+            raise _not_found("mission", mission_id)
+        self.bus.mission_updated(mission)
+        return mission
+
+    async def rename_mission(
+        self, mission_id: str, title: str, acting_user: str | None
+    ) -> Mission:
+        """Rename the mission and, when that name is free, its project."""
+        mission = await self._call(self.store.update_mission, mission_id, title=title)
+        if mission is None:
+            raise _not_found("mission", mission_id)
+        await self.projects.rename(mission, acting_user)
+        self.bus.mission_updated(mission)
+        return mission
+
+    async def mission_project_id(self, mission: Mission, acting_user: str | None) -> str | None:
+        """The project new sessions of ``mission`` are filed in (created lazily)."""
+        return await self.projects.project_for(mission, acting_user)
 
     async def require_mission(self, mission_id: str) -> Mission:
         mission = await self._call(self.store.get_mission, mission_id)
@@ -360,6 +389,7 @@ class ShipcrewService:
                 base_branch=base_branch,
                 labels={TASK_LABEL_KEY: task.id, ROLE_LABEL_KEY: task.role},
                 owned_paths=tuple(str(p) for p in task.owned_paths),
+                project_id=await self.mission_project_id(mission, acting_user),
             )
             try:
                 session_id = await self.sessions.create_root_session(request)

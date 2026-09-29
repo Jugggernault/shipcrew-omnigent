@@ -201,6 +201,7 @@ import {
 import { ExtensionPrimaryNavigation } from "@/extensions/ExtensionPrimaryNavigation";
 import { PrimaryNavLink } from "@/shell/PrimaryNavLink";
 import { BoardNavLink, isBoardPath } from "@/board/BoardNavLink";
+import { ProjectBoardButton } from "@/board/ProjectBoardButton";
 import { useViewerId } from "@/hooks/useViewerId";
 import { useExtensions } from "@/extensions/ExtensionProvider";
 import { extensionPathParts, resolveExtensionPageFromPath } from "@/extensions/catalog";
@@ -1502,6 +1503,7 @@ function ProjectFolder({
         indentRows
         headerAction={
           <ProjectFolderActions
+            projectId={projectId}
             projectName={name}
             onNavigate={onRowClick}
             actions={orderedMenuActions}
@@ -4741,16 +4743,20 @@ function PinnedProjectFlyoutContent({
 }
 
 function ProjectFolderActions({
+  projectId,
   projectName,
   onNavigate,
   actions,
 }: {
+  projectId: string | null;
   projectName: string;
   onNavigate: (e: MouseEvent<HTMLAnchorElement>) => void;
   actions: ProjectFolderMenuActions;
 }) {
   return (
     <div className="flex items-center gap-0.5">
+      {/* shipcrew: "Open board" for a mission's project (renders nothing otherwise). */}
+      <ProjectBoardButton projectId={projectId} projectName={projectName} onNavigate={onNavigate} />
       <Tooltip>
         <TooltipTrigger asChild>
           <Button

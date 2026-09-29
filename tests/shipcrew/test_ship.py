@@ -286,6 +286,8 @@ class TestAutoShip:
         assert request.branch.startswith(f"shipcrew/{mission.id[:8]}-ship-")
         assert request.labels["shipcrew.ship"] == "deploy"
         assert request.acting_user == "alice@example.com"
+        # Filed in the mission's omnigent project, like every mission session.
+        assert mission.project_id and request.project_id == mission.project_id
         assert "vercel link --yes --project tiny_cli" in request.prompt
         assert "vercel deploy --prod --yes" in request.prompt
         assert "DEPLOYED: <https production url>" in request.prompt
