@@ -340,6 +340,15 @@ class OmnigentSessionService:
             snap = snapshot_from_payload(response.json())
             if snap.status != "idle":
                 return snap
+            # An idle root may still be waiting on background agents / shells.
+            children = await client.get(
+                f"/v1/sessions/{session_id}/child_sessions",
+                headers=self._auth_headers(acting_user),
+            )
+            if children.status_code < 400 and any(
+                isinstance(c, dict) and c.get("busy") for c in children.json().get("data") or []
+            ):
+                return dataclasses.replace(snap, status="running")
             items = await client.get(
                 f"/v1/sessions/{session_id}/items",
                 params={"limit": 1, "order": "desc"},
@@ -390,8 +399,12 @@ def snapshot_from_payload(payload: dict[str, Any]) -> SessionSnapshot:
     """Reduce a ``GET /v1/sessions/{id}`` body to a :class:`SessionSnapshot`."""
     error = payload.get("last_task_error")
     cost = payload.get("total_cost_usd")
+    status = str(payload.get("status") or "idle")
+    # Claude-native background shells / agents keep the task in flight.
+    if status == "idle" and (payload.get("background_task_count") or 0) > 0:
+        status = "running"
     return SessionSnapshot(
-        status=str(payload.get("status") or "idle"),
+        status=status,
         awaiting_human=bool(payload.get("pending_elicitations")),
         cost_usd=float(cost) if isinstance(cost, int | float) else None,
         error=str(error.get("message") or error) if isinstance(error, dict) else None,

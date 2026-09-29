@@ -42,6 +42,7 @@ class _StubApp:
         self.session_body: dict[str, Any] | None = {"status": "running", "runner_id": "run_1"}
         self.runner_polls = 0
         self.latest_items: list[dict[str, Any]] = []
+        self.children: list[dict[str, Any]] = []
         self.app = FastAPI()
         self.app.state.host_registry = _Registry(host_ids)
         self.app.state.host_store = None
@@ -70,6 +71,10 @@ class _StubApp:
             # Offline on the first poll, online after: the prompt must wait.
             self.runner_polls += 1
             return {"online": self.runner_polls > 1}
+
+        @self.app.get("/v1/sessions/{session_id}/child_sessions")
+        async def child_sessions(session_id: str) -> dict[str, Any]:
+            return {"object": "list", "data": self.children}
 
         @self.app.get("/v1/sessions/{session_id}/items")
         async def items(session_id: str, limit: int, order: str) -> dict[str, Any]:
@@ -244,6 +249,22 @@ async def test_idle_snapshot_reads_latest_item(
     snap = await OmnigentSessionService(stub.app, None).snapshot("c", acting_user=None)
     assert snap is not None
     assert snap.agent_replied is replied
+
+
+async def test_idle_root_with_busy_child_is_running() -> None:
+    stub = _StubApp(host_ids=[])
+    stub.session_body = {"status": "idle"}
+    stub.latest_items = [{"type": "message", "role": "assistant"}]
+    stub.children = [{"id": "child", "busy": True}]
+    snap = await OmnigentSessionService(stub.app, None).snapshot("c", acting_user=None)
+    assert snap is not None and snap.status == "running"
+
+
+def test_idle_payload_with_background_tasks_is_running() -> None:
+    assert snapshot_from_payload({"status": "idle", "background_task_count": 1}).status == (
+        "running"
+    )
+    assert snapshot_from_payload({"status": "idle", "background_task_count": 0}).status == "idle"
 
 
 def test_snapshot_from_payload_failed() -> None:

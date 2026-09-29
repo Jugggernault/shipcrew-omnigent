@@ -13,6 +13,7 @@ import {
 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { useChildSessions } from "@/hooks/useChildSessions";
 import { getEmbedRoot } from "@/lib/host";
 import { formatSessionCostUsd } from "@/lib/formatCost";
 import { Link } from "@/lib/routing";
@@ -30,6 +31,31 @@ interface TaskDrawerProps {
   onStart: (task: Task) => void;
   onStop: (task: Task) => void;
   pending?: boolean;
+}
+
+/**
+ * The task's sub-agent graph. Mounted only once the child list has loaded:
+ * before that `useChildSessions` returns a fresh `[]` per render, which the
+ * graph's render-time sync turns into an update loop (the chat panel waits
+ * the same way).
+ */
+function AgentTree({ rootSessionId }: { rootSessionId: string }) {
+  const { children, isLoading, error } = useChildSessions(rootSessionId);
+  if (children.length === 0 && (isLoading || error)) {
+    return (
+      <div
+        className="flex h-32 items-center justify-center rounded-lg border text-xs text-muted-foreground"
+        data-testid="task-agent-tree-pending"
+      >
+        {error ? "Could not load the agents." : "Loading agents…"}
+      </div>
+    );
+  }
+  return (
+    <div className="h-80 overflow-hidden rounded-lg border" data-testid="task-agent-tree">
+      <SubagentsGraphView conversationId={rootSessionId} rootSessionId={rootSessionId} />
+    </div>
+  );
 }
 
 function Section({ title, children }: { title: string; children: React.ReactNode }) {
@@ -213,12 +239,7 @@ function TaskDrawerBody({
 
         <Section title="Agents">
           {task.root_session_id ? (
-            <div className="h-80 overflow-hidden rounded-lg border" data-testid="task-agent-tree">
-              <SubagentsGraphView
-                conversationId={task.root_session_id}
-                rootSessionId={task.root_session_id}
-              />
-            </div>
+            <AgentTree rootSessionId={task.root_session_id} />
           ) : (
             <div
               className="flex h-32 items-center justify-center rounded-lg border border-dashed text-xs text-muted-foreground"

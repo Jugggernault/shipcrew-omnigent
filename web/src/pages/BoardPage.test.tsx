@@ -59,6 +59,9 @@ function serve(input: RequestInfo | URL, init?: RequestInit): Response {
   requests.push({ method, url, body });
   if (url === "/v1/shipcrew/missions") return json({ missions: [makeMission()] });
   if (url.endsWith("/stream")) return new Response("unavailable", { status: 503 });
+  if (/^\/v1\/sessions\/[^/]+\/child_sessions$/.test(url)) {
+    return json({ object: "list", data: [] });
+  }
   if (url === "/v1/shipcrew/missions/mission_1/tasks" && method === "GET") {
     return json({ tasks });
   }
@@ -305,7 +308,7 @@ describe("BoardPage", () => {
         .getAllByRole("listitem")
         .map((item) => item.textContent),
     ).toEqual(["Shows the invoice list", "Links to Stripe"]);
-    expect(inDrawer.getByTestId("subagents-graph")).toHaveTextContent("conv_root");
+    expect(await inDrawer.findByTestId("subagents-graph")).toHaveTextContent("conv_root");
     expect(inDrawer.getByRole("link", { name: "Open session" })).toHaveAttribute(
       "href",
       "/c/conv_root",
@@ -329,6 +332,23 @@ describe("BoardPage", () => {
       expect(inDrawer.getByTestId("subagents-graph")).toHaveTextContent("conv_started"),
     );
     expect(inDrawer.getByRole("button", { name: "Stop" })).toBeInTheDocument();
+  });
+
+  it("mounts the agent graph only after the child sessions have loaded", async () => {
+    let release: () => void = () => {};
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    fetchMock.mockImplementation(async (input, init) => {
+      if (input.toString().endsWith("/child_sessions")) await gate;
+      return serve(input, init);
+    });
+    renderBoard("/board?task=t_review");
+    const inDrawer = within(await screen.findByTestId("task-drawer"));
+    expect(inDrawer.getByTestId("task-agent-tree-pending")).toHaveTextContent("Loading agents");
+    expect(inDrawer.queryByTestId("subagents-graph")).not.toBeInTheDocument();
+    release();
+    expect(await inDrawer.findByTestId("subagents-graph")).toHaveTextContent("conv_root");
   });
 
   it("creates a task from the inline form", async () => {

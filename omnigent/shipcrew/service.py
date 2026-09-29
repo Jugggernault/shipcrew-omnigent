@@ -58,13 +58,25 @@ def build_prompt(task: Task) -> str:
     return "\n".join(lines)
 
 
+# Review cards are still watched: Claude can end its turn while a background
+# sub-agent keeps working, and resume when that sub-agent reports.
+WATCHED_REVIEW_STATUSES = frozenset({"review"})
+
+
 def map_session_state(task: Task, snap: SessionSnapshot | None) -> dict[str, Any]:
     """Task field changes implied by the root session's current state."""
     if snap is None:
+        if task.status in WATCHED_REVIEW_STATUSES:
+            return {}
         return {"status": "blocked", "blocked_reason": "agent session no longer exists"}
     changes: dict[str, Any] = {}
     if snap.cost_usd is not None and snap.cost_usd != task.cost_usd:
         changes["cost_usd"] = snap.cost_usd
+    resumed = snap.awaiting_human or snap.status in ("running", "waiting")
+    if task.status in WATCHED_REVIEW_STATUSES and not resumed:
+        # A review card only moves again when its agent picks work back up
+        # (e.g. a background sub-agent reported after the turn ended).
+        return {k: v for k, v in changes.items() if getattr(task, k) != v}
     if snap.awaiting_human:
         changes.update(status="intervention", session_seen_active=True)
     elif snap.status in ("running", "waiting"):
@@ -249,7 +261,9 @@ class ShipcrewService:
 
     async def sync_active(self) -> None:
         """Pull each agent-run task's session state back onto its card."""
-        tasks = await self._call(self.store.list_tasks_by_status, ACTIVE_STATUSES)
+        tasks = await self._call(
+            self.store.list_tasks_by_status, ACTIVE_STATUSES | WATCHED_REVIEW_STATUSES
+        )
         missions = {m.id: m for m in await self.list_missions()}
         for task in tasks:
             if task.human_assigned or task.root_session_id is None:

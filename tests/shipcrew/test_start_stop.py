@@ -178,6 +178,19 @@ class TestSessionMapping:
         task = self._task(status="intervention", session_seen_active=True)
         assert map_session_state(task, SessionSnapshot(status="running")) == {"status": "running"}
 
+    def test_review_card_resumes_when_its_agent_runs_again(self) -> None:
+        task = self._task(status="review", session_seen_active=True)
+        assert map_session_state(task, SessionSnapshot(status="running")) == {"status": "running"}
+
+    def test_review_card_ignores_idle_failed_or_stopped_sessions(self) -> None:
+        task = self._task(status="review", session_seen_active=True, cost_usd=0.1)
+        assert map_session_state(task, SessionSnapshot(status="idle")) == {}
+        assert map_session_state(task, SessionSnapshot(status="failed", error="x")) == {}
+        assert map_session_state(task, None) == {}
+        assert map_session_state(task, SessionSnapshot(status="idle", cost_usd=0.3)) == {
+            "cost_usd": 0.3
+        }
+
     def test_failure_blocks(self) -> None:
         snap = SessionSnapshot(status="failed", error="rate limited")
         assert map_session_state(self._task(), snap) == {
