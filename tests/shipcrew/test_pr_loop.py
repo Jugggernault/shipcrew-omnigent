@@ -35,7 +35,12 @@ from omnigent.shipcrew.pr_loop import (
 from omnigent.shipcrew.router import mount_shipcrew
 from omnigent.shipcrew.scheduler import ShipcrewScheduler
 from omnigent.shipcrew.service import ShipcrewService
-from omnigent.shipcrew.sessions import ChildSessionRequest, RootSessionRequest, SessionSnapshot
+from omnigent.shipcrew.sessions import (
+    ChildSessionRequest,
+    RootSessionRequest,
+    SessionServiceError,
+    SessionSnapshot,
+)
 from omnigent.shipcrew.settings import ShipcrewSettings
 from omnigent.shipcrew.store import Task
 
@@ -424,6 +429,57 @@ class TestCi:
         assert git(repo, "branch", "--list", merged.branch or "") == ""
         calls = [c[:2] for c in gh_state_of(gh_state)["calls"]]
         assert calls.index(["pr", "ready"]) < calls.index(["pr", "merge"])
+
+    async def test_reviewer_start_failure_is_retried_before_holding(
+        self,
+        service: ShipcrewService,
+        sessions: LoopSessions,
+        repo: Path,
+        scheduler: ShipcrewScheduler,
+    ) -> None:
+        # A runner that fails to come up once (seen live: "runner failed to
+        # start") must not park the card: the next tick starts the reviewer.
+        failures = {"left": 1}
+        real = sessions.create_child_session
+
+        async def flaky(request: ChildSessionRequest) -> str:
+            if failures["left"]:
+                failures["left"] -= 1
+                raise SessionServiceError("prompt dispatch failed: runner unavailable")
+            return await real(request)
+
+        sessions.create_child_session = flaky  # type: ignore[method-assign]
+
+        def developer(wt: Path, message: str) -> str:
+            commit(wt, "ok", "", "fix CI")
+            return "PASS"
+
+        sessions.developer = developer
+        task, _ = await start(service, sessions, repo)
+        merged = await run_until(scheduler, service, task.id, status_is("merged"), 20)
+        assert sessions.roles() == ["reviewer"]
+        assert merged.blocked_reason is None
+
+    async def test_reviewer_that_never_starts_is_held_after_retries(
+        self,
+        service: ShipcrewService,
+        sessions: LoopSessions,
+        repo: Path,
+        scheduler: ShipcrewScheduler,
+    ) -> None:
+        async def broken(request: ChildSessionRequest) -> str:
+            raise SessionServiceError("runner unavailable")
+
+        sessions.create_child_session = broken  # type: ignore[method-assign]
+
+        def developer(wt: Path, message: str) -> str:
+            commit(wt, "ok", "", "fix CI")
+            return "PASS"
+
+        sessions.developer = developer
+        task, _ = await start(service, sessions, repo)
+        held = await run_until(scheduler, service, task.id, status_is("intervention"), 20)
+        assert "could not start the reviewer" in (held.blocked_reason or "")
 
     async def test_three_failed_fixes_park_the_card(
         self,

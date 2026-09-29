@@ -417,12 +417,13 @@ class OmnigentSessionService:
             )
             if parent.status_code >= 400:
                 raise SessionServiceError(f"parent session read failed: {_error_detail(parent)}")
-            if not parent.json().get("runner_id"):
-                # No live parent runner to co-locate on: launch on the host.
-                # Only then does the child get a host_id, because stopping a
-                # host-bound session also tears down its runner, which for a
-                # co-located child would be the parent's.
-                metadata["host_id"], _conn = await self._resolve_host(request.acting_user)
+            # Always give the child its own host runner. Co-locating it on the
+            # parent's runner raced with that runner stopping (the developer
+            # goes idle, or is stopped, right before the reviewer starts), and
+            # the child then failed with "runner failed to start". Being
+            # host-bound, stopping the child tears down only its own runner;
+            # parent_session_id still puts it in the parent's tree.
+            metadata["host_id"], _conn = await self._resolve_host(request.acting_user)
             created = await client.post(
                 "/v1/sessions",
                 data={"metadata": json.dumps(metadata)},

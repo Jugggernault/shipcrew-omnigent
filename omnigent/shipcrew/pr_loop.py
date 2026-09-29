@@ -64,6 +64,9 @@ _logger = logging.getLogger(__name__)
 
 MAX_CI_FIX_ATTEMPTS = 3
 MAX_REVIEW_ROUNDS = 3
+# A reviewer/integrator that fails to start is retried on the next ticks
+# before the card is held for a human.
+CHILD_START_ATTEMPTS = 3
 TEMPLATES_DIR = Path(__file__).parent / "templates"
 APPROVALS_FILE = "APPROVALS.md"
 REVIEWER_ROLE = "reviewer"
@@ -507,6 +510,8 @@ class PrLoop:
     def __init__(self, service: ShipcrewService) -> None:
         self._svc = service
         self._merge_locks: dict[str, asyncio.Lock] = {}
+        # ponytail: in-memory, a restart resets the count (worst case: 3 more tries).
+        self._child_start_failures: dict[tuple[str, str], int] = {}
 
     # ── plumbing ──
 
@@ -581,6 +586,16 @@ class PrLoop:
     def _bundle(self, role: str) -> Path | None:
         agent_dir = self._svc.settings.agents_dir / role
         return agent_dir if (agent_dir / "config.yaml").is_file() else None
+
+    def _child_start_failed(self, ctx: _Ctx, role: str) -> bool:
+        """Count a failed child start; True once the card should be held."""
+        key = (ctx.task.id, role)
+        n = self._child_start_failures.get(key, 0) + 1
+        if n < CHILD_START_ATTEMPTS:
+            self._child_start_failures[key] = n
+            return False
+        self._child_start_failures.pop(key, None)
+        return True
 
     async def _start_child(self, ctx: _Ctx, role: str, title: str, prompt: str) -> str:
         agent_dir = self._bundle(role)
@@ -844,7 +859,10 @@ class PrLoop:
                 ctx, REVIEWER_ROLE, f"Review: {ctx.task.title}", prompt
             )
         except SessionServiceError as exc:
+            if not self._child_start_failed(ctx, REVIEWER_ROLE):
+                raise  # transient: _advance_safely notes it and the next tick retries
             return await self._hold(ctx, f"could not start the reviewer: {exc}")
+        self._child_start_failures.pop((ctx.task.id, REVIEWER_ROLE), None)
         return await self._update(
             ctx.task,
             reviewer_session_id=session_id,
@@ -948,9 +966,12 @@ class PrLoop:
                 ctx, INTEGRATOR_ROLE, f"Merge main: {ctx.task.title}", prompt
             )
         except SessionServiceError as exc:
+            if not self._child_start_failed(ctx, INTEGRATOR_ROLE):
+                raise  # transient: retried next tick
             return await self._hold(
                 ctx, f"merge conflict, and the integrator failed to start: {exc}"
             )
+        self._child_start_failures.pop((ctx.task.id, INTEGRATOR_ROLE), None)
         return await self._update(
             ctx.task,
             integrator_session_id=session_id,

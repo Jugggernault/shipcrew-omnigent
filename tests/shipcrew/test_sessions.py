@@ -416,9 +416,9 @@ async def test_last_agent_text_is_the_latest_assistant_message() -> None:
     assert await service.last_agent_text("c", acting_user=None) is None
 
 
-@pytest.mark.parametrize(("parent_runner", "host_bound"), [("run_1", False), (None, True)])
-async def test_child_session_co_locates_on_a_live_parent(
-    bundle: Path, parent_runner: str | None, host_bound: bool, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("parent_runner", ["run_1", None])
+async def test_child_session_gets_its_own_host_runner(
+    bundle: Path, parent_runner: str | None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from omnigent.shipcrew import sessions as sessions_mod
 
@@ -440,7 +440,7 @@ async def test_child_session_co_locates_on_a_live_parent(
     metadata = create["metadata"]
     assert metadata["parent_session_id"] == "conv_root"
     assert metadata["workspace"] == "/wt/task"
-    # A co-located child must not be host-bound: stopping it would tear down
-    # the parent's runner.
-    assert ("host_id" in metadata) is host_bound
+    # Always host-bound, live parent runner or not: co-locating raced with
+    # the parent's runner stopping ("runner failed to start", seen live).
+    assert metadata["host_id"] == "host_a"
     assert stub.events[-1][1]["data"]["content"][0]["text"] == "review this"
