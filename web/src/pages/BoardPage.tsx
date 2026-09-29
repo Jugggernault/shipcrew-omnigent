@@ -10,8 +10,10 @@
  * - A card opens a drawer with the task's acceptance criteria, its pull
  *   request, review and approval gate, and its live sub-agent tree (the chat
  *   view's `SubagentsGraphView`).
- * - The mission header starts the planner ("Plan from PRD"), shows its run,
- *   and forces a GitHub sync.
+ * - The mission header starts the planner ("Plan from PRD", with the
+ *   "Run automatically after planning" setting), shows its run, forces a
+ *   GitHub sync, moves every backlog card to Ready ("Run all tasks"), and
+ *   sends short orders to the crew ("Ask the crew…", rule-based server side).
  * - The selected mission and task live in `?mission=` / `?task=`.
  */
 
@@ -36,13 +38,16 @@ import {
   useApproveTask,
   useCreateMission,
   useCreateTask,
+  useMissionCommand,
   useMissions,
   useMissionTasks,
   usePlanMission,
   useRequestTaskChanges,
+  useStartAllTasks,
   useStartTask,
   useStopTask,
   useSyncMission,
+  useUpdateMission,
   useUpdateTask,
 } from "@/board/api";
 import { BoardColumn } from "@/board/BoardColumn";
@@ -55,6 +60,7 @@ import {
 } from "@/board/columns";
 import { columnKeyboardCoordinates } from "@/board/keyboard";
 import { MissionPlanStatus, missionPlan, PlanFromPrdDialog } from "@/board/MissionPlan";
+import { MissionCommandBox, RunAllTasksButton, runnableBacklog } from "@/board/MissionRun";
 import { NewMissionDialog } from "@/board/NewMissionDialog";
 import { NewTaskForm } from "@/board/NewTaskForm";
 import { TaskCard } from "@/board/TaskCard";
@@ -114,6 +120,7 @@ export function BoardPage() {
   const [blockedOnly, setBlockedOnly] = useState(false);
   const columns = useMemo(() => projectColumns(tasks, { blockedOnly }), [tasks, blockedOnly]);
   const blockedCount = useMemo(() => tasks.filter(isBlocked).length, [tasks]);
+  const backlogCount = useMemo(() => runnableBacklog(tasks).length, [tasks]);
 
   const createMission = useCreateMission();
   const createTask = useCreateTask(missionId);
@@ -124,6 +131,9 @@ export function BoardPage() {
   const { mutateAsync: requestChangesAsync } = useRequestTaskChanges();
   const { mutateAsync: planAsync } = usePlanMission();
   const { mutate: mutateSync, isPending: syncing } = useSyncMission();
+  const { mutate: mutateStartAll, isPending: startingAll } = useStartAllTasks();
+  const { mutate: mutateMission } = useUpdateMission();
+  const { mutateAsync: commandAsync } = useMissionCommand();
 
   const selectedTaskId = searchParams.get(TASK_QUERY_PARAM);
   const selectedTask = tasks.find((task) => task.id === selectedTaskId) ?? null;
@@ -192,6 +202,41 @@ export function BoardPage() {
         onError: (error) => showToast(`Could not sync with GitHub: ${errorMessage(error)}`),
       }),
     [mutateSync],
+  );
+
+  const startAll = useCallback(
+    (target: Mission) =>
+      mutateStartAll(target, {
+        onSuccess: ({ started }) =>
+          showToast(
+            started.length === 1
+              ? "Moved 1 task to Ready"
+              : `Moved ${started.length} tasks to Ready`,
+          ),
+        onError: (error) => showToast(`Could not run the tasks: ${errorMessage(error)}`),
+      }),
+    [mutateStartAll],
+  );
+  const setAutoRun = useCallback(
+    (target: Mission, autoRun: boolean) =>
+      mutateMission(
+        { mission: target, patch: { auto_run: autoRun } },
+        { onError: (error) => showToast(`Could not save the setting: ${errorMessage(error)}`) },
+      ),
+    [mutateMission],
+  );
+  const command = useCallback(
+    async (target: Mission, text: string) => {
+      try {
+        const result = await commandAsync({ mission: target, text });
+        showToast(result.message);
+        return result;
+      } catch (error) {
+        showToast(errorMessage(error));
+        throw error;
+      }
+    },
+    [commandAsync],
   );
 
   const moveTask = useCallback(
@@ -318,7 +363,17 @@ export function BoardPage() {
         </div>
         {mission && (
           <div className="flex shrink-0 flex-wrap items-center justify-end gap-1.5">
-            <PlanFromPrdDialog mission={mission} onPlan={(prd) => planAsync({ mission, prd })} />
+            <MissionCommandBox onCommand={(text) => command(mission, text)} />
+            <RunAllTasksButton
+              count={backlogCount}
+              pending={startingAll}
+              onRun={() => startAll(mission)}
+            />
+            <PlanFromPrdDialog
+              mission={mission}
+              onPlan={(prd) => planAsync({ mission, prd })}
+              onAutoRunChange={(autoRun) => setAutoRun(mission, autoRun)}
+            />
             <Button variant="ghost" size="sm" onClick={() => sync(mission)} loading={syncing}>
               <RefreshCwIcon className="size-3.5" />
               Sync GitHub

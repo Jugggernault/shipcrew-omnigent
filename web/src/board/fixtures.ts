@@ -42,6 +42,7 @@ export function makeMission(overrides: Partial<Mission> = {}): Mission {
     repo_url: null,
     status: "active",
     plan: { status: "idle", session_id: null, error: null, imported_count: 0 },
+    auto_run: false,
     created_at: 1_788_253_200,
     ...overrides,
   };

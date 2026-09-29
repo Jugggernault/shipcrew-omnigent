@@ -1591,6 +1591,7 @@ class ClaudeSDKExecutor(Executor):
         agent_name: str | None = None,
         skills_filter: str | list[str] = "all",
         api_key_helper: str | None = None,
+        strict_mcp_config: bool = False,
     ) -> None:
         """Create a ClaudeSDKExecutor.
 
@@ -1664,6 +1665,10 @@ class ClaudeSDKExecutor(Executor):
                 Injected into ``_extra_env`` as
                 :data:`_CLAUDE_API_KEY_HELPER_ENV_KEY` so it reaches
                 the SDK's ``settings.apiKeyHelper`` option at turn time.
+            strict_mcp_config: Pass ``--strict-mcp-config`` so the CLI loads
+                only the servers the SDK hands it (the in-process
+                ``omnigent`` tools), not the host user's MCP servers,
+                plugins or claude.ai connectors (shipcrew fork).
         """
         # Fail loud: a ``databricks-*`` model requires the gateway transport.
         if not gateway and model is not None and model.startswith("databricks-"):
@@ -1806,6 +1811,7 @@ class ClaudeSDKExecutor(Executor):
         # ``_CLAUDE_API_KEY_HELPER_ENV_KEY`` from ``_extra_env`` only.
         if api_key_helper:
             self._extra_env[_CLAUDE_API_KEY_HELPER_ENV_KEY] = api_key_helper
+        self._strict_mcp_config = strict_mcp_config
 
     def __del__(self) -> None:
         wrapper_path = getattr(self, "_cli_wrapper_path", None)
@@ -2645,7 +2651,10 @@ class ClaudeSDKExecutor(Executor):
             "include_hook_events": True,
             "skills": resolved.skills,
             "plugins": bundle_plugins,
-            "extra_args": {"no-session-persistence": None},
+            "extra_args": {
+                "no-session-persistence": None,
+                **({"strict-mcp-config": None} if self._strict_mcp_config else {}),
+            },
             "max_buffer_size": 10 * 1024 * 1024,
         }
         # Only forward ``setting_sources`` when explicitly set.

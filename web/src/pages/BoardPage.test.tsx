@@ -13,6 +13,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { makeMission, makeTask } from "@/board/fixtures";
 import type { Mission, Task } from "@/board/types";
+import { showToast } from "@/components/ui/toast";
 import { authenticatedFetch } from "@/lib/identity";
 import { BoardPage } from "./BoardPage";
 
@@ -34,6 +35,7 @@ vi.mock("@/lib/identity", async (importActual) => ({
   ...(await importActual<typeof Identity>()),
   authenticatedFetch: vi.fn(),
 }));
+vi.mock("@/components/ui/toast", () => ({ showToast: vi.fn() }));
 vi.mock("@/hooks/useViewerId", () => ({ useViewerId: () => "ana@example.com" }));
 vi.mock("@/shell/SubagentsGraphView", () => ({
   SubagentsGraphView: ({ rootSessionId }: { rootSessionId: string }) => (
@@ -69,6 +71,24 @@ function serve(input: RequestInfo | URL, init?: RequestInit): Response {
   }
   if (url === "/v1/shipcrew/missions/mission_1/sync" && method === "POST") {
     return json(missions[0]);
+  }
+  if (url === "/v1/shipcrew/missions/mission_1/start-all" && method === "POST") {
+    const started = tasks.filter((task) => task.status === "backlog").map((task) => task.id);
+    tasks = tasks.map((task) =>
+      started.includes(task.id) ? { ...task, status: "ready" as const } : task,
+    );
+    return json({ mission: missions[0], started });
+  }
+  if (url === "/v1/shipcrew/missions/mission_1" && method === "PATCH") {
+    missions = [{ ...missions[0], ...(body as Partial<Mission>) }];
+    return json(missions[0]);
+  }
+  if (url === "/v1/shipcrew/missions/mission_1/command" && method === "POST") {
+    const text = (body as { text: string }).text;
+    if (text !== "lance tout") {
+      return json({ error: { code: "invalid_input", message: "Unknown command" } }, 400);
+    }
+    return json({ intent: "start_all", message: "Moved 1 task to Ready.", mission: missions[0] });
   }
   if (url.endsWith("/stream")) return new Response("unavailable", { status: 503 });
   if (/^\/v1\/sessions\/[^/]+\/child_sessions$/.test(url)) {
@@ -155,6 +175,7 @@ function mutations(method: string) {
 }
 
 beforeEach(() => {
+  vi.mocked(showToast).mockClear();
   fetchMock.mockReset();
   fetchMock.mockImplementation(async (input, init) => serve(input, init));
   requests = [];
@@ -498,6 +519,67 @@ describe("BoardPage", () => {
         body: undefined,
       }),
     );
+  });
+
+  it("runs every backlog task after a confirmation", async () => {
+    renderBoard();
+    await screen.findByText("Billing page");
+    const button = screen.getByRole("button", { name: /Run all tasks/ });
+    expect(within(button).getByTestId("run-all-count")).toHaveTextContent("1");
+    fireEvent.click(button);
+    const dialog = await screen.findByRole("dialog", { name: "Run 1 task?" });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Run 1 task" }));
+    await waitFor(() => expect(column("ready").getByText("Write the schema")).toBeInTheDocument());
+    expect(requests).toContainEqual({
+      method: "POST",
+      url: "/v1/shipcrew/missions/mission_1/start-all",
+      body: undefined,
+    });
+    expect(vi.mocked(showToast)).toHaveBeenCalledWith("Moved 1 task to Ready");
+    expect(screen.getByRole("button", { name: /Run all tasks/ })).toBeDisabled();
+  });
+
+  it("saves the auto-run setting from the plan dialog", async () => {
+    renderBoard();
+    await screen.findByText("Billing page");
+    fireEvent.click(screen.getByRole("button", { name: "Plan from PRD" }));
+    const dialog = await screen.findByRole("dialog", { name: "Plan from PRD" });
+    fireEvent.click(
+      within(dialog).getByRole("checkbox", { name: "Run automatically after planning" }),
+    );
+    await waitFor(() =>
+      expect(requests).toContainEqual({
+        method: "PATCH",
+        url: "/v1/shipcrew/missions/mission_1",
+        body: { auto_run: true },
+      }),
+    );
+    await waitFor(() =>
+      expect(
+        within(dialog).getByRole("checkbox", { name: "Run automatically after planning" }),
+      ).toBeChecked(),
+    );
+  });
+
+  it("sends a command to the crew and toasts what it did", async () => {
+    renderBoard();
+    await screen.findByText("Billing page");
+    const input = screen.getByRole("textbox", { name: "Command for the crew" });
+    fireEvent.change(input, { target: { value: "lance tout" } });
+    fireEvent.submit(screen.getByRole("form", { name: "Ask the crew" }));
+    await waitFor(() =>
+      expect(vi.mocked(showToast)).toHaveBeenCalledWith("Moved 1 task to Ready."),
+    );
+    expect(requests).toContainEqual({
+      method: "POST",
+      url: "/v1/shipcrew/missions/mission_1/command",
+      body: { text: "lance tout" },
+    });
+
+    fireEvent.change(input, { target: { value: "deploy" } });
+    fireEvent.submit(screen.getByRole("form", { name: "Ask the crew" }));
+    await waitFor(() => expect(vi.mocked(showToast)).toHaveBeenCalledWith("Unknown command"));
+    expect(input).toHaveValue("deploy");
   });
 
   it("approves a gated merge from the drawer", async () => {

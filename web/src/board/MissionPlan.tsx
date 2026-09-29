@@ -5,6 +5,7 @@
 import { useState, type FormEvent } from "react";
 import { CircleCheckIcon, CircleXIcon, SparklesIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
 import {
   Dialog,
   DialogContent,
@@ -33,10 +34,13 @@ function taskCount(count: number): string {
 export function PlanFromPrdDialog({
   mission,
   onPlan,
+  onAutoRunChange,
 }: {
   mission: Mission;
   /** Starts the planner; rejects with the server's message. */
   onPlan: (prd: string | undefined) => Promise<unknown>;
+  /** Saves `mission.auto_run`; the checkbox is hidden without it. */
+  onAutoRunChange?: (autoRun: boolean) => void;
 }) {
   const [open, setOpen] = useState(false);
   const [prd, setPrd] = useState("");
@@ -97,6 +101,15 @@ export function PlanFromPrdDialog({
               className="max-h-[50vh] min-h-40 font-mono text-xs md:text-xs"
             />
           </label>
+          {onAutoRunChange && (
+            <label className="flex items-center gap-2 text-ui">
+              <Checkbox
+                checked={mission.auto_run === true}
+                onCheckedChange={(checked) => onAutoRunChange(checked === true)}
+              />
+              Run automatically after planning
+            </label>
+          )}
           {error && (
             <p role="alert" className="text-xs text-destructive">
               {error}

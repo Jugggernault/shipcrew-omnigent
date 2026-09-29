@@ -39,6 +39,7 @@ class Mission:
     plan_error: str | None = None
     plan_imported_count: int = 0
     plan_started_at: float | None = None
+    auto_run: bool = False
 
     def to_api(self) -> dict[str, Any]:
         """Serialize to the shared API contract shape."""
@@ -55,6 +56,7 @@ class Mission:
                 "error": self.plan_error,
                 "imported_count": self.plan_imported_count,
             },
+            "auto_run": self.auto_run,
         }
 
 
@@ -157,6 +159,7 @@ def _mission(row: SqlMission) -> Mission:
         plan_error=row.plan_error,
         plan_imported_count=int(row.plan_imported_count or 0),
         plan_started_at=row.plan_started_at,
+        auto_run=bool(row.auto_run),
     )
 
 
@@ -243,6 +246,7 @@ _MISSION_FIELDS = frozenset(
         "plan_error",
         "plan_imported_count",
         "plan_started_at",
+        "auto_run",
     }
 )
 _PLAN_TASK_FIELDS = ("title", "body", "acceptance", "role", "owned_paths")
@@ -297,6 +301,7 @@ class ShipcrewStore:
             status="planning",
             owner_user_id=owner_user_id,
             created_at=int(time.time()),
+            auto_run=False,
         )
         with self._session("create_mission") as session:
             session.add(row)
@@ -393,6 +398,36 @@ class ShipcrewStore:
                 if row.status in _PLAN_EDITABLE_STATUSES:
                     row.depends_on = [rows[k].id for k in spec.depends_on]
             return [_task(rows[spec.key]) for spec in specs]
+
+    def ready_backlog(self, mission_id: str, task_ids: set[str] | None = None) -> list[Task]:
+        """Move the mission's backlog tasks to ``ready``, in one transaction.
+
+        Human-assigned tasks stay in the backlog. Moving a task to ready only
+        queues it: the scheduler's gates (dependencies, capacity, owned paths,
+        budget) decide what starts.
+
+        :param task_ids: Only these tasks (e.g. the ones a plan import just
+            wrote); ``None`` means every backlog task of the mission.
+        :returns: The tasks that moved, in board order (empty when none did).
+        """
+        stmt = (
+            select(SqlTask)
+            .where(SqlTask.mission_id == mission_id, SqlTask.status == "backlog")
+            .order_by(SqlTask.position, SqlTask.created_at, SqlTask.id)
+        )
+        now = int(time.time())
+        with self._session("ready_backlog") as session:
+            moved: list[Task] = []
+            for row in session.scalars(stmt).all():
+                if row.assignee_kind == "human":
+                    continue
+                if task_ids is not None and row.id not in task_ids:
+                    continue
+                row.status = "ready"
+                row.blocked_reason = None
+                row.updated_at = now
+                moved.append(_task(row))
+            return moved
 
     # ── Tasks ───────────────────────────────────────────────────
 

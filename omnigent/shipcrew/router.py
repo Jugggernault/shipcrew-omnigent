@@ -19,7 +19,9 @@ from fastapi import APIRouter, FastAPI, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.routes._auth_helpers import require_user
+from omnigent.shipcrew.commands import MAX_COMMAND_CHARS, classify, unknown_command_message
 from omnigent.shipcrew.events import MissionEventBus
 from omnigent.shipcrew.scheduler import ShipcrewScheduler
 from omnigent.shipcrew.service import ShipcrewService
@@ -96,6 +98,18 @@ class PlanBody(BaseModel):
     prd: str | None = Field(default=None, max_length=200_000)
 
 
+class PatchMissionBody(BaseModel):
+    auto_run: bool | None = None
+
+
+class CommandBody(BaseModel):
+    text: str = Field(min_length=1, max_length=MAX_COMMAND_CHARS)
+
+
+def _plural(count: int, word: str) -> str:
+    return f"{count} {word}" if count == 1 else f"{count} {word}s"
+
+
 def _sse(event: dict[str, Any]) -> str:
     return f"data: {json.dumps(event, separators=(',', ':'))}\n\n"
 
@@ -131,6 +145,72 @@ def create_shipcrew_router(
             body.title, body.repo_path, body.repo_url, user_id
         )
         return mission.to_api()
+
+    @router.patch("/missions/{mission_id}")
+    async def patch_mission(
+        request: Request, mission_id: str, body: PatchMissionBody
+    ) -> dict[str, Any]:
+        user_id = require_user(request, auth_provider)
+        service = await _svc()
+        mission = await service.authorize_mission(mission_id, user_id)
+        if body.auto_run is not None:
+            mission = await service.set_auto_run(mission_id, body.auto_run)
+        return mission.to_api()
+
+    async def _start_all(service: ShipcrewService, mission_id: str) -> list[str]:
+        started = [t.id for t in await service.start_all(mission_id)]
+        if started and on_ready is not None:
+            on_ready()
+        return started
+
+    @router.post("/missions/{mission_id}/start-all")
+    async def start_all(request: Request, mission_id: str) -> dict[str, Any]:
+        user_id = require_user(request, auth_provider)
+        service = await _svc()
+        await service.authorize_mission(mission_id, user_id)
+        started = await _start_all(service, mission_id)
+        mission = await service.require_mission(mission_id)
+        return {"mission": mission.to_api(), "started": started}
+
+    @router.post("/missions/{mission_id}/command")
+    async def mission_command(
+        request: Request, mission_id: str, body: CommandBody
+    ) -> dict[str, Any]:
+        user_id = require_user(request, auth_provider)
+        service = await _svc()
+        await service.authorize_mission(mission_id, user_id)
+        intent = classify(body.text)
+        if intent is None:
+            raise OmnigentError(unknown_command_message(body.text), code=ErrorCode.INVALID_INPUT)
+        result: dict[str, Any] = {"intent": intent}
+        if intent == "start_all":
+            started = await _start_all(service, mission_id)
+            result["started"] = started
+            result["message"] = (
+                f"Moved {_plural(len(started), 'task')} to Ready."
+                if started
+                else "No backlog task to run."
+            )
+        elif intent == "stop_all":
+            stopped = [t.id for t in await service.stop_all(mission_id, user_id)]
+            result["stopped"] = stopped
+            result["message"] = (
+                f"Stopped {_plural(len(stopped), 'running task')}."
+                if stopped
+                else "No running task to stop."
+            )
+        elif intent == "plan":
+            # The PRD comes from the repo (.shipcrew/prd.md); the dialog sends text.
+            await service.planner.start(mission_id, None, user_id)
+            result["message"] = "Planner started from the repository PRD."
+        else:
+            report = await service.github.sync_mission(mission_id)
+            result["sync"] = report.to_api()
+            result["message"] = (
+                "GitHub sync done." if report.ok else f"GitHub sync skipped: {report.reason}"
+            )
+        result["mission"] = (await service.require_mission(mission_id)).to_api()
+        return result
 
     @router.post("/missions/{mission_id}/plan")
     async def plan_mission(

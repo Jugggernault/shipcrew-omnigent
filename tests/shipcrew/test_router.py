@@ -44,12 +44,19 @@ class TestAuth:
             ("POST", "/tasks/x/approve"),
             ("POST", "/tasks/x/request-changes"),
             ("GET", "/missions/x/stream"),
+            ("PATCH", "/missions/x"),
+            ("POST", "/missions/x/start-all"),
+            ("POST", "/missions/x/command"),
         ],
     )
     async def test_every_route_requires_identity(
         self, client: httpx.AsyncClient, method: str, path: str
     ) -> None:
-        body = {"title": "t", "repo_path": "/r", "message": "m"} if method != "GET" else None
+        body = (
+            {"title": "t", "repo_path": "/r", "message": "m", "text": "run all"}
+            if method != "GET"
+            else None
+        )
         r = await client.request(method, P + path, json=body, headers={USER_HEADER: ""})
         assert r.status_code == 401
 
@@ -74,13 +81,20 @@ class TestOwnership:
             ("GET", f"/missions/{mission['id']}/tasks"),
             ("POST", f"/missions/{mission['id']}/tasks"),
             ("GET", f"/missions/{mission['id']}/stream"),
+            ("PATCH", f"/missions/{mission['id']}"),
+            ("POST", f"/missions/{mission['id']}/start-all"),
+            ("POST", f"/missions/{mission['id']}/command"),
             ("PATCH", f"/tasks/{task['id']}"),
             ("POST", f"/tasks/{task['id']}/start"),
             ("POST", f"/tasks/{task['id']}/stop"),
             ("POST", f"/tasks/{task['id']}/approve"),
             ("POST", f"/tasks/{task['id']}/request-changes"),
         ]:
-            body = {"title": "t", "message": "m"} if method != "GET" else None
+            body = (
+                {"title": "t", "message": "m", "text": "run all", "auto_run": True}
+                if method != "GET"
+                else None
+            )
             r = await client.request(method, P + path, json=body, headers=bob)
             assert r.status_code == 404, (method, path, r.text)
         # Nothing bob sent reached alice's card.
@@ -93,8 +107,9 @@ class TestMissions:
         created = await _mission(client, repo_url="https://github.com/o/r")
         assert created["status"] == "planning"
         assert set(created) == {
-            "id", "title", "repo_path", "repo_url", "status", "created_at", "plan"
+            "id", "title", "repo_path", "repo_url", "status", "created_at", "plan", "auto_run"
         }  # fmt: skip
+        assert created["auto_run"] is False
         r = await client.get(f"{P}/missions")
         assert r.json() == {"missions": [created]}
 

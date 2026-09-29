@@ -171,6 +171,39 @@ class ShipcrewService:
             raise _not_found("task", task_id)
         return task
 
+    async def set_auto_run(self, mission_id: str, auto_run: bool) -> Mission:
+        """Turn "run automatically after planning" on or off (``mission.updated``)."""
+        mission = await self._call(self.store.update_mission, mission_id, auto_run=auto_run)
+        if mission is None:
+            raise _not_found("mission", mission_id)
+        self.bus.mission_updated(mission)
+        return mission
+
+    async def start_all(self, mission_id: str, task_ids: set[str] | None = None) -> list[Task]:
+        """Queue every backlog task of the mission (``ready``); idempotent.
+
+        The scheduler's gates still decide what actually runs.
+
+        :param task_ids: Restrict to these tasks (a plan import's own).
+        :returns: The tasks moved to ready.
+        """
+        await self.require_mission(mission_id)
+        moved = await self._call(self.store.ready_backlog, mission_id, task_ids)
+        for task in moved:
+            self.bus.task_updated(task)
+        return moved
+
+    async def stop_all(self, mission_id: str, acting_user: str | None) -> list[Task]:
+        """Stop every running (or intervention) task of the mission.
+
+        :returns: The tasks that were stopped (now ``blocked``).
+        """
+        stopped: list[Task] = []
+        for task in await self.list_tasks(mission_id):
+            if task.status in ACTIVE_STATUSES:
+                stopped.append(await self.stop_task(task.id, acting_user))
+        return stopped
+
     # ── Tasks ───────────────────────────────────────────────────
 
     async def require_task(self, task_id: str) -> Task:
