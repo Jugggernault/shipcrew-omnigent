@@ -10,7 +10,8 @@ function Columns() {
   const columns = projectColumns(SAMPLE_TASKS);
   return (
     <DndContext>
-      <div className="flex gap-3">
+      {/* The board's width at a 1600px window next to the default 320px sidebar. */}
+      <div className="flex w-[1280px] gap-2.5 px-5">
         {BOARD_COLUMNS.map((column) => (
           <BoardColumn
             key={column.id}

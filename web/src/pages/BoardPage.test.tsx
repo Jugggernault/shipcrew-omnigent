@@ -443,12 +443,13 @@ describe("BoardPage", () => {
     expect(
       gate.getByRole("button", { name: "Needs approval: Touches migrations/**" }),
     ).toBeVisible();
-    expect(gate.getByTestId("intervention-reason")).toHaveTextContent("Needs your approval");
-    expect(within(cardFor("Refund flow")).getByTestId("intervention-reason")).toHaveTextContent(
-      "Review rounds exhausted",
-    );
+    expect(gate.getByTestId("intervention-reason")).toHaveAttribute("data-kind", "approval");
+    expect(gate.getByLabelText("Needs your approval")).toHaveTextContent("Approve to merge");
+    expect(
+      within(cardFor("Refund flow")).getByLabelText("Review rounds exhausted"),
+    ).toBeInTheDocument();
     const ask = within(cardFor("Send receipts"));
-    expect(ask.getByTestId("intervention-reason")).toHaveTextContent("Guardrail ask pending");
+    expect(ask.getByLabelText("Guardrail ask pending")).toHaveTextContent("Guardrail ask");
     expect(ask.getByRole("link", { name: "Inbox" })).toHaveAttribute("href", "/inbox");
   });
 

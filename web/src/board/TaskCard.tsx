@@ -65,10 +65,12 @@ function InterventionNote({ reason }: { reason: InterventionReason }) {
       className="flex items-center gap-1.5 rounded-md bg-warning/10 px-2 py-1 text-xs text-warning"
       data-testid="intervention-reason"
       data-kind={reason.kind}
-      title={reason.detail}
+      title={`${reason.label}. ${reason.detail}`}
     >
       <TriangleAlertIcon aria-hidden className="size-3 shrink-0" />
-      <span className="min-w-0 flex-1 truncate font-medium">{reason.label}</span>
+      <span className="min-w-0 flex-1 truncate font-medium" aria-label={reason.label}>
+        {reason.short}
+      </span>
       {reason.kind === "guardrail" && (
         <Link
           to="/inbox"

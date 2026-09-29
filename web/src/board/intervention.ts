@@ -9,20 +9,25 @@ export type InterventionKind = "approval" | "review" | "guardrail";
 export interface InterventionReason {
   kind: InterventionKind;
   label: string;
+  /** Fits a narrow board card. */
+  short: string;
   detail: string;
 }
 
 const REASONS: Record<InterventionKind, Omit<InterventionReason, "kind">> = {
   approval: {
     label: "Needs your approval",
+    short: "Approve to merge",
     detail: "The merge waits for a human. Approve it from the task drawer.",
   },
   review: {
     label: "Review rounds exhausted",
+    short: "Reviews used up",
     detail: "The reviewer asked for changes three times. Read the review and step in.",
   },
   guardrail: {
     label: "Guardrail ask pending",
+    short: "Guardrail ask",
     detail: "An agent is waiting on an approval prompt. Answer it in the Inbox.",
   },
 };
