@@ -320,6 +320,8 @@ class TestVerifyLoop:
         assert fix.status == "merged"
         assert (repo / "src" / "cart.js").exists() and (repo / "tests" / "cart.test.js").exists()
         assert done.pr_number is None  # the re-run passed with nothing new to merge
+        # The handed-over tests branch is gone once the card passed.
+        assert git(repo, "branch", "--list", "shipcrew-tests/*") == ""
 
     async def test_after_the_last_fix_cycle_the_card_is_held(
         self,

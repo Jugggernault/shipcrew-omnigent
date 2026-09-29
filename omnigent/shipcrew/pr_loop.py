@@ -62,7 +62,13 @@ from omnigent.shipcrew.review_policy import (
 from omnigent.shipcrew.sessions import ChildSessionRequest, SessionServiceError
 from omnigent.shipcrew.store import Mission, Task
 from omnigent.shipcrew.tools import session_env
-from omnigent.shipcrew.verify import REPORT_FILES, VERIFY_ROLES, VerifyLoop, verify_writable
+from omnigent.shipcrew.verify import (
+    REPORT_FILES,
+    VERIFY_ROLES,
+    VerifyLoop,
+    drop_tests_branches,
+    verify_writable,
+)
 
 if TYPE_CHECKING:
     from omnigent.shipcrew.service import ShipcrewService
@@ -1076,6 +1082,8 @@ class PrLoop:
         ):
             await self._stop(ctx, session_id)
         await self._io(_cleanup_worktree, ctx.repo, ctx.worktree, ctx.branch, ctx.base)
+        if task.role in VERIFY_ROLES:
+            await self._io(drop_tests_branches, ctx.repo, task.id)
         return await self._update(
             task,
             status="merged",

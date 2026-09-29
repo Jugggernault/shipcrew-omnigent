@@ -1,6 +1,6 @@
 """Guardrail policies for the shipcrew role bundles.
 
-Four :class:`FunctionPolicy` factories, registered through
+Five :class:`FunctionPolicy` factories, registered through
 :data:`POLICY_REGISTRY` so uploaded bundles may use them:
 
 * :func:`shell_allowlist` -- a per-role shell allowlist. A shell command runs
@@ -18,6 +18,7 @@ Four :class:`FunctionPolicy` factories, registered through
   policy abstains.
 * :func:`test_writes_only` -- verify roles (qa, security) write test files
   and their report only; any other write is DENY.
+* :func:`workflows_guard` -- ASK before a write to ``.github/workflows/**``.
 * :func:`push_guard` -- the orchestrator may push only task branches named
   ``shipcrew/<8 hex>-<slug>``, every push segment explicitly.
 
@@ -1081,6 +1082,74 @@ def paths_outside_owned(
     return outside
 
 
+# ── Workflow files ───────────────────────────────────────────────────────────
+
+_WORKFLOWS = re.compile(r"(^|[/=:])\.github/workflows(/|$)")
+# Commands that only read what they name (a workflow path in their arguments).
+_WORKFLOW_READERS = frozenset(
+    {"cat", "ls", "head", "tail", "grep", "egrep", "fgrep", "rg", "wc", "diff", "stat",
+     "file", "less", "tree", "echo", "printf", "test", "["}
+)  # fmt: skip
+_GIT_WORKFLOW_READS = frozenset({"diff", "log", "show", "status", "ls-files", "blame", "grep"})
+
+
+def _reads_workflows_only(argv: list[str]) -> bool:
+    if not argv:
+        return True
+    prog, args = argv[0], argv[1:]
+    if prog in _WORKFLOW_READERS:
+        return True
+    if prog == "yq":
+        return not any(a.startswith(("-i", "--inplace")) for a in args)
+    if prog == "find":
+        return not any(a in ("-delete", "-exec", "-execdir", "-ok", "-okdir") for a in args)
+    if prog == "git" and args and args[0] in _GIT_WORKFLOW_READS:
+        return not any(a.startswith(("--output", "-o")) for a in args[1:])
+    return False
+
+
+def workflows_guard(*, reason: str | None = None) -> _Evaluator:
+    """Factory: ASK before any write to ``.github/workflows/**``; reads pass.
+
+    Write tools on a workflow path ASK. A shell command ASKs when a write
+    target (redirection, ``cp``/``mv``/``tee``/``sed -i``/``git checkout
+    <path>`` ...) is a workflow path, or when a simple command that names a
+    workflow path (or runs after ``cd`` into one) is not a known reader. Other
+    simple commands of the same chain do not matter: ``git checkout x -- a.js
+    && ls .github/workflows`` passes (the old regex asked for it). A command
+    naming workflows that cannot be analyzed (substitutions, heredocs) ASKs.
+    """
+    text = reason or "Editing .github/workflows/** needs human approval."
+    ask: _Json = {"result": "ASK", "reason": text}
+
+    def _evaluate(event: _Json, config: _Json | None = None) -> _Json:  # noqa: ARG001
+        paths = _write_tool_paths(event)
+        if paths is not None:
+            return ask if any(_WORKFLOWS.search(p) for p in paths) else _ALLOW
+        command = _shell_command(event)
+        if command is None or "workflows" not in command:
+            return _ALLOW
+        segments = parse_command(command, strict=False)
+        if segments is None:
+            return ask
+        inside = False
+        for seg in segments:
+            argv = seg.argv
+            if argv[:1] == ["cd"]:
+                # After `cd .github` (or deeper) every later command may touch workflows.
+                inside = inside or any(".github" in a or "workflows" in a for a in argv[1:])
+                continue
+            if any(_WORKFLOWS.search(t) for t in [*seg.writes, *shell_write_targets(argv)]):
+                return ask
+            names = inside or any(_WORKFLOWS.search(a) for a in argv)
+            writes = [w for w in seg.writes if not _scratch_target(w)]
+            if names and (writes or not _reads_workflows_only(argv)):
+                return ask
+        return _ALLOW
+
+    return _evaluate
+
+
 # ── Orchestrator push guard ──────────────────────────────────────────────────
 
 _PUSH_BANNED_FLAGS = re.compile(
@@ -1236,6 +1305,14 @@ POLICY_REGISTRY: list[dict[str, object]] = [
                 "reason": {"type": "string"},
             },
         },
+    },
+    {
+        "handler": "omnigent.shipcrew.policies.workflows_guard",
+        "kind": "factory",
+        "name": "shipcrew: Workflows Guard",
+        "description": "Asks before any write to .github/workflows/**; reads (also chained with "
+        "other commands) pass.",
+        "params_schema": {"type": "object", "properties": {"reason": {"type": "string"}}},
     },
     {
         "handler": "omnigent.shipcrew.policies.push_guard",

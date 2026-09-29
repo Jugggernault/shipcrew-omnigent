@@ -11,6 +11,67 @@ live end-to-end run: 2026-09-29.
 ![Card held for a human merge approval (APPROVALS.md)](board-approval.png)
 ![Drawer with the Approve merge action](drawer-approval.png)
 
+## Round 4: verify roles and speed (2026-09-29)
+
+- **Verify roles write tests only** (`omnigent/shipcrew/policies.py`
+  `test_writes_only`, registered): qa and security may write `test/**`,
+  `tests/**`, `e2e/**` (top level), `**/__tests__/**`, `**/__snapshots__/**`,
+  `**/*.test.*`, `**/*.spec.*` and their report (`.shipcrew/qa.json`,
+  `.shipcrew/security.md`); any other write (write tools and shell targets) is
+  DENY. `owned_paths` gained `extra_free_paths` (the report file) and still asks
+  for a test outside the task. The PR loop re-checks the diff: a non-test file
+  in a verify PR needs approval.
+- **Failures become fix tasks** (`omnigent/shipcrew/verify.py`, hooked at the
+  PR loop's first step): verify `PASS` with no commits -> card `merged`
+  (nothing to merge); `PASS` with tests -> normal PR; `FAIL` or a
+  blocker/major finding -> ONE developer task `Fix: <title>` (findings with
+  file:line and repro, the report, "add a regression test"; owned paths = the
+  files named, fallback the verify task's; plan key `fix:<id>:<n>`), Ready. The
+  verify card goes back to Ready with `depends_on += fix`, its worktree and
+  branch removed so it re-runs on the merged fix. Tests it wrote stay on local
+  branch `shipcrew-tests/<id8>-<n>`, named in the fix body. After 2 fix cycles:
+  Intervention `verification still failing after 2 fix cycles: <reason>` (the
+  session sync leaves that hold alone until a human talks to the agent).
+- **Parallel starts** (`service.schedule_ready`): gates are evaluated in order
+  against a view where each picked card already runs, then the picked cards
+  start with `asyncio.gather`. `git worktree add` is serialized per repository
+  (`OmnigentSessionService._worktree_lock`).
+- **node_modules seeding** (`omnigent/shipcrew/deps_seed.py`): a new task
+  worktree whose lockfile is byte-identical to the main checkout's (and whose
+  `node_modules` is gitignored) gets a reflink copy, else a hardlink copy
+  (`cp -al`, symlinks kept, so pnpm's layout works). Files a package manager
+  rewrites in place (`.package-lock.json`, `.modules.yaml`, ...) are made
+  private, tool caches are dropped. Any failure: silently nothing.
+- **Cheaper reviews** (`omnigent/shipcrew/review_policy.py`): with CI green, a
+  tests-only or docs-only diff (`.md/.rst/.adoc`, not `AGENTS.md`, `CLAUDE.md`,
+  `DESIGN.md`, skills, `.shipcrew/`, `.github/`) skips the reviewer
+  (`review.summary = "review skipped: ..."`, `SHIPCREW_REVIEW_SKIP=0` turns it
+  off). Otherwise the reviewer session gets `reasoning_effort` `low` (<= 40
+  changed lines) or `medium` (< 150), passed as session metadata, which
+  claude-native turns into `--effort` (`SHIPCREW_REVIEW_EFFORT_TINY/SMALL`).
+- **CI template**: pnpm or npm picked from the lockfile, setup-node cache,
+  `--prefer-offline` installs, `.next/cache`, lint + typecheck + test in one
+  parallel step (each log grouped, fails if any failed), `cancel-in-progress`.
+- **Bundles** (shipcrew `v3-qaspeed`): planner (fewest, largest tasks along
+  module boundaries; small PRD = at most 5 tasks + one final qa verify task with
+  the security checklist; verify roles never implement), COMMON speed rules
+  (unit tests on route handlers with the fake DB, one command for the whole
+  suite, e2e and dev servers only when needed, batched reads, no polling,
+  install once), scaffolder on pnpm with `packageManager`.
+
+Measured on this machine (ext4, so the hardlink path; Next 15 + React 19 +
+vitest + eslint + faker, 391 MB, ~13k files):
+
+| | fresh worktree install | seed |
+|---|---|---|
+| npm (`npm ci --prefer-offline`, warm cache) | 5.1 s | 0.34 s |
+| pnpm (`pnpm install --frozen-lockfile --prefer-offline`, warm store) | 0.68 s | 0.21 s |
+| cold install (empty worktree, network) | npm 23.5 s, pnpm 33.4 s | 0.2-0.3 s |
+
+The seed also saves the agent's install turn. Parallel starts: N starts take
+the time of the slowest instead of the sum (test: 2 x 0.3 s starts in < 0.6 s).
+CI: the three check scripts run side by side (test: 3 x 0.5 s in < 1.4 s).
+
 ## Round 3: run everything, MCP scoping (2026-09-29)
 
 - **Run all tasks** (`omnigent/shipcrew/router.py`, `service.py`, `store.py`):

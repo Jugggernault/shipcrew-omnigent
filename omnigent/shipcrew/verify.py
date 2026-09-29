@@ -46,6 +46,7 @@ VERIFY_ROLES = frozenset({"qa", "security"})
 MAX_FIX_CYCLES = 2
 FIX_KEY_PREFIX = "fix:"
 VERIFY_HOLD_PREFIX = "verification still failing"
+TESTS_BRANCH_PREFIX = "shipcrew-tests/"
 TEST_GLOBS = DEFAULT_TEST_GLOBS
 # Report files a verify role writes next to its tests.
 REPORT_FILES = {"qa": ".shipcrew/qa.json", "security": ".shipcrew/security.md"}
@@ -178,6 +179,22 @@ def _read_report(worktree: Path | None, role: str) -> str | None:
     return text.strip() or None
 
 
+def tests_branch_name(task_id: str, cycle: int) -> str:
+    """Local branch that keeps a verify task's failing tests for its fix task."""
+    return f"{TESTS_BRANCH_PREFIX}{task_id[:8]}-{cycle}"
+
+
+def drop_tests_branches(repo: Path, task_id: str) -> None:
+    """Delete the verify task's ``shipcrew-tests/<id8>-<n>`` branches (it passed)."""
+    from omnigent.shipcrew import pr_loop as pl
+
+    pattern = f"refs/heads/{TESTS_BRANCH_PREFIX}{task_id[:8]}-*"
+    listed = pl._git(["for-each-ref", "--format=%(refname:short)", pattern], repo, check=False)
+    refs = listed.stdout.split()
+    for ref in refs:
+        pl._git(["branch", "-D", ref], repo, check=False)
+
+
 class VerifyLoop:
     """The verify-role branch of the PR loop's first step (see the module docstring).
 
@@ -227,6 +244,7 @@ class VerifyLoop:
 
         await loop._stop(ctx, ctx.task.root_session_id)
         await loop._io(pl._cleanup_worktree, ctx.repo, ctx.worktree, ctx.branch, ctx.base)
+        await loop._io(drop_tests_branches, ctx.repo, ctx.task.id)
         summary = f"{ctx.task.role}: PASS, nothing to merge"
         return await loop._update(
             ctx.task,
@@ -256,7 +274,7 @@ class VerifyLoop:
             names = await loop._io(pl._git, diff, ctx.worktree)
             test_files = [n for n in names.stdout.split("\0") if n and is_test_path(n)]
             if test_files:
-                tests_branch = f"shipcrew-tests/{task.id[:8]}-{cycle}"
+                tests_branch = tests_branch_name(task.id, cycle)
                 await loop._io(pl._git, ["branch", "-f", tests_branch, "HEAD"], ctx.worktree)
         report = _read_report(ctx.worktree, task.role)
         fix = await self._svc.create_task(
