@@ -155,6 +155,9 @@ class SqlTask(ShipcrewBase):
     started_at: Mapped[float | None] = mapped_column(Float, nullable=True)
     # Every time the card entered intervention: [{"at": float, "reason": str}].
     interventions: Mapped[list[Any] | None] = mapped_column(JSON, nullable=True)
+    # ── sc0005vn ──
+    # Automatic "end with PASS/FAIL" turns sent since the agent's last verdict.
+    verdict_nudges: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
 
     __table_args__ = (
         CheckConstraint(_in_check("status", TASK_STATUSES), name="ck_shipcrew_tasks_status"),

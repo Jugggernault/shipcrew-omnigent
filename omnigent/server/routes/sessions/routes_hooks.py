@@ -983,7 +983,11 @@ def register_hooks_routes(
                                 media_type="application/json",
                             )
                         approval_body: dict[str, Any] = (
-                            {"result": "POLICY_ACTION_ALLOW"}
+                            # shipcrew fork: ``human_approved`` tells the
+                            # claude-native hook this ALLOW is a human's
+                            # accepted ASK, so it answers ``allow`` instead
+                            # of letting Claude prompt a second time.
+                            {"result": "POLICY_ACTION_ALLOW", "human_approved": True}
                             if approved
                             else {
                                 "result": "POLICY_ACTION_DENY",

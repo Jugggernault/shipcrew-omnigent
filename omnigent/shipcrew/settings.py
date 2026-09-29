@@ -47,6 +47,9 @@ class ShipcrewSettings:
     :param ship_verify_interval_s: Pause between two URL checks.
     :param ship_allow_private_urls: Accept ``http://`` and private / loopback
         hosts as the deployment URL (tests and local fakes only).
+    :param install_ci: Whether the first task start of a mission commits the
+        shipcrew CI workflow to ``origin/<pr_base>`` when it has none
+        (``SHIPCREW_INSTALL_CI``; needs the PR loop).
     """
 
     agents_dir: Path = Path(DEFAULT_AGENTS_DIR)
@@ -64,6 +67,7 @@ class ShipcrewSettings:
     ship_verify_s: float = 120.0
     ship_verify_interval_s: float = 5.0
     ship_allow_private_urls: bool = False
+    install_ci: bool = True
 
     @classmethod
     def from_env(cls) -> ShipcrewSettings:
@@ -89,4 +93,5 @@ class ShipcrewSettings:
             ship_allow_private_urls=(
                 env.get("SHIPCREW_SHIP_ALLOW_PRIVATE_URLS", "0").strip().lower() not in _FALSEY
             ),
+            install_ci=env.get("SHIPCREW_INSTALL_CI", "1").strip().lower() not in _FALSEY,
         )

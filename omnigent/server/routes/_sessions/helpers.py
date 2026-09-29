@@ -9742,9 +9742,14 @@ def _derive_terminal_launch_args_from_spec(
         allowed_tools = [t for t in re.split(r"[,\s]+", raw_tools) if t]
         if allowed_tools:
             claude_args += ["--allowedTools", ",".join(allowed_tools)]
-        # shipcrew fork: per-role MCP scoping (``strict_mcp_config`` / ``mcp_config``).
-        from omnigent.shipcrew.launch_args import claude_mcp_launch_args
+        # shipcrew fork: per-role MCP scoping (``strict_mcp_config`` / ``mcp_config``)
+        # and no host-user settings/plugins (``setting_sources``).
+        from omnigent.shipcrew.launch_args import (
+            claude_mcp_launch_args,
+            claude_setting_sources_args,
+        )
 
+        claude_args += claude_setting_sources_args(spec.executor.config)
         claude_args += claude_mcp_launch_args(spec.executor.config)
         return _validate_terminal_launch_args(claude_args) if claude_args else None
     if harness == _CODEX_NATIVE_HARNESS:

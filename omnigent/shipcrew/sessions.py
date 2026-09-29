@@ -96,6 +96,9 @@ class SessionSnapshot:
     :param error: Last task error message, when the session failed.
     :param agent_replied: The latest transcript item is the agent's, not the
         user's prompt; only read while idle, to tell "finished" from "not started".
+    :param pending_ask: What the first open approval prompt asks: its
+        ``policy`` name and a redacted, ~120-char ``preview`` of the command /
+        file (see :func:`ask_summary`).
     """
 
     status: str
@@ -103,6 +106,8 @@ class SessionSnapshot:
     cost_usd: float | None = None
     error: str | None = None
     agent_replied: bool = False
+    # ``{"policy": ..., "preview": ...}`` of the first open approval prompt.
+    pending_ask: dict[str, str] | None = None
 
 
 class SessionService(Protocol):
@@ -447,9 +452,12 @@ class OmnigentSessionService:
             # Always give the child its own host runner. Co-locating it on the
             # parent's runner raced with that runner stopping (the developer
             # goes idle, or is stopped, right before the reviewer starts), and
-            # the child then failed with "runner failed to start". Being
-            # host-bound, stopping the child tears down only its own runner;
-            # parent_session_id still puts it in the parent's tree.
+            # stopping the co-located child sent SIGTERM to the parent's
+            # runner (the stop targets the runner bound to the child's row).
+            # An explicit host_id makes the server skip the runner
+            # inheritance (routes_core, shipcrew fork), so stopping the child
+            # tears down only its own runner; parent_session_id still puts it
+            # in the parent's tree.
             metadata["host_id"], _conn = await self._resolve_host(request.acting_user)
             created = await client.post(
                 "/v1/sessions",
@@ -598,17 +606,62 @@ def assistant_text(item: Any) -> str | None:
     return "".join(parts) if parts else None
 
 
+_PREVIEW_MAX = 120
+# Values that must never reach the report: KEY=value / --token value / known token shapes.
+_SECRET_ASSIGN = re.compile(
+    r"(?i)\b([A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD|PASS|AUTH|CREDENTIAL|COOKIE|"
+    r"DATABASE_URL|DSN)[A-Z0-9_]*)(\s*[=:]\s*|\s+)(\"[^\"]*\"|'[^']*'|\S+)"
+)
+_SECRET_SHAPES = re.compile(
+    r"(?i)(bearer\s+)\S+|\b(sk-[A-Za-z0-9_-]{8,}|gh[pousr]_[A-Za-z0-9]{8,}|"
+    r"xox[abp]-[A-Za-z0-9-]{8,}|AKIA[0-9A-Z]{12,}|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9._-]+)"
+    r"|(://[^/\s:@]+:)[^@\s]+@"
+)
+
+
+def redact_preview(text: str, limit: int = _PREVIEW_MAX) -> str:
+    """One line, secrets masked (``KEY=***``, tokens, URL passwords), cut to *limit*."""
+    flat = " ".join(str(text).split())
+    flat = _SECRET_SHAPES.sub(
+        lambda m: (m.group(1) or "") + "***" if m.group(1) or m.group(2) else f"{m.group(3)}***@",
+        flat,
+    )
+    flat = _SECRET_ASSIGN.sub(lambda m: f"{m.group(1)}{m.group(2)}***", flat)
+    return flat if len(flat) <= limit else flat[: limit - 1].rstrip() + "…"
+
+
+def ask_summary(event: object) -> dict[str, str] | None:
+    """``{"policy", "preview"}`` of a ``response.elicitation_request`` event dict."""
+    if not isinstance(event, dict):
+        return None
+    params = event.get("params") if isinstance(event.get("params"), dict) else {}
+    policy = params.get("policy_name") or event.get("policy_name") or ""
+    preview = (
+        params.get("content_preview")
+        or event.get("content_preview")
+        or params.get("message")
+        or event.get("message")
+        or ""
+    )
+    if not policy and not preview:
+        return None
+    return {"policy": str(policy)[:80], "preview": redact_preview(str(preview))}
+
+
 def snapshot_from_payload(payload: dict[str, Any]) -> SessionSnapshot:
     """Reduce a ``GET /v1/sessions/{id}`` body to a :class:`SessionSnapshot`."""
     error = payload.get("last_task_error")
     cost = payload.get("total_cost_usd")
     status = str(payload.get("status") or "idle")
+    pending = payload.get("pending_elicitations") or []
+    pending = pending if isinstance(pending, list) else []
     # Claude-native background shells / agents keep the task in flight.
     if status == "idle" and (payload.get("background_task_count") or 0) > 0:
         status = "running"
     return SessionSnapshot(
         status=status,
-        awaiting_human=bool(payload.get("pending_elicitations")),
+        awaiting_human=bool(pending),
+        pending_ask=next((a for a in map(ask_summary, pending) if a), None),
         cost_usd=float(cost) if isinstance(cost, int | float) else None,
         error=str(error.get("message") or error) if isinstance(error, dict) else None,
     )

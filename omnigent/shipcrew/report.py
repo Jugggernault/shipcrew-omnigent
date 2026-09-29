@@ -104,6 +104,18 @@ def build_report(mission: Mission, tasks: Sequence[Task]) -> str:
     wall = wall_time_s(mission, tasks)
     wall_text = f"{format_duration(wall)} (first task start to ship end)" if wall else "n/a"
     lines.append(f"- **Wall time:** {wall_text}")
+    per_policy: dict[str, int] = {}
+    for task in tasks:
+        for entry in task.interventions:
+            key = str(entry.get("policy") or "other")
+            per_policy[key] = per_policy.get(key, 0) + 1
+    if per_policy:
+        counts = ", ".join(
+            f"{_inline(name)} {n}" for name, n in sorted(per_policy.items(), key=lambda i: -i[1])
+        )
+        lines.append(f"- **Human interventions:** {sum(per_policy.values())} ({counts})")
+    else:
+        lines.append("- **Human interventions:** 0")
     lines.append("")
 
     merged = sum(1 for t in tasks if t.status == "merged")
@@ -194,9 +206,13 @@ def build_report(mission: Mission, tasks: Sequence[Task]) -> str:
         for entry in task.interventions:
             at = entry.get("at")
             when = _stamp(float(at)) if isinstance(at, int | float) else "n/a"
-            lines.append(
-                f"- **{_inline(task.title)}** ({when}): {_inline(entry.get('reason') or '')}"
+            policy, preview = entry.get("policy"), entry.get("preview")
+            what = (
+                f"{_inline(policy)}: {_inline(preview)}"
+                if policy and preview
+                else _inline(entry.get("reason") or "")
             )
+            lines.append(f"- **{_inline(task.title)}** ({when}): {what}")
             count += 1
     if not count:
         lines.append("_None: the crew needed no human._")

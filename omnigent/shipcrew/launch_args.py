@@ -22,6 +22,19 @@ prompt-injected agent can reach. A shipcrew bundle declares instead::
   to the CLI through ``--mcp-config`` too, so it stays. ``mcp_config`` is not
   used there (no shipcrew SDK role needs a server).
 
+User-level Claude settings are scoped the same way: a bundle declares
+``setting_sources: project,local`` and the session skips ``~/.claude/settings.json``
+(the host user's enabled plugins, their SessionStart hooks, user skills and
+``~/.claude/CLAUDE.md``) while the subscription login, which lives outside the
+settings files, keeps working:
+
+- claude-native: :func:`claude_setting_sources_args` -> ``--setting-sources
+  project,local``. The bundle's own skills still load: omnigent passes the
+  bundle with ``--plugin-dir``, which ``--setting-sources`` does not filter,
+  and the bridge's ``--settings`` file (hooks, permission relay) still applies.
+- claude-sdk: ``HARNESS_CLAUDE_SDK_SETTING_SOURCES`` (workflow spawn env) ->
+  ``ClaudeAgentOptions.setting_sources`` (bundle skills ride ``plugins``).
+
 The values are strings because omnigent's spec parser stringifies every scalar
 ``executor.config`` value.
 """
@@ -34,6 +47,8 @@ from typing import Any
 
 STRICT_KEY = "strict_mcp_config"
 CONFIG_KEY = "mcp_config"
+SETTING_SOURCES_KEY = "setting_sources"
+SETTING_SOURCES = ("user", "project", "local")
 _TRUE = frozenset({"true", "1", "yes", "on"})
 # Claude names MCP tools ``mcp__<server>__<tool>``: keep server names plain.
 _SERVER_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
@@ -88,3 +103,29 @@ def claude_mcp_launch_args(config: dict[str, Any]) -> list[str]:
     if parsed is not None:
         args += ["--mcp-config", json.dumps(parsed, separators=(",", ":"))]
     return args
+
+
+def setting_sources(config: dict[str, Any]) -> list[str] | None:
+    """The bundle's ``setting_sources`` (``"project,local"`` -> ``["project", "local"]``).
+
+    :returns: ``None`` when unset (Claude's default sources, user included).
+    :raises ValueError: On a source other than ``user``, ``project``, ``local``.
+    """
+    raw = config.get(SETTING_SOURCES_KEY)
+    if raw is None:
+        return None
+    items = raw if isinstance(raw, list) else str(raw).replace(" ", ",").split(",")
+    sources = [str(s).strip() for s in items if str(s).strip()]
+    bad = [s for s in sources if s not in SETTING_SOURCES]
+    if bad:
+        raise ValueError(
+            f"executor.config.{SETTING_SOURCES_KEY}: unknown source(s) {bad}, "
+            f"expected a subset of {list(SETTING_SOURCES)}"
+        )
+    return sources or None
+
+
+def claude_setting_sources_args(config: dict[str, Any]) -> list[str]:
+    """``--setting-sources <list>`` for a claude-native bundle, or ``[]`` when unset."""
+    sources = setting_sources(config)
+    return ["--setting-sources", ",".join(sources)] if sources else []

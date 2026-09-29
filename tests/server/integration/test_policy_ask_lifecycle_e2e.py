@@ -295,6 +295,8 @@ async def test_ask_policy_approve_flow(
         resp = await evaluate
         assert resp.status_code == 200, resp.text
         assert resp.json()["result"] == "POLICY_ACTION_ALLOW"
+        # shipcrew fork: the claude-native hook answers `allow` on this flag.
+        assert resp.json().get("human_approved") is True
     finally:
         for task in [drain, evaluate]:
             if task is not None and not task.done():

@@ -9,6 +9,7 @@ through ``scripts/shipcrew-fake-gh``.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import os
 import subprocess
@@ -95,6 +96,7 @@ class LoopSessions(FakeSessions):
     reviews: list[str] = field(default_factory=list)
     integrator: Callable[[Path], str] | None = None
     busy: set[str] = field(default_factory=set)
+    child_log: list[tuple[str, Path, str, int]] = field(default_factory=list)
 
     async def create_root_session(self, request: RootSessionRequest) -> str:
         session_id = await super().create_root_session(request)
@@ -122,6 +124,17 @@ class LoopSessions(FakeSessions):
 
     async def create_child_session(self, request: ChildSessionRequest) -> str:
         session_id = await super().create_child_session(request)
+        ws = Path(request.workspace)
+        # Where each child ran, its checkout's HEAD, and which sessions were
+        # already stopped when it started.
+        self.child_log.append(
+            (
+                session_id,
+                ws,
+                git(ws, "rev-parse", "HEAD") if ws.exists() else "",
+                len(self.stopped),
+            )
+        )
         role = request.agent_dir.name
         if role == "reviewer":
             self.agent_texts[session_id] = self.reviews.pop(0) if self.reviews else "APPROVE"
@@ -193,6 +206,8 @@ def settings(tmp_path: Path, agents_dir: Path) -> ShipcrewSettings:
         max_usd=None,
         scheduler_enabled=False,
         pr_loop_enabled=True,
+        # A workflow on main makes "no checks" wait for CI; test_ci_install covers it.
+        install_ci=False,
         db_url=f"sqlite:///{tmp_path / 'shipcrew.db'}",
     )
 
@@ -586,7 +601,9 @@ class TestReview:
         assert "[blocker] src/a.txt:3 — add a test for the retry path" in feedback
         first = sessions.children[0]
         assert first.parent_session_id == task.root_session_id
-        assert first.workspace == str(wt)
+        # Its own checkout of the head (own runner), not the developer's worktree.
+        assert first.workspace != str(wt)
+        assert Path(first.workspace).name.startswith("shipcrew-review-")
         assert first.labels["shipcrew.role"] == "reviewer"
         diff_file = first.prompt.split("Saved diff snapshot")[1].split("`")[3]
         assert "+a" in Path(diff_file).read_text()
@@ -1067,3 +1084,201 @@ class TestHardening:
         done = await service.pr_loop.finish_external_merge(running)
         assert done is not None and done.status == "merged"
         assert not wt.exists() and task.root_session_id in sessions.stopped
+
+
+# ── child workspaces (live bug: stopping a co-located reviewer killed the developer) ──
+
+
+class TestChildWorkspaces:
+    async def test_reviewer_runs_in_its_own_detached_worktree(
+        self,
+        service: ShipcrewService,
+        sessions: LoopSessions,
+        repo: Path,
+        scheduler: ShipcrewScheduler,
+    ) -> None:
+        task, wt = await start(service, sessions, repo, files={"src/a.txt": "a\n", "ok": ""})
+        merged = await run_until(scheduler, service, task.id, status_is("merged"))
+        assert sessions.roles() == ["reviewer"]
+        (child_id, workspace, head, stopped_before) = sessions.child_log[0]
+        # Its own checkout (so its own runner), next to the task worktrees,
+        # detached at the reviewed PR head.
+        assert workspace != wt
+        assert workspace == pr_loop.review_worktree_path(repo, task.id, merged.review_sha or "")
+        assert head == merged.review_sha
+        assert stopped_before == 0
+        root = task.root_session_id
+        assert root is not None
+        # The reviewer was stopped before the developer, which was only stopped
+        # by the merge cleanup; the reviewer checkout is gone afterwards.
+        assert sessions.stopped.index(child_id) < sessions.stopped.index(root)
+        assert sessions.stopped.count(root) == 1
+        assert not workspace.exists()
+        assert str(workspace) not in git(repo, "worktree", "list")
+
+    async def test_review_worktrees_are_idempotent_and_removed(
+        self, repo: Path, tmp_path: Path
+    ) -> None:
+        head = git(repo, "rev-parse", "HEAD")
+        first = await asyncio.to_thread(pr_loop.add_review_worktree, repo, "t" * 32, head)
+        again = await asyncio.to_thread(pr_loop.add_review_worktree, repo, "t" * 32, head)
+        assert first == again and git(first, "rev-parse", "HEAD") == head
+        # A newer head replaces the old checkout of the same task.
+        commit(repo, "n.txt", "n", "next")
+        newer = git(repo, "rev-parse", "HEAD")
+        second = await asyncio.to_thread(pr_loop.add_review_worktree, repo, "t" * 32, newer)
+        assert second != first and not first.exists()
+        await asyncio.to_thread(pr_loop.remove_review_worktrees, repo, "t" * 32)
+        await asyncio.to_thread(pr_loop.remove_review_worktrees, repo, "t" * 32)
+        assert not second.exists()
+        assert "shipcrew-review-" not in git(repo, "worktree", "list")
+
+    async def test_integrator_owns_the_task_worktree_after_the_developer_stops(
+        self,
+        service: ShipcrewService,
+        sessions: LoopSessions,
+        repo: Path,
+        scheduler: ShipcrewScheduler,
+    ) -> None:
+        def integrator(wt: Path) -> str:
+            subprocess.run(["git", "fetch", "-q", "origin"], cwd=wt, check=True)
+            subprocess.run(["git", "merge", "-q", "origin/main"], cwd=wt, capture_output=True)
+            (wt / "shared.txt").write_text("base\nfrom a\nfrom b\n")
+            git(wt, "add", "shared.txt")
+            git(wt, "commit", "-qm", "merge main")
+            return "Resolved.\nPASS"
+
+        sessions.integrator = integrator
+        a, a_wt = await start(
+            service, sessions, repo, title="a", files={"shared.txt": "base\nfrom a\n", "ok": ""}
+        )
+        b, b_wt = await start(
+            service, sessions, repo, title="b",
+            files={"shared.txt": "base\nfrom b\n", "ok": ""}, mission_id=a.mission_id,
+        )  # fmt: skip
+        for _ in range(25):
+            await scheduler.tick()
+            tasks = [await service.require_task(t.id) for t in (a, b)]
+            if all(t.status == "merged" for t in tasks):
+                break
+        assert [t.status for t in tasks] == ["merged", "merged"]
+        index = next(
+            i for i, c in enumerate(sessions.children) if c.agent_dir.name == "integrator"
+        )
+        (_child, workspace, _head, stopped_before) = sessions.child_log[index]
+        # Whichever card merged second hit the conflict: the integrator took over
+        # that card's worktree after its developer was stopped.
+        owner = {a_wt: a, b_wt: b}[workspace]
+        assert owner.root_session_id in sessions.stopped[:stopped_before]
+        # Every reviewer ran in its own checkout, never in a task worktree.
+        for (_c, ws, _h, _n), req in zip(sessions.child_log, sessions.children, strict=True):
+            if req.agent_dir.name == "reviewer":
+                assert ws.name.startswith("shipcrew-review-") and not ws.exists()
+
+    async def test_developer_runner_lost_after_approval_still_merges(
+        self,
+        service: ShipcrewService,
+        sessions: LoopSessions,
+        repo: Path,
+        scheduler: ShipcrewScheduler,
+        client: httpx.AsyncClient,
+    ) -> None:
+        task, _ = await start(
+            service, sessions, repo, files={"auth/login.py": "x = 1\n", "ok": ""}
+        )
+        held = await run_until(scheduler, service, task.id, status_is("intervention"))
+        assert (held.ci, (held.review or {}).get("verdict")) == ("green", "approve")
+        # The developer's runner disconnects (live: "Runner disconnected unexpectedly").
+        assert task.root_session_id is not None
+        sessions.snapshots[task.root_session_id] = SessionSnapshot(
+            status="failed", error="Runner disconnected unexpectedly"
+        )
+        await scheduler.tick()
+        assert (await service.require_task(task.id)).status == "intervention"
+        r = await client.post(f"{P}/tasks/{task.id}/approve")
+        assert r.status_code == 200, r.text
+        merged = await run_until(scheduler, service, task.id, status_is("merged"))
+        assert merged.blocked_reason is None
+
+
+def test_a_merge_ready_card_is_not_blocked_by_a_dead_session() -> None:
+    from omnigent.shipcrew.service import map_session_state
+
+    ready = Task(
+        id="t", mission_id="m", title="t", status="running", pr_number=3, ci="green",
+        review={"verdict": "approve"}, root_session_id="s",
+    )  # fmt: skip
+    failed = SessionSnapshot(status="failed", error="Runner disconnected unexpectedly")
+    assert map_session_state(ready, failed) == {"status": "review", "blocked_reason": None}
+    review = dataclasses.replace(ready, status="review")
+    assert map_session_state(review, None) == {}
+    # Not merge ready (CI red): a dead developer still blocks the card.
+    red = dataclasses.replace(ready, ci="red")
+    assert map_session_state(red, failed)["status"] == "blocked"
+
+
+# ── verdict nudge: one automatic turn before a verdict-less card blocks ──
+
+
+class TestVerdictNudge:
+    async def test_one_nudge_then_the_verdict_proceeds(
+        self,
+        service: ShipcrewService,
+        sessions: LoopSessions,
+        repo: Path,
+        scheduler: ShipcrewScheduler,
+    ) -> None:
+        # A declined ask interrupted the turn: no PASS/FAIL line.
+        sessions.developer = lambda wt, message: "Finished without that command.\nPASS"
+        task, _ = await start(
+            service, sessions, repo, files={"src/a.txt": "a\n", "ok": ""}, verdict="(declined)"
+        )
+        merged = await run_until(scheduler, service, task.id, status_is("merged"))
+        nudges = [m for m in sessions.messages if m[1] == pr_loop.VERDICT_NUDGE]
+        assert nudges == [(task.root_session_id, pr_loop.VERDICT_NUDGE)]
+        # The verdict resets the count for a later turn.
+        assert merged.verdict_nudges == 0
+
+    async def test_second_missing_verdict_blocks(
+        self,
+        service: ShipcrewService,
+        sessions: LoopSessions,
+        repo: Path,
+        scheduler: ShipcrewScheduler,
+    ) -> None:
+        sessions.developer = lambda wt, message: "Still thinking about it."
+        task, _ = await start(service, sessions, repo, verdict="I have a question")
+        done = await run_until(scheduler, service, task.id, status_is("blocked"))
+        assert "without a PASS/FAIL line" in (done.blocked_reason or "")
+        assert [m[1] for m in sessions.messages] == [pr_loop.VERDICT_NUDGE]
+        assert done.verdict_nudges == 1
+
+    async def test_the_nudge_count_survives_a_restart(
+        self,
+        service: ShipcrewService,
+        sessions: LoopSessions,
+        repo: Path,
+        settings: ShipcrewSettings,
+    ) -> None:
+        task, _ = await start(service, sessions, repo, verdict="no verdict here")
+        assert task.root_session_id is not None
+        await service.sync_active()
+        await service.pr_loop.tick()
+        assert (await service.require_task(task.id)).verdict_nudges == 1
+        # A new server (fresh PrLoop, same DB) with the same verdict-less text.
+        await asyncio.to_thread(
+            service.store.update_task, task.id, status="review", session_seen_active=True
+        )
+        from fastapi import FastAPI
+
+        fresh = mount_shipcrew(
+            FastAPI(),
+            conversation_store=_Store(storage_location="sqlite://"),
+            auth_provider=HeaderAuth(),
+            settings=settings,
+            session_service=sessions,
+        )()
+        await fresh.pr_loop.tick()
+        done = await fresh.require_task(task.id)
+        assert done.status == "blocked"
+        assert [m[1] for m in sessions.messages] == [pr_loop.VERDICT_NUDGE]

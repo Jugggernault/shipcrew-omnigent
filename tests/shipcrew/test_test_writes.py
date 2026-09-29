@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import subprocess
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -60,7 +62,8 @@ def test_write_tools(policy: Any, path: str, result: str) -> None:
         ("git add tests && git commit -m 'test: cart'", "ALLOW"),
         ("npx prettier --write tests/cart.test.ts", "ALLOW"),
         ("cp tests/a.test.ts tests/b.test.ts", "ALLOW"),
-        ("rm tests/*.snap", "ALLOW"),
+        # No git repo at ROOT: what a removal deletes cannot be checked (add-only rule).
+        ("rm tests/*.snap", "DENY"),
         ("echo x > src/cart.ts", "DENY"),
         ("cd src && touch x.ts", "DENY"),
         ("cp tests/a.test.ts src/a.ts", "DENY"),
@@ -117,3 +120,58 @@ def test_owned_paths_extra_free_paths_frees_the_report_file() -> None:
     report = _write(f"{ROOT}/.shipcrew/qa.json")
     assert (plain(report, {})["result"], qa(report, {})["result"]) == ("ASK", "ALLOW")
     assert qa(_write(f"{ROOT}/node_modules/x"), {})["result"] == "ALLOW"  # defaults kept
+
+
+class TestAddOnly:
+    """Verify roles add tests; other tasks' tests (on the base branch) are never removed."""
+
+    @pytest.fixture
+    def repo(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+        for key, value in {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@x.invalid",
+                           "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@x.invalid",
+                           "GIT_CONFIG_GLOBAL": str(tmp_path / "gc"),
+                           "GIT_CONFIG_NOSYSTEM": "1"}.items():  # fmt: skip
+            monkeypatch.setenv(key, value)
+        repo = tmp_path / "wt"
+        (repo / "e2e").mkdir(parents=True)
+        (repo / "tests" / "__snapshots__").mkdir(parents=True)
+        (repo / "e2e" / "home-page.spec.ts").write_text("test('home')\n")
+        (repo / "tests" / "__snapshots__" / "a.snap").write_text("x\n")
+        for args in (["init", "-q", "-b", "main"], ["add", "-A"], ["commit", "-qm", "base"],
+                     ["update-ref", "refs/remotes/origin/main", "HEAD"]):  # fmt: skip
+            subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True)
+        (repo / "e2e" / "mine.spec.ts").write_text("test('mine')\n")  # this task's new test
+        return repo
+
+    @pytest.mark.parametrize(
+        ("command", "result"),
+        [
+            ("git rm -q e2e/home-page.spec.ts", "DENY"),  # seen live: "redundant"
+            ("rm e2e/home-page.spec.ts", "DENY"),
+            ("rm -rf e2e", "DENY"),
+            ("mv e2e/home-page.spec.ts e2e/old.spec.ts", "DENY"),
+            ("git mv e2e/home-page.spec.ts e2e/x.spec.ts", "DENY"),
+            ("echo '' > e2e/home-page.spec.ts", "DENY"),
+            ("truncate -s 0 e2e/home-page.spec.ts", "DENY"),
+            ("rm tests/__snapshots__/*.snap", "DENY"),
+            ("echo \"test('more')\" >> e2e/home-page.spec.ts", "ALLOW"),  # adding is fine
+            ("rm e2e/mine.spec.ts", "ALLOW"),  # its own new test
+            ("mv e2e/mine.spec.ts e2e/mine2.spec.ts", "ALLOW"),
+            ("rm e2e/*.tmp.spec.ts", "ALLOW"),  # matches nothing at the base
+            ("rm -rf test-results node_modules/.cache", "ALLOW"),
+        ],
+    )
+    def test_shell(self, repo: Path, command: str, result: str) -> None:
+        policy = make_policy(role="qa", root=str(repo))
+        assert policy(_bash(command), {})["result"] == result
+
+    def test_write_tools(self, repo: Path) -> None:
+        policy = make_policy(role="qa", root=str(repo))
+        existing = str(repo / "e2e" / "home-page.spec.ts")
+        out = policy(_write(existing), {})
+        assert out["result"] == "DENY" and "only adds tests" in out["reason"]
+        edit = {"type": "tool_call", "data": {"name": "Edit", "arguments": {
+            "file_path": existing, "old_string": "a", "new_string": "b"}}}  # fmt: skip
+        assert policy(edit, {})["result"] == "ALLOW"
+        assert policy(_write(str(repo / "e2e" / "mine.spec.ts")), {})["result"] == "ALLOW"
+        assert policy(_write(str(repo / "e2e" / "new.spec.ts")), {})["result"] == "ALLOW"

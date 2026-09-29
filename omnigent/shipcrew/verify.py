@@ -35,6 +35,7 @@ from collections.abc import Iterable, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from omnigent.shipcrew.owned_tests import with_own_tests
 from omnigent.shipcrew.policies import DEFAULT_TEST_GLOBS, is_test_path
 from omnigent.shipcrew.store import Task
 
@@ -220,7 +221,8 @@ class VerifyLoop:
         await loop.record_decisions(task, text)
         verdict = pl.parse_verdict(text)
         if verdict is None or ctx.worktree is None:
-            return None  # the builder path blocks with its usual reason
+            return None  # the builder path nudges once, then blocks
+        await loop.clear_verdict_nudges(task)
         findings = pl._findings(text or "")
         bad = serious(findings)
         await loop._io(pl._fetch, ctx.worktree, ctx.base)
@@ -292,8 +294,9 @@ class VerifyLoop:
             ),
             acceptance=fix_acceptance(bool(tests_branch)),
             role="developer",
-            owned_paths=fix_owned_paths(
-                serious(findings) or findings, test_files, task.owned_paths
+            owned_paths=with_own_tests(
+                f"Fix: {task.title}",
+                fix_owned_paths(serious(findings) or findings, test_files, task.owned_paths),
             ),
         )
         await self._svc.update_fields(fix.id, plan_key=fix_key(task.id, cycle), status="ready")

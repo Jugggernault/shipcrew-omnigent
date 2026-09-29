@@ -7,10 +7,13 @@ import dataclasses
 import logging
 import time
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.shipcrew import main_deps
 from omnigent.shipcrew.branches import task_branch
+from omnigent.shipcrew.ci_install import CiInstall, ensure_ci_workflow
 from omnigent.shipcrew.events import MissionEventBus
 from omnigent.shipcrew.gates import GateContext, evaluate_gates, find_cycle
 from omnigent.shipcrew.issue_sync import GitHubSync
@@ -74,8 +77,25 @@ WATCHED_REVIEW_STATUSES = frozenset({"review"})
 SESSION_HOLDING_STATUSES = ACTIVE_STATUSES | WATCHED_REVIEW_STATUSES
 
 
+def merge_ready(task: Task) -> bool:
+    """A PR with green CI and an approved review: only the merge is left.
+
+    The developer session is no longer needed then, so its runner dying (or
+    its session disappearing) must not block the card: the PR loop merges.
+    """
+    approved = (task.review or {}).get("verdict") == "approve" or task.human_approved
+    return task.pr_number is not None and task.ci == "green" and approved
+
+
 def map_session_state(task: Task, snap: SessionSnapshot | None) -> dict[str, Any]:
     """Task field changes implied by the root session's current state."""
+    if (snap is None or snap.status == "failed") and merge_ready(task):
+        kept: dict[str, Any] = {}
+        if snap is not None and snap.cost_usd is not None and snap.cost_usd != task.cost_usd:
+            kept["cost_usd"] = snap.cost_usd
+        if task.status == "running":
+            kept.update(status="review", blocked_reason=None)
+        return kept
     if snap is None:
         if task.status in WATCHED_REVIEW_STATUSES:
             return {}
@@ -90,13 +110,25 @@ def map_session_state(task: Task, snap: SessionSnapshot | None) -> dict[str, Any
         return {k: v for k, v in changes.items() if getattr(task, k) != v}
     if snap.awaiting_human:
         changes.update(status="intervention", session_seen_active=True)
+        if snap.pending_ask and task.status != "intervention":
+            # What is asked, on the card (reason badge) and in the report.
+            changes["intervention"] = dict(snap.pending_ask)
+            ask = snap.pending_ask
+            changes["blocked_reason"] = (
+                f"Needs approval: {ask.get('policy') or 'agent'}: {ask.get('preview') or ''}"
+            ).rstrip(": ")
     elif snap.status in ("running", "waiting"):
         changes.update(status="running", session_seen_active=True)
+        if task.status == "intervention" and (task.blocked_reason or "").startswith(
+            "Needs approval: "
+        ):
+            changes["blocked_reason"] = None  # the ask was answered
     elif snap.status == "failed":
         changes.update(status="blocked", blocked_reason=snap.error or "agent session failed")
     elif snap.status == "idle" and (task.session_seen_active or snap.agent_replied):
         changes["status"] = "review"
-    return {k: v for k, v in changes.items() if getattr(task, k) != v}
+    # ``intervention`` is not a column: store.update_task logs it with the entry.
+    return {k: v for k, v in changes.items() if getattr(task, k, None) != v}
 
 
 class ShipcrewService:
@@ -114,6 +146,9 @@ class ShipcrewService:
         self.sessions = sessions
         self.settings = settings
         self._starting: set[str] = set()
+        # Missions whose CI workflow is settled (installed, present or refused).
+        self._ci_done: dict[str, CiInstall] = {}
+        self._ci_locks: dict[str, asyncio.Lock] = {}
         self.pr_loop = PrLoop(self)
         self.planner = PlanRunner(self)
         self.github = GitHubSync(self)
@@ -344,6 +379,14 @@ class ShipcrewService:
                 branch=branch,
                 started_at=task.started_at or time.time(),
             )
+            # Before the first branch of the mission is cut: CI on main.
+            await self.ensure_ci(mission)
+            if self.settings.pr_loop_enabled:
+                # A main checkout with a lockfile but no node_modules gets one
+                # background install, so later worktrees seed from it.
+                await self._call(
+                    main_deps.refresh_after_merge, Path(mission.repo_path), self.settings.pr_base
+                )
             base_branch = self.settings.base_branch
             if base_branch is None and self.settings.pr_loop_enabled:
                 base_branch = await self._call(
@@ -382,6 +425,34 @@ class ShipcrewService:
             return await self._update(task.id, root_session_id=session_id)
         finally:
             self._starting.discard(task_id)
+
+    async def ensure_ci(self, mission: Mission) -> CiInstall | None:
+        """Install the shipcrew CI workflow on the mission's base once (see ``ci_install``).
+
+        Serialized per mission, so parallel first starts all fork from the
+        commit that has CI. ``skipped`` (no origin or no base yet) is retried at
+        the next start; any other outcome is kept for the server's lifetime.
+        Never raises: a failure is logged and the task starts anyway.
+        """
+        if not (self.settings.install_ci and self.settings.pr_loop_enabled):
+            return None
+        lock = self._ci_locks.setdefault(mission.id, asyncio.Lock())
+        async with lock:
+            done = self._ci_done.get(mission.id)
+            if done is not None:
+                return done
+            try:
+                result = await self._call(
+                    ensure_ci_workflow, mission.repo_path, self.settings.pr_base
+                )
+            except Exception:
+                _logger.exception("shipcrew: CI install failed for mission %s", mission.id)
+                result = CiInstall("failed", "unexpected error")
+            if result.status == "failed":
+                _logger.warning("shipcrew: CI not installed: %s", result.detail)
+            if result.status != "skipped":
+                self._ci_done[mission.id] = result
+            return result
 
     async def update_fields(self, task_id: str, **fields: Any) -> Task:
         """Write task columns and publish ``task.updated`` (no status side effects)."""

@@ -1592,6 +1592,7 @@ class ClaudeSDKExecutor(Executor):
         skills_filter: str | list[str] = "all",
         api_key_helper: str | None = None,
         strict_mcp_config: bool = False,
+        setting_sources: list[str] | None = None,
     ) -> None:
         """Create a ClaudeSDKExecutor.
 
@@ -1669,6 +1670,10 @@ class ClaudeSDKExecutor(Executor):
                 only the servers the SDK hands it (the in-process
                 ``omnigent`` tools), not the host user's MCP servers,
                 plugins or claude.ai connectors (shipcrew fork).
+            setting_sources: Claude setting sources to load, e.g.
+                ``["project", "local"]`` (no host-user settings, plugins or
+                hooks; shipcrew fork). ``None`` keeps the skills-filter
+                mapping; a ``"none"`` skills filter (``[]``) still wins.
         """
         # Fail loud: a ``databricks-*`` model requires the gateway transport.
         if not gateway and model is not None and model.startswith("databricks-"):
@@ -1812,6 +1817,7 @@ class ClaudeSDKExecutor(Executor):
         if api_key_helper:
             self._extra_env[_CLAUDE_API_KEY_HELPER_ENV_KEY] = api_key_helper
         self._strict_mcp_config = strict_mcp_config
+        self._setting_sources = list(setting_sources) if setting_sources else None
 
     def __del__(self) -> None:
         wrapper_path = getattr(self, "_cli_wrapper_path", None)
@@ -2668,6 +2674,9 @@ class ClaudeSDKExecutor(Executor):
         # branch).
         if resolved.setting_sources is not None:
             options_kwargs["setting_sources"] = resolved.setting_sources
+        # shipcrew fork: bundle-declared sources (e.g. no user settings/plugins).
+        if self._setting_sources is not None and resolved.setting_sources != []:
+            options_kwargs["setting_sources"] = self._setting_sources
         try:
             reasoning_effort = validate_effort(
                 cfg.extra.get("reasoning_effort"), "Claude Agent SDK", CLAUDE_EFFORTS

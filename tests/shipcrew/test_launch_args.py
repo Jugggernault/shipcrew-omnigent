@@ -15,8 +15,10 @@ from omnigent.runtime.workflow import _build_claude_sdk_spawn_env
 from omnigent.server.routes._sessions.helpers import _derive_terminal_launch_args_from_spec
 from omnigent.shipcrew.launch_args import (
     claude_mcp_launch_args,
+    claude_setting_sources_args,
     mcp_server_names,
     parse_mcp_config,
+    setting_sources,
     strict_mcp_enabled,
 )
 from omnigent.spec.types import AgentSpec, ExecutorSpec
@@ -163,51 +165,130 @@ class TestClaudeSdk:
 
     @pytest.mark.parametrize("strict", [True, False])
     def test_executor_passes_strict_to_the_cli(self, strict: bool) -> None:
-        from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
-
-        seen: list[dict[str, Any]] = []
-
-        class _Result:
-            def __init__(self, session_id: str, result: str) -> None:
-                self.session_id = session_id
-                self.result = result
-
-        class _FakeSDK:
-            AssistantMessage = type("AssistantMessage", (), {})
-            UserMessage = type("UserMessage", (), {})
-            SystemMessage = type("SystemMessage", (), {})
-            ResultMessage = _Result
-            StreamEvent = type("StreamEvent", (), {})
-            ClaudeAgentOptions = type(
-                "ClaudeAgentOptions",
-                (),
-                {"__init__": lambda self, **kwargs: self.__dict__.update(kwargs)},
-            )
-
-            class ClaudeSDKClient:
-                def __init__(self, options: Any) -> None:
-                    self.options = options
-
-                async def connect(self) -> None:
-                    return None
-
-                async def query(self, prompt: str, session_id: str = "default") -> None:
-                    seen.append(dict(self.options.extra_args))
-
-                async def receive_response(self) -> Any:
-                    yield _Result("claude-s", "ok")
-
-                async def disconnect(self) -> None:
-                    return None
-
-        async def run() -> None:
-            executor = ClaudeSDKExecutor(strict_mcp_config=strict)
-            with patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=_FakeSDK):
-                messages = [{"role": "user", "content": "hi", "session_id": "s"}]
-                [e async for e in executor.run_turn(messages, [], "")]
-
-        asyncio.run(run())
+        options = _run_executor(strict_mcp_config=strict)
         expected: dict[str, None] = {"no-session-persistence": None}
         if strict:
             expected["strict-mcp-config"] = None
-        assert seen == [expected]
+        assert options["extra_args"] == expected
+
+
+def _run_executor(**kwargs: Any) -> dict[str, Any]:
+    """Run one turn of ClaudeSDKExecutor(**kwargs) on a fake SDK; return the options."""
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+    seen: list[dict[str, Any]] = []
+
+    class _Result:
+        def __init__(self, session_id: str, result: str) -> None:
+            self.session_id = session_id
+            self.result = result
+
+    class _FakeSDK:
+        AssistantMessage = type("AssistantMessage", (), {})
+        UserMessage = type("UserMessage", (), {})
+        SystemMessage = type("SystemMessage", (), {})
+        ResultMessage = _Result
+        StreamEvent = type("StreamEvent", (), {})
+        ClaudeAgentOptions = type(
+            "ClaudeAgentOptions",
+            (),
+            {"__init__": lambda self, **kw: self.__dict__.update(kw)},
+        )
+
+        class ClaudeSDKClient:
+            def __init__(self, options: Any) -> None:
+                self.options = options
+
+            async def connect(self) -> None:
+                return None
+
+            async def query(self, prompt: str, session_id: str = "default") -> None:
+                seen.append(dict(self.options.__dict__))
+
+            async def receive_response(self) -> Any:
+                yield _Result("claude-s", "ok")
+
+            async def disconnect(self) -> None:
+                return None
+
+    async def run() -> None:
+        executor = ClaudeSDKExecutor(**kwargs)
+        with patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=_FakeSDK):
+            messages = [{"role": "user", "content": "hi", "session_id": "s"}]
+            [e async for e in executor.run_turn(messages, [], "")]
+
+    asyncio.run(run())
+    assert len(seen) == 1
+    return seen[0]
+
+
+class TestSettingSources:
+    """``setting_sources: project,local``: no host-user settings, plugins or hooks.
+
+    Checked against the real CLI (2.1.285, subscription login): with
+    ``--setting-sources project,local`` the init event lists only the built-in
+    plugins (no vercel / superpowers / ponytail ...), no SessionStart hook runs,
+    and the turn still answers; without it 8 user plugins and 5 hooks load.
+    """
+
+    def test_parse(self) -> None:
+        assert setting_sources({}) is None
+        assert setting_sources({"setting_sources": "project,local"}) == ["project", "local"]
+        assert setting_sources({"setting_sources": " project local "}) == ["project", "local"]
+        assert setting_sources({"setting_sources": ""}) is None
+        with pytest.raises(ValueError, match="unknown source"):
+            setting_sources({"setting_sources": "project,managed"})
+
+    def test_native_launch_args(self) -> None:
+        spec = _spec(
+            harness="claude-native",
+            permission_mode="default",
+            setting_sources="project,local",
+            strict_mcp_config="true",
+        )
+        assert _derive_terminal_launch_args_from_spec(spec, headless_defaults=False) == [
+            "--permission-mode", "default", "--setting-sources", "project,local",
+            "--strict-mcp-config",
+        ]  # fmt: skip
+        assert claude_setting_sources_args({}) == []
+
+    def test_bundle_skills_still_ride_plugin_dir(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        bundle = tmp_path / "bundle"
+        (bundle / "skills" / "design-lock").mkdir(parents=True)
+        (bundle / "skills" / "design-lock" / "SKILL.md").write_text(
+            "---\nname: design-lock\n---\n"
+        )
+        spec = _spec(harness="claude-native", setting_sources="project,local")
+        base = _derive_terminal_launch_args_from_spec(spec) or []
+        monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+        monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path)
+        args = augment_claude_args(tuple(base), bridge_dir=tmp_path, bundle_dir=bundle)
+        assert args[args.index("--plugin-dir") + 1] == str(bundle)
+        assert args.count("--setting-sources") == 1
+        assert args[args.index("--setting-sources") + 1] == "project,local"
+        assert "--settings" in args  # the bridge's hooks file still applies
+
+    def test_sdk_spawn_env_and_harness(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from omnigent.inner import claude_sdk_harness
+
+        spec = _spec(harness="claude-sdk", setting_sources="project,local")
+        env = _build_claude_sdk_spawn_env(spec)
+        assert env["HARNESS_CLAUDE_SDK_SETTING_SOURCES"] == "project,local"
+        assert "HARNESS_CLAUDE_SDK_SETTING_SOURCES" not in _build_claude_sdk_spawn_env(
+            _spec(harness="claude-sdk")
+        )
+        monkeypatch.setenv("HARNESS_CLAUDE_SDK_SETTING_SOURCES", "project,local")
+        executor = claude_sdk_harness._build_claude_sdk_executor()
+        assert executor._setting_sources == ["project", "local"]  # type: ignore[attr-defined]
+
+    def test_sdk_executor_forwards_them(self) -> None:
+        assert _run_executor(setting_sources=["project", "local"])["setting_sources"] == [
+            "project",
+            "local",
+        ]
+        assert "setting_sources" not in _run_executor()
+        # A "none" skills filter hides every source and still wins.
+        none = _run_executor(setting_sources=["project", "local"], skills_filter="none")
+        assert none["setting_sources"] == []

@@ -364,6 +364,8 @@ def hook_payload_to_evaluation_request(
 def evaluation_response_to_hook_output(
     hook_event: str,
     eval_response: dict[str, object],
+    *,
+    honor_human_approval: bool = False,
 ) -> dict[str, object] | None:
     """
     Convert an ``EvaluationResponse`` into native-harness hook output JSON.
@@ -408,6 +410,12 @@ def evaluation_response_to_hook_output(
         ``"PostToolUse"``, or ``"UserPromptSubmit"``.
     :param eval_response: Parsed ``EvaluationResponse`` from AP, e.g.
         ``{"result": "POLICY_ACTION_DENY", "reason": "blocked by policy"}``.
+    :param honor_human_approval: shipcrew fork. When ``True`` (claude-native),
+        a PreToolUse ``ALLOW`` carrying ``"human_approved": true`` (an ASK a
+        human accepted on the approval card) maps to ``permissionDecision:
+        "allow"``: the user's consent was just given, so Claude's own prompt
+        would ask the same human twice. A plain ALLOW (explicit or no-match)
+        still returns ``None``.
     :returns: Hook output dict for the harness to read on stdout, or
         ``None`` when there is no verdict to express (allow with no
         rewrite on PostToolUse, or an unknown action).
@@ -429,6 +437,19 @@ def evaluation_response_to_hook_output(
         return None
 
     if hook_event == _PRE_TOOL_USE:
+        # shipcrew fork: an accepted ASK already carries the user's consent.
+        if (
+            honor_human_approval
+            and action == "POLICY_ACTION_ALLOW"
+            and eval_response.get("human_approved") is True
+        ):
+            return {
+                "hookSpecificOutput": {
+                    "hookEventName": _PRE_TOOL_USE,
+                    "permissionDecision": "allow",
+                    "permissionDecisionReason": "Approved on the Omnigent approval card.",
+                }
+            }
         # ALLOW (the engine default when no policy matches) is omitted → None,
         # so the harness's own permission prompt still fires; see docstring.
         decision_map = {

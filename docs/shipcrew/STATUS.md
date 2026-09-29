@@ -11,6 +11,121 @@ live end-to-end run: 2026-09-29.
 ![Card held for a human merge approval (APPROVALS.md)](board-approval.png)
 ![Drawer with the Approve merge action](drawer-approval.png)
 
+## Round 5: zero approvals for safe work (2026-09-29)
+
+Branch `shipcrew-round4` (bundles: shipcrew `v3-round4`). Driven by the
+approval cards of a live autonomous run (Next.js app, real GitHub). Goal: no
+card for normal development, every real protection kept (no push, no remote
+writes, no `.env` reads, owned paths, CI workflow edits gated, reviewer
+read-only, verify roles test-only, the DENY set).
+
+- **Shell allowlist** (`policies.py`): `$?` `$#` `$$` `$!` always pass.
+  `$VAR` / `${VAR}` / `${VAR:-lit}` are parsed (`parse_command(params=True)`,
+  words marked) and pass only in an expansion-safe read-only command (the
+  bundle's new `read_only:` list; entries with a `!banned` option, a glob
+  word, or `cd`/`printf`/`find`/`sed`/`jq`... are not safe) and only for vetted
+  names (env-allow names, `HOME PWD USER PATH TMPDIR ...`, or assigned earlier
+  in the command): `echo $DATABASE_URL` and `X=--output=f; git diff $X` ask. A
+  bare `S=/p;` of an unvetted name makes the rest of the chain read-only-only;
+  `PATH`/`LD_*`/`GIT_*`/`NODE_*`/... assignments ask; a variable in a write
+  target asks. `${PORT:-3000}` in a vetted env prefix passes.
+  `PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD` joined the env prefixes. Newlines after
+  `&`/`|` no longer glue into one token (`npm ci ... &\n cat ...; wait`).
+  New built-in matchers `@sed:sed_in_place` (substitution scripts only, exact
+  flags) and `@perl:perl_in_place` (one code-free `s///`); both are write
+  targets for owned paths and the workflows guard (`sed -ni`, `--expression=`
+  now counted too). `uniq IN OUT` is a write. Bypasses closed on the way:
+  `printf -v`, `rg --pre`, `git diff-tree/rev-list/shortlog --output`.
+- **Owned paths**: owning `package.json` (or `pyproject.toml`) by name owns the
+  lockfiles next to it (policy and the PR loop's diff check).
+- **Verify roles add tests only** (`test_writes_only`): deleting, renaming away
+  or truncating a test on `origin/main` (`rm`, `git rm`, `mv`/`git mv` source,
+  `truncate`, `>`, a full `Write`) is DENY; `Edit`, `>>` and removing its own new
+  tests pass; a removal git cannot check is refused.
+- **Bundles** (shipcrew `v3-round4`): new groups `deps` (npm/pnpm install|add
+  any flags but `-g`/`--prefix`/`--filter`/workspace ones; gated by owning
+  `package.json`) and `fs_edit` for builders and the scaffolder; `uniq`,
+  `wait` read-only. COMMON: no `; echo EXIT=$?`, no needless shell variables,
+  the repo's package manager (by lockfile, never npm in a pnpm repo), the
+  repo's `playwright.config`, CI is installed by the server, feature tasks never
+  add dependencies (say so in `Decisions:`). Scaffolder: pnpm when no lockfile,
+  scaffold in place (see below), the whole test toolchain in the Foundation,
+  scripts `lint typecheck test build e2e`. Planner: Foundation owns
+  `**` + `package.json` and installs every dependency; tasks own their tests.
+  Verify roles: add-only rule. 189 validator cases per bundle (every live
+  command above as ALLOW, a Foundation contract for the dependency and
+  `git mv || mv; sed -i` cases, CI workflow writes still ASK, negatives).
+- **CI installed by the server** (`omnigent/shipcrew/ci_install.py`): at the
+  first task start of a mission (per-mission lock, so parallel first starts
+  wait), `origin/<pr_base>` without `.github/workflows/ci.yml` gets
+  `templates/ci.yml` as one `chore: shipcrew CI` commit (plumbing on a temp
+  index, plain fast-forward push, one retry, local base fast-forwarded when
+  clean); present -> nothing; no origin / empty remote -> skipped, retried next
+  start; refused -> logged, the task starts anyway. `SHIPCREW_INSTALL_CI=0`
+  turns it off. The template now detects pnpm / yarn / npm (or no
+  `package.json` yet: nothing runs), runs `lint typecheck test build e2e` only
+  when defined, `CHROMIUM_PATH=/usr/bin/google-chrome`, never a browser
+  download.
+- **No host-user settings in worker sessions** (`launch_args.py`): bundles
+  declare `setting_sources: project,local`; claude-native gets
+  `--setting-sources project,local`, claude-sdk
+  `HARNESS_CLAUDE_SDK_SETTING_SOURCES` -> `ClaudeAgentOptions.setting_sources`
+  (a `"none"` skills filter still wins). Verified with the real CLI 2.1.285 on
+  the subscription: the turn answers, only built-in plugins and 18 built-in
+  skills, no SessionStart hook (without the flag: 8 user plugins incl.
+  ponytail/superpowers/vercel, 124 skills, 5 hooks). Bundle skills still load
+  through `--plugin-dir`; since user plugin skills (`vercel:*`,
+  `superpowers:*`, `shipcrew:design-lock`) are gone, `design-lock` is now
+  bundled (symlink) in designer/scaffolder/developer/reviewer/qa and the ROLE
+  texts no longer name plugin skills.
+- **Main checkout deps** (`omnigent/shipcrew/main_deps.py`): after a merge the
+  merged worktree's `node_modules` is moved into the fast-forwarded main
+  checkout when the lockfiles match, else one background frozen install runs
+  there (pnpm/npm/yarn/bun from the lockfile, `CI=1`, bounded by
+  `SHIPCREW_MAIN_DEPS_TIMEOUT_S`, log `.git/shipcrew/deps-install.log`, stamp
+  per lockfile hash; `SHIPCREW_MAIN_DEPS=0` off). Also tried at each task
+  start. Later worktrees then seed via `deps_seed`.
+- **Tasks own their tests** (`omnigent/shipcrew/owned_tests.py`): plan import
+  (and fix tasks) add `e2e/<slug>*.spec.*`, `test(s)/<slug>*` and colocated
+  `*.test.*` / `*.spec.*` / `__tests__/**` next to owned sources, never the
+  repo root, idempotent.
+- **One approval, not two** (`native_policy_hook.py`, `routes_hooks.py`,
+  claude-native `hook.py` / `bridge.py`): an accepted guardrail ASK answers
+  Claude's PreToolUse with `permissionDecision: allow`, so Claude does not
+  prompt again for the same call; a plain ALLOW still defers to
+  `--allowedTools`.
+- **Children get their own runner** (`routes_core.py` +5, `pr_loop.py`): a
+  child create inherited the parent's runner, so stopping the approved
+  reviewer SIGTERMed the developer's runner ("Runner disconnected
+  unexpectedly") and the card went Blocked. An explicit `host_id` now cancels
+  that inheritance. The reviewer runs in a detached checkout of the PR head
+  (`<repo>-worktrees/shipcrew-review-<id8>-<sha8>`, node_modules seeded,
+  reused per head, removed after the verdict / skip / block / merge); the
+  integrator takes the task worktree after the idle developer session is
+  stopped (git allows one worktree per branch; not seen live yet).
+  `service.merge_ready`: a card with green CI + approval whose developer
+  session failed or vanished goes on to merge instead of Blocked.
+- **One verdict nudge** (`pr_loop.py`, `verify.py`, column
+  `shipcrew_tasks.verdict_nudges`, migration `sc0005vn` after `sc0004sh`): a
+  turn that ends without `PASS`/`FAIL` (a declined ask, or forgotten) gets one
+  automatic "continue without it, finish, end with Decisions + one verdict"
+  message; a second missing verdict blocks. The count is stored before the
+  send, so a restart never nudges twice.
+- **Interventions say what was asked** (`sessions.ask_summary`,
+  `store.update_task(intervention=...)`, `report.py`): the pending
+  elicitation's `policy_name` and `content_preview` (one line, <= 120 chars,
+  `KEY=`, bearer, `sk-`/`ghp_`/JWT and URL-password values masked) go into the
+  `Task.interventions` entry and the card's reason (`Needs approval: <policy>:
+  <preview>`, cleared when the session resumes); the report summary counts
+  interventions per policy and lists `<policy>: <preview>` per entry.
+
+Scaffolding in place: `create-next-app .` refuses a folder that already holds
+`.github/`, `.shipcrew/` or `DESIGN.md` (checked with create-next-app 16.3.7:
+"contains files that could conflict"), and every mission repo has them once
+CI is installed. So the scaffolder now sets Next.js up directly in its
+worktree (`package.json`, one `pnpm add` + one `pnpm add -D`, config files with
+the Write tool, `npx shadcn@latest init -d`), never in `/tmp`.
+
 ## Round 4 integration: ship + verify/speed together (2026-09-29)
 
 Branch `shipcrew-round3` = `shipcrew` + `shipcrew-ship` + `shipcrew-qaspeed`
@@ -389,7 +504,8 @@ project (`src/sum.js`, node:test tests, `"test": "node --test test/"`) whose
   Review findings, Request changes), `mission.updated` over SSE, six columns
   without horizontal scroll at 1600 px.
 - **Schema**: Alembic lineage `sc0001 -> sc0002pr (PR loop) -> sc0002p (plan +
-  issue sync) -> sc0003ar (mission auto_run) -> sc0004sh (ship stage)`, single head.
+  issue sync) -> sc0003ar (mission auto_run) -> sc0004sh (ship stage) ->
+  sc0005vn (verdict nudges)`, single head.
 - Round 1 behaviour (board, drawer tree, 4 scheduler gates, session state ->
   card, folder pre-trust, ACL per owner) is unchanged.
 
@@ -530,7 +646,8 @@ scripts/shipcrew-fake-gh pr list --state all     # or read $E/gh.json "calls"
 scripts/shipcrew_stack.sh stop $E/state 16772
 ```
 
-New settings: `SHIPCREW_PR_LOOP` (default on), `SHIPCREW_PR_BASE` (default
+New settings: `SHIPCREW_INSTALL_CI` (default on), `SHIPCREW_MAIN_DEPS`
+(default on), `SHIPCREW_MAIN_DEPS_TIMEOUT_S` (600), `SHIPCREW_PR_LOOP` (default on), `SHIPCREW_PR_BASE` (default
 `main`), `SHIPCREW_SYNC_INTERVAL_S` (default 60, min 5), `SHIPCREW_GH`,
 `SHIPCREW_SHIP` (auto ship, default on), `SHIPCREW_SHIP_VERIFY_S` (120),
 `SHIPCREW_SHIP_VERIFY_INTERVAL_S` (5), `SHIPCREW_SHIP_ALLOW_PRIVATE_URLS`
@@ -558,6 +675,30 @@ server side is `omnigent/shipcrew/router.py` and the client side is
   454 passed.
 - Bundles: `build_agents.py --check`, `validate_agents.py` from this worktree:
   10 bundles valid, 117 guardrail cases each, MCP set asserted per bundle.
+
+## Checks (round 5, 2026-09-29)
+
+- **Backend:** `ruff check` / `ruff format --check` (omnigent/shipcrew,
+  tests/shipcrew, every touched upstream file); `pyrefly check` (project
+  config) 0 errors; `pytest tests/shipcrew tests/server/test_shipcrew_mount.py
+  tests/server/test_shipcrew_child_runner.py tests/test_native_policy_hook.py
+  tests/test_claude_native_bridge.py
+  tests/server/integration/test_policy_ask_lifecycle_e2e.py
+  tests/inner/test_claude_sdk_executor.py tests/inner/test_claude_sdk_harness.py
+  tests/server/routes/test_sessions_yolo_launch_args.py
+  tests/policies/test_registry.py tests/server/routes/test_policy_registry.py`:
+  1515 passed; `tests/test_claude_native_hook.py
+  tests/runner/test_app_claude_native_launch_args.py
+  tests/runtime/test_claude_sdk_spawn_env.py`: 121 passed. New:
+  `test_zero_approvals.py`, `test_ci_install.py`, `test_main_deps.py`,
+  `test_owned_tests.py`, `test_intervention_details.py`,
+  `test_shipcrew_child_runner.py`, add-only cases in `test_test_writes.py`,
+  setting-sources cases in `test_launch_args.py`, CI template cases in
+  `test_speed.py`.
+- **Bundles:** `build_agents.py --check` fresh; `validate_agents.py` from this
+  worktree: 10 bundles valid, 189 guardrail cases each.
+- **Live:** only the CLI check of `--setting-sources project,local` (above);
+  no end-to-end mission run on this branch yet.
 
 ## Checks (round 4 integration, 2026-09-29)
 
@@ -611,6 +752,14 @@ server side is `omnigent/shipcrew/router.py` and the client side is
   (+3), `omnigent/inner/claude_sdk_executor.py` (+10): the claude-sdk
   `strict_mcp_config` flag (env `HARNESS_CLAUDE_SDK_STRICT_MCP_CONFIG`, then
   `extra_args["strict-mcp-config"]`).
+
+- Round 5: `helpers.py` also adds `--setting-sources` (from
+  `setting_sources`); `workflow.py`, `claude_sdk_harness.py`,
+  `claude_sdk_executor.py` carry `HARNESS_CLAUDE_SDK_SETTING_SOURCES` ->
+  `setting_sources`; `routes_core.py` (+5: an explicit child `host_id` gets its
+  own runner); `routes_hooks.py`, `native/native_policy_hook.py`,
+  `harnesses/claude_native/hook.py` / `bridge.py` (an accepted ASK answers
+  `allow`). All marked `shipcrew fork`.
 
 Everything else is new: `omnigent/shipcrew/`, its own Alembic lineage
 (`shipcrew_alembic_version`), `web/src/board/`, `web/src/pages/BoardPage*`,
