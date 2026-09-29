@@ -55,6 +55,10 @@ const CanvasPage = withPageView(
   "canvas",
   lazy(() => import("@/pages/CanvasPage").then((m) => ({ default: m.CanvasPage }))),
 );
+const BoardPage = withPageView(
+  "board",
+  lazy(() => import("@/pages/BoardPage").then((m) => ({ default: m.BoardPage }))),
+);
 const TasksPage = withPageView(
   "tasks",
   lazy(() => import("@/pages/TasksPage").then((m) => ({ default: m.TasksPage }))),
@@ -178,6 +182,7 @@ function AppRoutes({ basename }: AppProps) {
               </FeatureGatedPage>
             }
           />
+          <Route path={`${prefix}/board`} element={<BoardPage />} />
           <Route path={`${prefix}/tasks`} element={<TasksPage />} />
           <Route
             path={`${prefix}/usage`}
