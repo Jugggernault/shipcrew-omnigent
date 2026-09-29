@@ -115,9 +115,10 @@ _READ_REDIRECTS = frozenset({"<", "<<<"})
 _ENV_ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 # ``git commit -m "$(cat <<'EOF' ... EOF)"`` is how Claude Code writes commit
 # messages: the substitution only produces a literal string, so it is replaced
-# by a placeholder before the unanalyzable-construct check.
+# by a placeholder before the unanalyzable-construct check. The delimiter must
+# be quoted: with a bare ``<<EOF`` the shell expands ``$(..)`` in the body.
 _HEREDOC_STRING = re.compile(
-    r"\$\(\s*cat\s+<<-?\s*(['\"]?)(\w+)\1[ \t]*\n.*?\n[ \t]*\2[ \t]*\n?\s*\)", re.DOTALL
+    r"\$\(\s*cat\s+<<-?\s*(['\"])(\w+)\1[ \t]*\n.*?\n[ \t]*\2[ \t]*\n?\s*\)", re.DOTALL
 )
 # fd duplication / close (``2>&1``, ``>&2``, ``3>&-``): not a file write.
 _FD_DUP = re.compile(r"(^|[\s;&|(])\d*[<>]&\s*(\d+|-)(?=$|[\s;&|)])")

@@ -73,6 +73,10 @@ class TestParse:
         assert segs is not None
         assert [s.argv for s in segs] == [["git", "commit", "-m", "HEREDOC"]]
 
+    def test_unquoted_heredoc_delimiter_is_not_a_literal(self) -> None:
+        # the shell expands $(..) in the body of a bare <<EOF heredoc
+        assert parse_command('git commit -m "$(cat <<EOF\n$(rm -rf x)\nEOF\n)"') is None
+
     def test_env_and_program_normalization(self) -> None:
         segs = parse_command(
             "CI=1 /usr/bin/git --no-pager log; pnpm exec vitest; npx -y tsc; timeout 5 npm test"
