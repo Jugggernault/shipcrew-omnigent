@@ -19,6 +19,7 @@ from omnigent.shipcrew.sessions import (
     RootSessionRequest,
     SessionServiceError,
     bundle_agent_dir,
+    inject_task_contract,
     snapshot_from_payload,
 )
 
@@ -179,6 +180,53 @@ async def test_create_makes_worktree_session_and_sends_prompt(
     (sent,) = stub.events
     assert sent[0] == "conv_1"
     assert sent[1]["data"]["content"] == [{"type": "input_text", "text": "# Add login"}]
+
+
+_OWNED_CONFIG = """name: developer
+guardrails:
+  policies:
+    shipcrew_owned_paths:
+      type: function
+      on: [tool_call]
+      function:
+        path: omnigent.shipcrew.policies.owned_paths
+        arguments:
+          owned_paths: []  # @task.owned_paths
+          root: ""  # @task.root
+"""
+
+
+def test_inject_task_contract_fills_the_slots() -> None:
+    import yaml
+
+    text = inject_task_contract(_OWNED_CONFIG, owned_paths=["app/**", 'we"ird'], root="/wt/t")
+    args = yaml.safe_load(text)["guardrails"]["policies"]["shipcrew_owned_paths"]["function"][
+        "arguments"
+    ]
+    assert args == {"owned_paths": ["app/**", 'we"ird'], "root": "/wt/t"}
+
+
+def test_inject_task_contract_leaves_configs_without_slots() -> None:
+    assert inject_task_contract("name: qa\n", owned_paths=["a/**"], root="/wt") == "name: qa\n"
+    assert inject_task_contract(_OWNED_CONFIG, owned_paths=[], root="/wt") == _OWNED_CONFIG
+
+
+async def test_create_injects_owned_paths_into_the_bundle(
+    monkeypatch: pytest.MonkeyPatch, bundle: Path
+) -> None:
+    (bundle / "config.yaml").write_text(_OWNED_CONFIG)
+    stub = _StubApp(host_ids=["host_a"])
+    _patch_worktrees(monkeypatch, _Worktrees(listed=[]))
+    request = dataclasses.replace(_request(bundle), owned_paths=("app/cart/**",))
+    await OmnigentSessionService(stub.app, None).create_root_session(request)
+    with tarfile.open(fileobj=io.BytesIO(stub.creates[0]["bundle"]), mode="r:gz") as tar:
+        member = tar.extractfile("config.yaml")
+        assert member is not None
+        config = member.read().decode()
+    assert 'owned_paths: ["app/cart/**"]' in config
+    assert 'root: "/wt/task"' in config
+    # the source bundle is untouched
+    assert (bundle / "config.yaml").read_text() == _OWNED_CONFIG
 
 
 async def test_restart_reuses_existing_worktree(

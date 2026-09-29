@@ -55,6 +55,8 @@ class TestStart:
         assert "Use OAuth." in req.prompt
         assert "- tests pass" in req.prompt
         assert "`src/auth/**`" in req.prompt
+        # the owned paths also reach the session's owned-paths guardrail
+        assert req.owned_paths == ("src/auth/**",)
         mission = await service.require_mission(mission_id)
         assert mission.status == "active"
 
