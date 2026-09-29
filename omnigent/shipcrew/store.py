@@ -34,6 +34,11 @@ class Mission:
     status: str
     created_at: int
     owner_user_id: str | None = None
+    plan_status: str = "idle"
+    plan_session_id: str | None = None
+    plan_error: str | None = None
+    plan_imported_count: int = 0
+    plan_started_at: float | None = None
 
     def to_api(self) -> dict[str, Any]:
         """Serialize to the shared API contract shape."""
@@ -44,6 +49,12 @@ class Mission:
             "repo_url": self.repo_url,
             "status": self.status,
             "created_at": self.created_at,
+            "plan": {
+                "status": self.plan_status,
+                "session_id": self.plan_session_id,
+                "error": self.plan_error,
+                "imported_count": self.plan_imported_count,
+            },
         }
 
 
@@ -60,6 +71,8 @@ class Task:
     depends_on: list[str] = field(default_factory=list)
     owned_paths: list[str] = field(default_factory=list)
     issue_number: int | None = None
+    issue_url: str | None = None
+    plan_key: str | None = None
     pr_number: int | None = None
     pr_url: str | None = None
     ci: str = "none"
@@ -101,6 +114,7 @@ class Task:
             "depends_on": list(self.depends_on),
             "owned_paths": list(self.owned_paths),
             "issue_number": self.issue_number,
+            "issue_url": self.issue_url,
             "pr_number": self.pr_number,
             "pr_url": self.pr_url,
             "ci": self.ci,
@@ -138,6 +152,11 @@ def _mission(row: SqlMission) -> Mission:
         status=row.status,
         created_at=row.created_at,
         owner_user_id=row.owner_user_id,
+        plan_status=row.plan_status or "idle",
+        plan_session_id=row.plan_session_id,
+        plan_error=row.plan_error,
+        plan_imported_count=int(row.plan_imported_count or 0),
+        plan_started_at=row.plan_started_at,
     )
 
 
@@ -159,6 +178,8 @@ def _task(row: SqlTask) -> Task:
         depends_on=[str(d) for d in row.depends_on or []],
         owned_paths=[str(p) for p in row.owned_paths or []],
         issue_number=row.issue_number,
+        issue_url=row.issue_url,
+        plan_key=row.plan_key,
         pr_number=row.pr_number,
         pr_url=row.pr_url,
         ci=row.ci,
@@ -192,6 +213,8 @@ _TASK_FIELDS = frozenset(
         "depends_on",
         "owned_paths",
         "issue_number",
+        "issue_url",
+        "plan_key",
         "pr_number",
         "pr_url",
         "ci",
@@ -212,7 +235,34 @@ _TASK_FIELDS = frozenset(
         "human_approved",
     }
 )
+_MISSION_FIELDS = frozenset(
+    {
+        "status",
+        "plan_status",
+        "plan_session_id",
+        "plan_error",
+        "plan_imported_count",
+        "plan_started_at",
+    }
+)
+_PLAN_TASK_FIELDS = ("title", "body", "acceptance", "role", "owned_paths")
 _UNSET: Any = object()
+
+
+@dataclass(frozen=True)
+class PlanTaskSpec:
+    """One ``plan.json`` task, already validated (see ``omnigent.shipcrew.planner``).
+
+    :param depends_on: Plan keys, resolved to task ids on import.
+    """
+
+    key: str
+    title: str
+    body: str
+    acceptance: list[str]
+    role: str
+    depends_on: list[str]
+    owned_paths: list[str]
 
 
 class ShipcrewStore:
@@ -268,6 +318,74 @@ class ShipcrewStore:
             row = session.get(SqlMission, mission_id)
             if row is not None:
                 row.status = status
+
+    def update_mission(self, mission_id: str, **fields: Any) -> Mission | None:
+        """Apply ``fields`` (column names) to a mission.
+
+        :returns: The updated mission, or ``None`` when it does not exist.
+        :raises ValueError: On an unknown field name.
+        """
+        unknown = set(fields) - _MISSION_FIELDS
+        if unknown:
+            raise ValueError(f"unknown mission fields: {sorted(unknown)}")
+        with self._session("update_mission") as session:
+            row = session.get(SqlMission, mission_id)
+            if row is None:
+                return None
+            for name, value in fields.items():
+                setattr(row, name, value)
+            return _mission(row)
+
+    def upsert_plan_tasks(self, mission_id: str, specs: list[PlanTaskSpec]) -> list[Task]:
+        """Create or update one task per plan key, in one transaction.
+
+        A key already imported into this mission updates that task's content
+        (never its status, session or board position); a new key becomes a
+        ``backlog`` task. ``depends_on`` keys are mapped to task ids. Tasks whose
+        key left the plan are kept as they are.
+
+        :returns: The imported tasks, in plan order.
+        """
+        now = int(time.time())
+        with self._session("upsert_plan_tasks") as session:
+            existing = {
+                row.plan_key: row
+                for row in session.scalars(
+                    select(SqlTask).where(
+                        SqlTask.mission_id == mission_id, SqlTask.plan_key.is_not(None)
+                    )
+                ).all()
+            }
+            last = session.scalar(
+                select(func.max(SqlTask.position)).where(SqlTask.mission_id == mission_id)
+            )
+            position = float(last) + 1.0 if last is not None else 0.0
+            rows: dict[str, SqlTask] = {}
+            for spec in specs:
+                row = existing.get(spec.key)
+                if row is None:
+                    row = SqlTask(
+                        id=uuid.uuid4().hex,
+                        mission_id=mission_id,
+                        plan_key=spec.key,
+                        status="backlog",
+                        depends_on=[],
+                        ci="none",
+                        cost_usd=0.0,
+                        position=position,
+                        session_seen_active=False,
+                        created_at=now,
+                    )
+                    position += 1.0
+                    session.add(row)
+                for name in _PLAN_TASK_FIELDS:
+                    value = getattr(spec, name)
+                    setattr(row, name, list(value) if isinstance(value, list) else value)
+                row.updated_at = now
+                rows[spec.key] = row
+            for spec in specs:
+                rows[spec.key].depends_on = [rows[k].id for k in spec.depends_on]
+            return [_task(rows[spec.key]) for spec in specs]
 
     # ── Tasks ───────────────────────────────────────────────────
 

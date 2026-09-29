@@ -39,6 +39,7 @@ class ShipcrewSettings:
         PR -> CI -> review -> merge (``SHIPCREW_PR_LOOP``).
     :param pr_base: Branch PRs target and diffs are taken against
         (``SHIPCREW_PR_BASE``).
+    :param sync_interval_s: Seconds between GitHub issue syncs of a mission.
     """
 
     agents_dir: Path = Path(DEFAULT_AGENTS_DIR)
@@ -51,6 +52,7 @@ class ShipcrewSettings:
     db_url: str | None = None
     pr_loop_enabled: bool = True
     pr_base: str = "main"
+    sync_interval_s: float = 60.0
 
     @classmethod
     def from_env(cls) -> ShipcrewSettings:
@@ -67,4 +69,5 @@ class ShipcrewSettings:
             db_url=env.get("SHIPCREW_DB_URL") or None,
             pr_loop_enabled=env.get("SHIPCREW_PR_LOOP", "1").strip().lower() not in _FALSEY,
             pr_base=env.get("SHIPCREW_PR_BASE") or "main",
+            sync_interval_s=max(5.0, float(env.get("SHIPCREW_SYNC_INTERVAL_S") or 60.0)),
         )

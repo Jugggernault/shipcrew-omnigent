@@ -11,7 +11,9 @@ from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.shipcrew.branches import task_branch
 from omnigent.shipcrew.events import MissionEventBus
 from omnigent.shipcrew.gates import GateContext, evaluate_gates, find_cycle
+from omnigent.shipcrew.issue_sync import GitHubSync
 from omnigent.shipcrew.models import TASK_STATUSES
+from omnigent.shipcrew.planner import PlanRunner
 from omnigent.shipcrew.pr_loop import PrLoop, default_base_ref, is_loop_hold
 from omnigent.shipcrew.sessions import (
     RootSessionRequest,
@@ -109,6 +111,8 @@ class ShipcrewService:
         self.settings = settings
         self._starting: set[str] = set()
         self.pr_loop = PrLoop(self)
+        self.planner = PlanRunner(self)
+        self.github = GitHubSync(self)
 
     async def _call(self, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
         return await asyncio.to_thread(fn, *args, **kwargs)
@@ -330,6 +334,17 @@ class ShipcrewService:
             return await self._update(task.id, root_session_id=session_id)
         finally:
             self._starting.discard(task_id)
+
+    async def update_fields(self, task_id: str, **fields: Any) -> Task:
+        """Write task columns and publish ``task.updated`` (no status side effects)."""
+        return await self._update(task_id, **fields)
+
+    async def block_task(self, task_id: str, reason: str, acting_user: str | None) -> Task:
+        """Park a card as blocked with ``reason``, ending its agent session if any."""
+        task = await self.require_task(task_id)
+        if task.status in SESSION_HOLDING_STATUSES:
+            await self._stop_quietly(task, acting_user)
+        return await self._update(task.id, status="blocked", blocked_reason=reason)
 
     async def stop_task(self, task_id: str, acting_user: str | None) -> Task:
         """Terminate the agent's session and park the card as blocked."""

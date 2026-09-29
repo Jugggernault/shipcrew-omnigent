@@ -45,7 +45,7 @@ def gh_bin() -> str:
 
 def _run(
     args: Sequence[str],
-    cwd: Path,
+    cwd: Path | None,
     *,
     timeout: float = DEFAULT_TIMEOUT_S,
     stdin: str | None = None,
@@ -64,7 +64,7 @@ def _run(
         raise GhError(f"gh {' '.join(args[:3])}: {exc}") from exc
 
 
-def gh(*args: str, cwd: Path, check: bool = True, timeout: float = 1800) -> str:
+def gh(*args: str, cwd: Path | None, check: bool = True, timeout: float = 1800) -> str:
     r = _run(args, cwd, timeout=timeout)
     if check and r.returncode:
         raise GhError(f"gh {' '.join(args[:3])} failed: {r.stderr[-1500:]}")
@@ -310,3 +310,107 @@ def run_failed_log(cwd: Path, run_id: str, max_chars: int = _LOG_MAX_CHARS) -> s
         return ""
     text = (r.stdout or r.stderr).strip()
     return text if len(text) <= max_chars else "[...truncated...]\n" + text[-max_chars:]
+
+
+# ── Issue sync (repo-targeted, bounded) ─────────────────────────────
+# Every call names the repository with ``--repo`` so the result never depends on
+# the server's cwd, and uses a short timeout so a hung ``gh`` cannot stall a tick.
+
+SYNC_TIMEOUT_S = 60.0
+
+
+def auth_status(cwd: Path | None = None) -> tuple[bool, str]:
+    """``(logged_in, reason)`` from ``gh auth status``; reason is empty when logged in."""
+    try:
+        r = _run(["auth", "status"], cwd, timeout=SYNC_TIMEOUT_S)
+    except GhError as exc:
+        return False, f"gh unavailable: {exc}"
+    if r.returncode:
+        return False, "gh is not logged in (run `gh auth login`)"
+    return True, ""
+
+
+def ensure_repo_labels(repo: str, names: Sequence[str], cwd: Path | None = None) -> None:
+    """Create (or refresh) labels in ``repo``; best effort."""
+    for name in names:
+        gh(
+            "label",
+            "create",
+            name,
+            "--color",
+            LABELS.get(name, "C5DEF5"),
+            "--force",
+            "--repo",
+            repo,
+            cwd=cwd,
+            check=False,
+            timeout=SYNC_TIMEOUT_S,
+        )
+
+
+def create_issue(
+    repo: str, title: str, body: str, labels: Sequence[str], cwd: Path | None = None
+) -> tuple[int, str]:
+    """Open an issue in ``repo``. Returns ``(number, url)``."""
+    label_args = [arg for label in labels for arg in ("--label", label)]
+    out = gh(
+        "issue",
+        "create",
+        "--repo",
+        repo,
+        "--title",
+        title,
+        "--body",
+        body,
+        *label_args,
+        cwd=cwd,
+        timeout=SYNC_TIMEOUT_S,
+    )
+    url = out.strip().splitlines()[-1].strip() if out.strip() else ""
+    return int(url.rstrip("/").rsplit("/", 1)[-1]), url
+
+
+def list_issues(
+    repo: str, label: str, cwd: Path | None = None, limit: int = 500
+) -> list[dict[str, Any]]:
+    """Open and closed issues carrying ``label``: number, state, assignees, labels, url."""
+    out = gh(
+        "issue",
+        "list",
+        "--repo",
+        repo,
+        "--label",
+        label,
+        "--state",
+        "all",
+        "--limit",
+        str(limit),
+        "--json",
+        "number,state,assignees,labels,url",
+        cwd=cwd,
+        timeout=SYNC_TIMEOUT_S,
+    )
+    data = json.loads(out or "[]")
+    return [d for d in data if isinstance(d, dict)] if isinstance(data, list) else []
+
+
+def list_pull_requests(
+    repo: str, cwd: Path | None = None, limit: int = 200
+) -> list[dict[str, Any]]:
+    """Recent PRs in any state: number, state, headRefName, url."""
+    out = gh(
+        "pr",
+        "list",
+        "--repo",
+        repo,
+        "--state",
+        "all",
+        "--limit",
+        str(limit),
+        "--json",
+        "number,state,headRefName,url",
+        cwd=cwd,
+        timeout=SYNC_TIMEOUT_S,
+    )
+    data = json.loads(out or "[]")
+    return [d for d in data if isinstance(d, dict)] if isinstance(data, list) else []

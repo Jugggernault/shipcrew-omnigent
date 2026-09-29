@@ -91,6 +91,11 @@ class RequestChangesBody(BaseModel):
     message: str = Field(min_length=1, max_length=20_000)
 
 
+class PlanBody(BaseModel):
+    # ``None``/blank: the planner reads the repo's ``.shipcrew/prd.md``.
+    prd: str | None = Field(default=None, max_length=200_000)
+
+
 def _sse(event: dict[str, Any]) -> str:
     return f"data: {json.dumps(event, separators=(',', ':'))}\n\n"
 
@@ -126,6 +131,26 @@ def create_shipcrew_router(
             body.title, body.repo_path, body.repo_url, user_id
         )
         return mission.to_api()
+
+    @router.post("/missions/{mission_id}/plan")
+    async def plan_mission(
+        request: Request, mission_id: str, body: PlanBody | None = None
+    ) -> dict[str, Any]:
+        user_id = require_user(request, auth_provider)
+        service = await _svc()
+        await service.authorize_mission(mission_id, user_id)
+        prd = body.prd if body is not None else None
+        return (await service.planner.start(mission_id, prd, user_id)).to_api()
+
+    @router.post("/missions/{mission_id}/sync")
+    async def sync_mission(request: Request, mission_id: str) -> dict[str, Any]:
+        user_id = require_user(request, auth_provider)
+        service = await _svc()
+        await service.authorize_mission(mission_id, user_id)
+        report = await service.github.sync_mission(mission_id)
+        mission = await service.require_mission(mission_id)
+        # ``sync`` is extra to the Mission contract: why a sync did nothing.
+        return {**mission.to_api(), "sync": report.to_api()}
 
     @router.get("/missions/{mission_id}/tasks")
     async def list_tasks(request: Request, mission_id: str) -> dict[str, Any]:
