@@ -36,7 +36,8 @@ start() {
     --artifact-location "$OMNIGENT_DATA_DIR/artifacts" \
     >"$STATE_DIR/logs/server.log" 2>&1 &
   echo $! >"$STATE_DIR/server.pid"
-  for _ in $(seq 1 120); do
+  # A cold start (migrations, first import) can take over a minute.
+  for _ in $(seq 1 360); do
     curl -fsS "$URL/health" >/dev/null 2>&1 && break
     sleep 0.5
   done
