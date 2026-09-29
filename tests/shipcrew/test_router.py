@@ -145,7 +145,7 @@ class TestTasks:
             "depends_on", "owned_paths", "issue_number", "issue_url", "pr_number", "pr_url", "ci",
             "root_session_id", "cost_usd", "position", "blocked_reason", "created_at",
             "updated_at", "branch", "ci_attempts", "review", "needs_human_approval",
-            "approval_reasons", "decisions", "started_at", "interventions",
+            "approval_reasons", "decisions", "started_at", "interventions", "approved_paths",
         }  # fmt: skip
         assert (task["decisions"], task["started_at"], task["interventions"]) == ([], None, [])
         assert (task["branch"], task["ci_attempts"], task["review"]) == (None, 0, None)

@@ -1018,6 +1018,51 @@ class TestHardening:
         held = await run_until(scheduler, service, task.id, status_is("intervention"))
         assert held.approval_reasons == ["outside the task's owned paths: lib/x.txt"]
 
+    async def test_paths_a_human_accepted_during_the_build_are_not_held_again(
+        self,
+        service: ShipcrewService,
+        sessions: LoopSessions,
+        repo: Path,
+        scheduler: ShipcrewScheduler,
+    ) -> None:
+        task, _ = await start(
+            service, sessions, repo,
+            files={"src/a.txt": "a\n", "lib/x.txt": "x\n", "lib/y.txt": "y\n", "ok": ""},
+            owned_paths=["src/**", "ok"],
+        )  # fmt: skip
+        assert task.root_session_id is not None
+        # The owned-paths ASK for lib/x.txt was accepted on the card (hook route).
+        reason = (
+            "Write needs approval: `lib/x.txt` is outside this task's owned paths (src/**). "
+            "Stay inside owned_paths; a human approves shared-file edits on the card."
+        )
+        recorded = await service.record_approved_write(task.root_session_id, reason)
+        assert recorded is not None and recorded.approved_paths == ["lib/x.txt"]
+        assert await service.record_approved_write("nope", reason) is None
+        held = await run_until(scheduler, service, task.id, status_is("intervention"))
+        # only the path nobody approved holds the merge
+        assert held.approval_reasons == ["outside the task's owned paths: lib/y.txt"]
+
+    async def test_an_accepted_path_lets_the_task_merge(
+        self,
+        service: ShipcrewService,
+        sessions: LoopSessions,
+        repo: Path,
+        scheduler: ShipcrewScheduler,
+    ) -> None:
+        task, _ = await start(
+            service, sessions, repo, files={"src/a.txt": "a\n", "lib/x.txt": "x\n", "ok": ""},
+            owned_paths=["src/**", "ok"],
+        )  # fmt: skip
+        assert task.root_session_id is not None
+        await service.record_approved_write(
+            task.root_session_id,
+            "Write needs approval: `lib/x.txt` is outside this task's owned paths (src/**).",
+        )
+        merged = await run_until(scheduler, service, task.id, status_is("merged"))
+        assert not merged.needs_human_approval
+        assert merged.approved_paths == ["lib/x.txt"]
+
     async def test_a_rename_out_of_a_gated_path_is_gated(
         self,
         service: ShipcrewService,

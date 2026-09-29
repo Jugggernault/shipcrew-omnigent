@@ -12,10 +12,12 @@ from typing import Any
 
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.shipcrew import main_deps
+from omnigent.shipcrew.approvals import approved_write_paths
 from omnigent.shipcrew.branches import task_branch
 from omnigent.shipcrew.ci_install import CiInstall, ensure_ci_workflow
 from omnigent.shipcrew.events import MissionEventBus
 from omnigent.shipcrew.gates import GateContext, evaluate_gates, find_cycle
+from omnigent.shipcrew.inherited_tests import grant_inherited_tests
 from omnigent.shipcrew.issue_sync import GitHubSync
 from omnigent.shipcrew.models import TASK_STATUSES
 from omnigent.shipcrew.planner import PlanRunner
@@ -37,6 +39,8 @@ _logger = logging.getLogger(__name__)
 TASK_LABEL_KEY = "shipcrew.task_id"
 ROLE_LABEL_KEY = "shipcrew.role"
 _PLAIN_FIELDS = ("title", "body", "acceptance", "owned_paths", "position")
+# Tasks whose owned paths are off limits to another task of the mission.
+CONTRACT_ACTIVE_STATUSES = frozenset({"ready", "running", "review", "intervention"})
 
 
 def _not_found(what: str, ident: str) -> OmnigentError:
@@ -421,6 +425,8 @@ class ShipcrewService:
                 base_branch = await self._call(
                     default_base_ref, mission.repo_path, self.settings.pr_base
                 )
+            others = await self._other_active_tasks(task)
+            task = await self._grant_inherited_tests(task, mission, base_branch, others)
             request = RootSessionRequest(
                 task_id=task.id,
                 title=task.title,
@@ -433,6 +439,9 @@ class ShipcrewService:
                 labels={TASK_LABEL_KEY: task.id, ROLE_LABEL_KEY: task.role},
                 owned_paths=tuple(str(p) for p in task.owned_paths),
                 project_id=await self.mission_project_id(mission, acting_user),
+                other_tasks=tuple(
+                    {"title": o.title, "owned_paths": list(o.owned_paths)} for o in others
+                ),
             )
             try:
                 session_id = await self.sessions.create_root_session(request)
@@ -455,6 +464,59 @@ class ShipcrewService:
             return await self._update(task.id, root_session_id=session_id)
         finally:
             self._starting.discard(task_id)
+
+    async def record_approved_write(self, session_id: str, reason: str | None) -> Task | None:
+        """A human accepted an owned-paths ASK in *session_id*: remember the paths.
+
+        Only a task's root session counts (loop children do not write). The
+        merge gate skips these paths (``approved_paths``).
+        """
+        paths = approved_write_paths(reason)
+        if not paths:
+            return None
+        task = await self._call(self.store.task_for_session, session_id)
+        if task is None:
+            return None
+        updated = await self._call(self.store.add_approved_paths, task.id, paths)
+        if updated is not None and updated.approved_paths != task.approved_paths:
+            self.bus.task_updated(updated)
+        return updated
+
+    async def _other_active_tasks(self, task: Task) -> list[Task]:
+        """The mission's other ready / running / review / intervention tasks with owned paths."""
+        tasks = await self._call(self.store.list_tasks, task.mission_id)
+        return [
+            t
+            for t in tasks
+            if t.id != task.id and t.status in CONTRACT_ACTIVE_STATUSES and t.owned_paths
+        ]
+
+    async def _grant_inherited_tests(
+        self, task: Task, mission: Mission, base_ref: str | None, others: list[Task]
+    ) -> Task:
+        """Own the existing tests that only import this task's modules (see ``inherited_tests``).
+
+        Best effort: a failed scan starts the task with its plan contract.
+        """
+        if not task.owned_paths:
+            return task
+        other_globs = [g for o in others for g in o.owned_paths]
+        try:
+            granted = await self._call(
+                grant_inherited_tests,
+                mission.repo_path,
+                base_ref or "HEAD",
+                task.owned_paths,
+                other_globs,
+            )
+        except Exception:
+            _logger.exception("shipcrew: test grant failed for task %s", task.id)
+            return task
+        new = [p for p in granted if p not in task.owned_paths]
+        if not new:
+            return task
+        _logger.info("shipcrew: task %s inherits tests %s", task.id, new)
+        return await self._update(task.id, owned_paths=[*task.owned_paths, *new])
 
     async def ensure_ci(self, mission: Mission) -> CiInstall | None:
         """Install the shipcrew CI workflow on the mission's base once (see ``ci_install``).

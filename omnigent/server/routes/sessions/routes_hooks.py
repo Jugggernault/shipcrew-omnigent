@@ -109,6 +109,22 @@ from omnigent.stores.permission_store import PermissionStore
 _NATIVE_POLICY_VENDORS: dict[str, str] = {"antigravity": "agy"}
 
 
+def _notify_shipcrew_approval(request: Request, session_id: str, reason: str | None) -> None:
+    """shipcrew fork: tell the board a human accepted this ASK (never raises).
+
+    ``app.state.shipcrew_approval_hook`` (``omnigent/shipcrew/approvals.py``)
+    records an accepted owned-paths write on the task, so the merge gate does
+    not hold the PR again for it.
+    """
+    hook = getattr(request.app.state, "shipcrew_approval_hook", None)
+    if hook is None:
+        return
+    try:
+        hook(session_id, reason)
+    except Exception:  # the approval itself must go through
+        _logger.debug("shipcrew approval hook failed", exc_info=True)
+
+
 def _create_route_decision_id(
     session_id: str,
     conversation_store: ConversationStore,
@@ -982,6 +998,8 @@ def register_hooks_routes(
                                 content=json.dumps(decline_body),
                                 media_type="application/json",
                             )
+                        if approved:
+                            _notify_shipcrew_approval(request, session_id, result.reason)
                         approval_body: dict[str, Any] = (
                             # shipcrew fork: ``human_approved`` tells the
                             # claude-native hook this ALLOW is a human's
