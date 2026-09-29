@@ -185,10 +185,13 @@ class GitHubSync:
             if pr is None:
                 pr = next((pr_by_head[b] for b in _task_branches(task) if b in pr_by_head), None)
             if pr is not None and str(pr.get("state", "")).upper() == "MERGED":
-                await self._service.patch_task(task.id, {"status": "merged"}, owner)
-                await self._service.update_fields(
+                task = await self._service.update_fields(
                     task.id, pr_number=pr.get("number"), pr_url=pr.get("url") or task.pr_url
                 )
+                # The PR loop's cleanup (sessions, worktree, branch), else a plain move.
+                done = await self._service.pr_loop.finish_external_merge(task)
+                if done is None:
+                    await self._service.patch_task(task.id, {"status": "merged"}, owner)
                 updated += 1
                 continue
             issue = issue_by_number.get(task.issue_number) if task.issue_number else None

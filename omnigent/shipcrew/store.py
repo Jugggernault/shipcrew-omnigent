@@ -246,6 +246,7 @@ _MISSION_FIELDS = frozenset(
     }
 )
 _PLAN_TASK_FIELDS = ("title", "body", "acceptance", "role", "owned_paths")
+_PLAN_EDITABLE_STATUSES = frozenset({"backlog", "ready"})
 _UNSET: Any = object()
 
 
@@ -340,9 +341,11 @@ class ShipcrewStore:
         """Create or update one task per plan key, in one transaction.
 
         A key already imported into this mission updates that task's content
-        (never its status, session or board position); a new key becomes a
-        ``backlog`` task. ``depends_on`` keys are mapped to task ids. Tasks whose
-        key left the plan are kept as they are.
+        while it is still ``backlog`` / ``ready`` (never its status, session or
+        board position: a started task keeps the contract its agents and
+        reviewer work to); a new key becomes a ``backlog`` task. ``depends_on``
+        keys are mapped to task ids. Tasks whose key left the plan are kept as
+        they are.
 
         :returns: The imported tasks, in plan order.
         """
@@ -378,13 +381,17 @@ class ShipcrewStore:
                     )
                     position += 1.0
                     session.add(row)
+                rows[spec.key] = row
+                if row.status not in _PLAN_EDITABLE_STATUSES:
+                    continue
                 for name in _PLAN_TASK_FIELDS:
                     value = getattr(spec, name)
                     setattr(row, name, list(value) if isinstance(value, list) else value)
                 row.updated_at = now
-                rows[spec.key] = row
             for spec in specs:
-                rows[spec.key].depends_on = [rows[k].id for k in spec.depends_on]
+                row = rows[spec.key]
+                if row.status in _PLAN_EDITABLE_STATUSES:
+                    row.depends_on = [rows[k].id for k in spec.depends_on]
             return [_task(rows[spec.key]) for spec in specs]
 
     # ── Tasks ───────────────────────────────────────────────────

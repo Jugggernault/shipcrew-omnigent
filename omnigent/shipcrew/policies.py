@@ -219,16 +219,81 @@ def _normalize_program(argv: list[str]) -> list[str]:
     return argv
 
 
-def parse_command(command: str) -> list[Segment] | None:
+_GLOB_CHARS = frozenset("*?[")
+
+
+def _has_expansion(text: str) -> bool:
+    """Whether the shell would rewrite a word of *text* before running it.
+
+    Parameter / ANSI-C expansion (``$X``, ``${X}``, ``$'..'``) outside single
+    quotes, unquoted brace expansion (``--{ha,}rd``) and an unquoted glob in an
+    option word (``--ha?d``) all turn a word the allowlist saw into another
+    one (``CI=--output=f; git diff $CI``), so such a command is unanalyzable.
+    """
+    quote: str | None = None
+    word_start = True
+    option_word = False  # in the name part of a word starting with "-"
+    brace = 0
+    brace_list = False
+    i = 0
+    while i < len(text):
+        c = text[i]
+        if quote == "'":
+            if c == "'":
+                quote = None
+            i += 1
+            continue
+        if c == "\\":
+            i += 2
+            word_start = False
+            continue
+        if c == "$" and i + 1 < len(text) and not text[i + 1].isspace() and text[i + 1] != '"':
+            return True
+        if quote == '"':
+            if c == '"':
+                quote = None
+            i += 1
+            continue
+        if c in "'\"":
+            quote = c
+            word_start = False
+        elif c.isspace() or c in ";&|<>()":
+            word_start, option_word, brace, brace_list = True, False, 0, False
+        else:
+            if word_start:
+                option_word = c == "-"
+                word_start = False
+            if c == "=":
+                option_word = False  # ``--include=*.ts``: only the value globs
+            elif c == "{":
+                brace += 1
+            elif c == "}" and brace:
+                if brace_list:
+                    return True
+                brace -= 1
+            elif brace and (c == "," or text.startswith("..", i)):
+                brace_list = True
+            elif option_word and c in _GLOB_CHARS:
+                return True
+        i += 1
+    return False
+
+
+def parse_command(command: str, *, strict: bool = True) -> list[Segment] | None:
     """Split *command* into simple commands, or ``None`` when it cannot be analyzed.
 
     Command substitution, process substitution, backticks and heredocs make a
     command unanalyzable (their inner commands would run unseen), except the
-    ``$(cat <<'EOF' ... EOF)`` literal-string idiom.
+    ``$(cat <<'EOF' ... EOF)`` literal-string idiom; so do parameter, brace
+    and option-glob expansions (see :func:`_has_expansion`) unless
+    ``strict=False`` (the owned-paths check, which refuses any target holding
+    a ``$`` itself).
     """
     text = command.replace("\\\n", " ")
     text = _HEREDOC_STRING.sub("HEREDOC", text)
     if any(marker in text for marker in ("$(", "`", "<(", ">(")):
+        return None
+    if strict and _has_expansion(text):
         return None
     text = _FD_DUP.sub(r"\1", text)
     text = _FD_NUMBER.sub(r"\1", text)
@@ -355,6 +420,28 @@ def _curl_localhost(args: list[str]) -> bool:
 _BUILTIN_MATCHERS: dict[str, Callable[[list[str]], bool]] = {"curl_localhost": _curl_localhost}
 
 
+def _banned_hit(arg: str, banned: str) -> bool:
+    """Whether *arg* is the refused option *banned* in any spelling getopt accepts.
+
+    ``fnmatch`` first; then, for a long option (``--hard``, ``--upload-pack*``),
+    any unambiguous-prefix abbreviation (``--har``, ``--upload-p=cmd``: git and
+    GNU tools expand them); and for a one-letter option (``-x``), a cluster or
+    a stuck value containing it (``-vx``, ``-xcmd``; ``-o*`` likewise refuses
+    ``-uo``).
+    """
+    if fnmatch.fnmatchcase(arg, banned):
+        return True
+    if banned.startswith("--"):
+        literal = re.split(r"[*?\[=]", banned, maxsplit=1)[0]
+        name = arg.split("=", 1)[0]
+        return name.startswith("--") and len(name) > 3 and literal.startswith(name)
+    if re.fullmatch(r"-[A-Za-z0-9]\*?", banned):
+        return (
+            arg.startswith("-") and not arg.startswith("--") and len(arg) > 2 and banned[1] in arg
+        )
+    return False
+
+
 @dataclass(frozen=True)
 class _Pattern:
     source: str
@@ -379,7 +466,7 @@ class _Pattern:
         rest = argv[len(self.words) :]
         if self.exact and rest:
             return False
-        return not any(fnmatch.fnmatchcase(a, b) for a in rest for b in self.banned)
+        return not any(_banned_hit(a, b) for a in rest for b in self.banned)
 
 
 def compile_pattern(source: str) -> _Pattern:
@@ -387,7 +474,9 @@ def compile_pattern(source: str) -> _Pattern:
 
     * ``"git diff !--output*"`` -- the command starts with the words
       ``git diff`` (each an ``fnmatch`` glob, ``*`` = any one word); the
-      remaining arguments are free except those matching a ``!glob``.
+      remaining arguments are free except those matching a ``!glob``
+      (abbreviated long options and short-option clusters included, see
+      :func:`_banned_hit`).
       A final ``$`` word forbids any remaining argument.
     * ``"re:<regex>"`` -- a Python regex matched at the start of the
       normalized command (words joined by one space).
@@ -666,8 +755,14 @@ def shell_write_targets(argv: list[str]) -> list[str]:
             return _positionals(rest)
         if sub == "restore":
             return _positionals(rest, _VALUE_FLAGS["restore"])
-        if sub == "checkout" and "--" in rest:
-            return rest[rest.index("--") + 1 :]
+        if sub == "checkout":
+            if "--" in rest:
+                return rest[rest.index("--") + 1 :]
+            # ``git checkout <tree-ish> <path>...`` rewrites those paths; a lone
+            # word may be a path or a branch (a switch rewrites the worktree):
+            # either way it is judged as a path.
+            pos = _positionals(rest, frozenset({"-b", "-B", "--orphan", "--conflict"}))
+            return pos[1:] if len(pos) > 1 else pos
         return []
     if prog == "prettier" and any(a in ("--write", "-w") for a in args):
         return _positionals(args, _VALUE_FLAGS["prettier"]) or ["."]
@@ -793,7 +888,7 @@ def owned_paths(
         command = _shell_command(event)
         if command is None:
             return _ALLOW
-        segments = parse_command(command)
+        segments = parse_command(command, strict=False)
         if segments is None:
             return _ALLOW  # unanalyzable: shell_allowlist asks for it
         cwd = root_abs
@@ -824,6 +919,30 @@ def owned_paths(
         return _ALLOW
 
     return _evaluate
+
+
+def paths_outside_owned(
+    changed: Iterable[str],
+    owned_paths: Sequence[str],
+    shared_paths: Sequence[str] | None = None,
+) -> list[str]:
+    """Repo-relative *changed* paths the task's ``owned_paths`` do not cover.
+
+    The same rules as :func:`owned_paths` (a shared contract file counts as
+    owned only when listed by name), applied to a diff. Empty *owned_paths*
+    means no contract: nothing is outside.
+    """
+    owned_list = [p for p in owned_paths if isinstance(p, str) and p.strip()]
+    if not owned_list:
+        return []
+    owned = _GlobSet(owned_list)
+    exact_owned = {_norm_glob(p) for p in owned_list if not _WILDCARD.search(_norm_glob(p))}
+    shared = _GlobSet(DEFAULT_SHARED_PATHS if shared_paths is None else shared_paths)
+    outside: list[str] = []
+    for path in changed:
+        if (shared.match(path) and path not in exact_owned) or not owned.match(path):
+            outside.append(path)
+    return outside
 
 
 # ── Orchestrator push guard ──────────────────────────────────────────────────

@@ -295,6 +295,16 @@ class TestPlanImport:
         await service.planner.import_plan(mission["id"])
         assert len(await _tasks(client, mission["id"])) == 4
 
+        # A started task keeps the contract its agents and reviewer work to.
+        await asyncio.to_thread(service.store.update_task, first["T02"]["id"], status="review")
+        replan["tasks"][1]["title"] = "Rewritten"
+        replan["tasks"][1]["owned_paths"] = ["**"]
+        _write_plan(repo, replan)
+        await service.planner.import_plan(mission["id"])
+        third = await _by_key(client, service, mission["id"])
+        assert third["T02"]["title"] == "Cart and checkout"
+        assert third["T02"]["owned_paths"] == second["T02"]["owned_paths"]
+
 
 class TestParsePlan:
     def test_unknown_dependency_key(self) -> None:
@@ -322,6 +332,17 @@ class TestParsePlan:
             (json.dumps({"tasks": []}), "tasks"),
             (json.dumps({"tasks": [{"key": "T01"}]}), "tasks.0.title"),
             (json.dumps({"tasks": [{"key": "T01", "title": "x", "role": "../x"}]}), "role"),
+            # The PRD is untrusted: no orchestrator / reviewer bundle for a task.
+            (json.dumps({"tasks": [{"key": "T01", "title": "x", "role": "shipcrew"}]}), "role"),
+            (
+                json.dumps({"tasks": [{"key": "T", "title": "x", "owned_paths": ["../w/**"]}]}),
+                "must not contain '..'",
+            ),
+            (
+                json.dumps({"tasks": [{"key": "T", "title": "x", "owned_paths": ["/etc/**"]}]}),
+                "relative to the repository",
+            ),
+            (json.dumps({"tasks": [{"key": f"T{i}", "title": "x"} for i in range(201)]}), "tasks"),
         ],
     )
     def test_schema_errors(self, text: str, message: str) -> None:

@@ -477,6 +477,11 @@ def pr_merge(state: dict[str, Any], a: argparse.Namespace) -> None:
     if not a.squash:
         raise Fail("fake gh: only --squash merges are supported")
     head_sha = _ref_sha(state, pr["head"])
+    if a.match_head_commit and a.match_head_commit != head_sha:
+        raise Fail(
+            f"Pull request #{pr['number']} head is {head_sha}, "
+            f"not the expected {a.match_head_commit}"
+        )
     with _clone(state) as repo:
         _git("checkout", "--quiet", pr["base"], cwd=repo)
         squashed = _git("merge", "--squash", f"origin/{pr['head']}", cwd=repo, check=False)
@@ -667,6 +672,7 @@ def _parser() -> argparse.ArgumentParser:
             p.add_argument("--squash", action="store_true")
             p.add_argument("--delete-branch", action="store_true")
             p.add_argument("--auto", action="store_true")
+            p.add_argument("--match-head-commit")
         if name == "update-branch":
             p.add_argument("--rebase", action="store_true")
     pl = pr.add_parser("list")

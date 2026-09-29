@@ -35,8 +35,30 @@ PRD_FILE = Path(".shipcrew") / "prd.md"
 MISSION_LABEL_KEY = "shipcrew.mission_id"
 # A plan.json last written this long before the planner started is stale.
 _STALE_SLACK_S = 1.0
-_ROLE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _MAX_ERRORS_SHOWN = 5
+# The task roles of agents/planner/ROLE.md. The PRD is untrusted input to the
+# planner, so a plan may not route work to the orchestrator, planner or
+# reviewer bundles.
+PLAN_ROLES = frozenset(
+    {"designer", "scaffolder", "developer", "integrator", "qa", "security", "devops"}
+)
+MAX_PLAN_TASKS = 200
+_MAX_OWNED = 100
+_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def _check_owned_path(glob: str) -> str:
+    """A repo-relative owned glob: no absolute path, ``..``, backslash or control char."""
+    glob = glob.strip()
+    if not glob or len(glob) > 512:
+        raise ValueError("owned path must be 1 to 512 characters")
+    if _CONTROL.search(glob) or "\\" in glob:
+        raise ValueError(f"owned path {glob!r} has a control character or a backslash")
+    if glob.startswith(("/", "~")):
+        raise ValueError(f"owned path {glob!r} must be relative to the repository")
+    if ".." in glob.split("/"):
+        raise ValueError(f"owned path {glob!r} must not contain '..'")
+    return glob
 
 
 class PlanError(ValueError):
@@ -50,11 +72,11 @@ class PlanTaskModel(BaseModel):
 
     key: str = Field(min_length=1, max_length=128)
     title: str = Field(min_length=1, max_length=512)
-    body: str = ""
-    acceptance: list[str] = Field(default_factory=list)
+    body: str = Field(default="", max_length=50_000)
+    acceptance: list[str] = Field(default_factory=list, max_length=50)
     role: str = "developer"
-    depends_on: list[str] = Field(default_factory=list)
-    owned_paths: list[str] = Field(default_factory=list)
+    depends_on: list[str] = Field(default_factory=list, max_length=MAX_PLAN_TASKS)
+    owned_paths: list[str] = Field(default_factory=list, max_length=_MAX_OWNED)
 
     @field_validator("key", "title")
     @classmethod
@@ -67,10 +89,22 @@ class PlanTaskModel(BaseModel):
     @field_validator("role")
     @classmethod
     def _bundle_name(cls, value: str) -> str:
-        # The role names a directory under SHIPCREW_AGENTS_DIR: no traversal.
-        if not _ROLE_RE.match(value) or ".." in value:
-            raise ValueError("must be a bundle directory name")
+        # The role names a directory under SHIPCREW_AGENTS_DIR: a known task role only.
+        if value not in PLAN_ROLES:
+            raise ValueError(f"must be one of {', '.join(sorted(PLAN_ROLES))}")
         return value
+
+    @field_validator("acceptance")
+    @classmethod
+    def _acceptance(cls, value: list[str]) -> list[str]:
+        if any(len(a) > 2000 for a in value):
+            raise ValueError("an acceptance criterion is longer than 2000 characters")
+        return value
+
+    @field_validator("owned_paths")
+    @classmethod
+    def _owned(cls, value: list[str]) -> list[str]:
+        return [_check_owned_path(p) for p in value]
 
 
 class PlanModel(BaseModel):
@@ -78,7 +112,7 @@ class PlanModel(BaseModel):
 
     model_config = ConfigDict(extra="ignore")
 
-    tasks: list[PlanTaskModel] = Field(min_length=1)
+    tasks: list[PlanTaskModel] = Field(min_length=1, max_length=MAX_PLAN_TASKS)
 
 
 def _find_cycle(deps: dict[str, list[str]]) -> list[str] | None:

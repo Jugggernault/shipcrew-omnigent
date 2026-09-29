@@ -10,6 +10,7 @@ from omnigent.shipcrew.policies import (
     compile_pattern,
     owned_paths,
     parse_command,
+    paths_outside_owned,
     push_guard,
     shell_allowlist,
     shell_write_targets,
@@ -178,7 +179,9 @@ class TestShellWriteTargets:
             (["sed", "-i", "s/a/b/", "f"], ["f"]),
             (["sed", "-n", "1p", "f"], []),
             (["git", "mv", "a", "b"], ["a", "b"]),
-            (["git", "checkout", "main"], []),
+            (["git", "checkout", "main"], ["main"]),  # a branch switch is judged as a path
+            (["git", "checkout", "-b", "feat"], []),
+            (["git", "checkout", "HEAD~3", "lib/a.ts"], ["lib/a.ts"]),
             (["git", "checkout", "--", "f"], ["f"]),
             (["npx", "prettier", "--write", "src"], ["src"]),
             (["prettier", "--check", "src"], []),
@@ -356,3 +359,64 @@ def test_claude_native_allowed_tools_become_launch_args() -> None:
     assert derive(_spec(allowed_tools="Bash")) == ["--allowedTools", "Bash"]
     assert derive(_spec(permission_mode="auto")) == ["--permission-mode", "auto"]
     assert derive(_spec()) is None
+
+
+class TestAllowlistBypasses:
+    """Spellings the shell or getopt turn into a refused word (review round 2)."""
+
+    ALLOW = [
+        "git reset !--hard !--merge !--keep",
+        "git fetch !--upload-pack*",
+        "git rebase !-i !--interactive !-x !--exec*",
+        "git diff !--output*",
+        "git branch !-D !-d",
+        "git commit",
+        "sort !-o* !--output*",
+        "grep",
+        "ls",
+        "echo",
+    ]
+
+    @pytest.mark.parametrize(
+        ("command", "verdict"),
+        [
+            ("git reset --har HEAD~1", "ASK"),  # git expands unambiguous prefixes
+            ("git fetch --upload-p='sh -c x' origin", "ASK"),  # runs a local command
+            ("git rebase --exe=true HEAD~1", "ASK"),
+            ("git rebase -xtrue HEAD~1", "ASK"),  # stuck value
+            ("git rebase -vx true HEAD~1", "ASK"),  # short-option cluster
+            ("git branch -vd old", "ASK"),
+            ("sort --out=f a", "ASK"),
+            ("sort -uo f a", "ASK"),
+            ("CI=--output=/tmp/x; git diff $CI", "ASK"),  # parameter expansion
+            ("git diff ${X}", "ASK"),
+            ("git diff $'\\x2d-output=x'", "ASK"),  # ANSI-C quoting
+            ("git reset --{ha,}rd", "ASK"),  # brace expansion
+            ("git reset --ha?d", "ASK"),  # glob in an option name
+            ('echo "$HOME"', "ASK"),
+            # Still free: the everyday forms.
+            ("git reset --soft HEAD~1", "ALLOW"),
+            ("git fetch origin main", "ALLOW"),
+            ("git rebase origin/main", "ALLOW"),
+            ("sort -u a", "ALLOW"),
+            ("grep -rn --include=*.ts foo src", "ALLOW"),
+            ("ls src/*.ts", "ALLOW"),
+            ("grep 'a$' f && grep \"a$\" f && echo '$HOME' && echo a\\$b", "ALLOW"),
+            ("git commit -m \"$(cat <<'EOF'\nfix: $HOME cost\nEOF\n)\"", "ALLOW"),
+        ],
+    )
+    def test_bypass(self, command: str, verdict: str) -> None:
+        fn = shell_allowlist(allow=self.ALLOW)
+        assert _result(fn, _bash(command)) == verdict
+
+    def test_push_guard_denies_an_expanded_refspec(self) -> None:
+        assert _result(push_guard(), _bash("B=main; git push origin $B")) == "DENY"
+
+
+def test_paths_outside_owned() -> None:
+    assert paths_outside_owned(["src/a", "lib/b", "package.json"], ["src/**"]) == [
+        "lib/b",
+        "package.json",
+    ]
+    assert paths_outside_owned(["x", "package.json"], ["**", "package.json"]) == []
+    assert paths_outside_owned(["anything"], []) == []

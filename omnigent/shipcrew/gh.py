@@ -12,6 +12,7 @@ Every call resolves the executable through :func:`omnigent.shipcrew.tools.resolv
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -165,9 +166,16 @@ def pr_merge(cwd: Path, pr: int) -> bool:
     return pr_merge_result(cwd, pr)[0]
 
 
-def pr_merge_result(cwd: Path, pr: int) -> tuple[bool, str]:
-    """Squash-merge and delete the head branch. ``(merged, gh output)``."""
-    r = _run(["pr", "merge", str(pr), "--squash", "--delete-branch"], cwd)
+def pr_merge_result(cwd: Path, pr: int, head_sha: str | None = None) -> tuple[bool, str]:
+    """Squash-merge and delete the head branch. ``(merged, gh output)``.
+
+    :param head_sha: Merge only if the PR head is still this commit
+        (``--match-head-commit``): a push after CI and review ran is not merged.
+    """
+    args = ["pr", "merge", str(pr), "--squash", "--delete-branch"]
+    if head_sha:
+        args += ["--match-head-commit", head_sha]
+    r = _run(args, cwd)
     return r.returncode == 0, (r.stdout + r.stderr).strip()[-1500:]
 
 
@@ -221,6 +229,11 @@ class PrState:
     url: str
 
 
+# A commit id as GitHub reports it (SHA-1 or SHA-256). The PR loop passes the
+# head to git as an argument, so anything else is refused.
+_SHA = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?")
+
+
 def pr_view(cwd: Path, pr: int) -> PrState:
     out = gh(
         "pr",
@@ -235,10 +248,13 @@ def pr_view(cwd: Path, pr: int) -> PrState:
         data = json.loads(out)
     except ValueError as exc:
         raise GhError(f"gh pr view {pr}: unreadable output {out[-300:]!r}") from exc
+    head_sha = str(data.get("headRefOid") or "")
+    if head_sha and not _SHA.fullmatch(head_sha):
+        raise GhError(f"gh pr view {pr}: unexpected head commit {head_sha[:80]!r}")
     return PrState(
         number=int(data["number"]),
         state=str(data["state"]).upper(),
-        head_sha=str(data.get("headRefOid") or ""),
+        head_sha=head_sha,
         is_draft=bool(data.get("isDraft")),
         url=str(data.get("url") or ""),
     )
@@ -257,12 +273,15 @@ class ChecksStatus:
     :param summary: One ``name: state`` line per check.
     :param failing: Names of the failing checks.
     :param run_ids: Actions run ids of the failing checks (for their logs).
+    :param none_reported: No check exists (yet) for the head: green unless
+        the caller knows CI should report (see the PR loop's grace period).
     """
 
     state: str
     summary: str = ""
     failing: tuple[str, ...] = ()
     run_ids: tuple[str, ...] = ()
+    none_reported: bool = False
 
 
 def _run_id(link: str) -> str | None:
@@ -279,13 +298,13 @@ def pr_checks_status(cwd: Path, pr: int) -> ChecksStatus:
     r = _run(["pr", "checks", str(pr), "--json", "name,state,bucket,link"], cwd)
     out = r.stdout + r.stderr
     if "no checks reported" in out.lower():
-        return ChecksStatus("green", "no checks reported")
+        return ChecksStatus("green", "no checks reported", none_reported=True)
     try:
         checks: list[dict[str, Any]] = json.loads(r.stdout or "[]")
     except ValueError as exc:
         raise GhError(f"gh pr checks {pr}: unreadable output {out[-500:]!r}") from exc
     if not checks:
-        return ChecksStatus("green", "no checks reported")
+        return ChecksStatus("green", "no checks reported", none_reported=True)
     buckets = [str(c.get("bucket") or "").lower() for c in checks]
     summary = "\n".join(f"{c.get('name')}: {c.get('state')}" for c in checks)
     failing = [c for c, b in zip(checks, buckets, strict=True) if b in ("fail", "cancel")]
