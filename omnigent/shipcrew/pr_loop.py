@@ -53,9 +53,16 @@ from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.shipcrew import gh
 from omnigent.shipcrew.branches import task_branch
 from omnigent.shipcrew.policies import paths_outside_owned
+from omnigent.shipcrew.review_policy import (
+    changed_lines,
+    review_effort,
+    review_skip_reason,
+    split_nul,
+)
 from omnigent.shipcrew.sessions import ChildSessionRequest, SessionServiceError
 from omnigent.shipcrew.store import Mission, Task
 from omnigent.shipcrew.tools import session_env
+from omnigent.shipcrew.verify import VERIFY_ROLES, VerifyLoop, verify_writable
 
 if TYPE_CHECKING:
     from omnigent.shipcrew.service import ShipcrewService
@@ -512,6 +519,7 @@ class PrLoop:
         self._merge_locks: dict[str, asyncio.Lock] = {}
         # ponytail: in-memory, a restart resets the count (worst case: 3 more tries).
         self._child_start_failures: dict[tuple[str, str], int] = {}
+        self._verify = VerifyLoop(service)
 
     # ── plumbing ──
 
@@ -597,7 +605,15 @@ class PrLoop:
         self._child_start_failures.pop(key, None)
         return True
 
-    async def _start_child(self, ctx: _Ctx, role: str, title: str, prompt: str) -> str:
+    async def _start_child(
+        self,
+        ctx: _Ctx,
+        role: str,
+        title: str,
+        prompt: str,
+        *,
+        reasoning_effort: str | None = None,
+    ) -> str:
         agent_dir = self._bundle(role)
         if agent_dir is None:
             raise SessionServiceError(
@@ -617,6 +633,7 @@ class PrLoop:
                     "shipcrew.role": role,
                     LOOP_LABEL_KEY: role,
                 },
+                reasoning_effort=reasoning_effort,
             )
         )
 
@@ -713,6 +730,11 @@ class PrLoop:
         return parse_verdict(text)
 
     async def _open_pr(self, ctx: _Ctx) -> Task:
+        if ctx.task.role in VERIFY_ROLES:
+            # qa / security: done, a PR of the tests it wrote, or a fix task.
+            handled = await self._verify.after_turn(self, ctx)
+            if handled is not None:
+                return handled
         verdict = await self._developer_verdict(ctx)
         if verdict is None:
             return await self._block(ctx, "developer ended its turn without a PASS/FAIL line")
@@ -815,6 +837,9 @@ class PrLoop:
         task = ctx.task
         review = task.review or {}
         if task.review_sha != head:
+            skipped = await self._skip_review(ctx, head)
+            if skipped is not None:
+                return skipped
             return await self._start_reviewer(ctx, head)
         if review.get("verdict") is None:
             done = await self._collect_review(ctx, head)
@@ -835,6 +860,33 @@ class PrLoop:
             ctx, review_feedback_prompt(ctx.task, review, rounds), review_rounds=rounds
         )
 
+    async def _changed_paths(self, ctx: _Ctx, head: str) -> list[str]:
+        assert ctx.worktree is not None
+        # -z: no C-quoting of unusual names; --no-renames: a file moved out of
+        # a gated path shows as a deletion there.
+        names = await self._io(
+            _git,
+            ["diff", "-z", "--no-renames", "--name-only", f"{ctx.base_ref}...{head}"],
+            ctx.worktree,
+        )
+        return split_nul(names.stdout)
+
+    async def _skip_review(self, ctx: _Ctx, head: str) -> _Ctx | None:
+        """Approve without a reviewer a tests-only / docs-only diff (CI is green here)."""
+        await self._io(_fetch, ctx.worktree, ctx.base)
+        reason = review_skip_reason(await self._changed_paths(ctx, head))
+        if reason is None:
+            return None
+        await self._stop(ctx, ctx.task.reviewer_session_id)
+        task = await self._update(
+            ctx.task,
+            review={"verdict": "approve", "summary": f"review skipped: {reason}", "findings": []},
+            review_sha=head,
+            reviewer_session_id=None,
+            blocked_reason=None,
+        )
+        return _replace(ctx, task)
+
     async def _start_reviewer(self, ctx: _Ctx, head: str) -> Task:
         assert ctx.worktree is not None
         await self._stop(ctx, ctx.task.reviewer_session_id)
@@ -846,6 +898,10 @@ class PrLoop:
         snapshot_dir.mkdir(parents=True, exist_ok=True)
         diff_path = snapshot_dir / f"{ctx.task.id}-{head[:12]}.diff"
         diff_path.write_text(diff.stdout)
+        numstat = await self._io(
+            _git, ["diff", "--numstat", f"{ctx.base_ref}...HEAD"], ctx.worktree, check=False
+        )
+        lines = changed_lines(numstat.stdout)
         prompt = reviewer_prompt(
             ctx.task,
             branch=ctx.branch,
@@ -856,7 +912,12 @@ class PrLoop:
         )
         try:
             session_id = await self._start_child(
-                ctx, REVIEWER_ROLE, f"Review: {ctx.task.title}", prompt
+                ctx,
+                REVIEWER_ROLE,
+                f"Review: {ctx.task.title}",
+                prompt,
+                # A small diff needs less thinking: a faster, cheaper review.
+                reasoning_effort=review_effort(lines),
             )
         except SessionServiceError as exc:
             if not self._child_start_failed(ctx, REVIEWER_ROLE):
@@ -906,15 +967,16 @@ class PrLoop:
     async def _policy_step(self, ctx: _Ctx, head: str) -> _Ctx | Task:
         assert ctx.worktree is not None
         await self._io(_fetch, ctx.repo, ctx.base)
-        # -z: no C-quoting of unusual names; --no-renames: a file moved out of
-        # a gated path shows as a deletion there.
-        names = await self._io(
-            _git,
-            ["diff", "-z", "--no-renames", "--name-only", f"{ctx.base_ref}...{head}"],
-            ctx.worktree,
-        )
-        changed = [n for n in names.stdout.split("\0") if n]
+        changed = await self._changed_paths(ctx, head)
         reasons = approval_reasons(changed, await self._approval_rules(ctx))
+        if ctx.task.role in VERIFY_ROLES:
+            # A verify task writes tests only (its guardrail); this also covers
+            # files changed by code it ran.
+            extra = [p for p in changed if not verify_writable(ctx.task.role, p)]
+            if extra:
+                more = f" (+{len(extra) - 5} more)" if len(extra) > 5 else ""
+                shown = ", ".join(extra[:5]) + more
+                reasons.append(f"a {ctx.task.role} task changed non-test files: {shown}")
         outside = paths_outside_owned(changed, ctx.task.owned_paths)
         if outside:
             shown = ", ".join(outside[:5]) + (
