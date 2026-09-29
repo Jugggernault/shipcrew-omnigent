@@ -24,7 +24,9 @@ export function BoardColumn({ column, tasks, viewerId, header, ...actions }: Boa
       aria-labelledby={headingId}
       data-testid={`board-column-${column.id}`}
       className={cn(
-        "flex w-[280px] shrink-0 flex-col rounded-xl border bg-muted/30 transition-colors",
+        // Columns share the width so all six fit next to a default sidebar at
+        // 1600px; below ~1250px of board width they scroll horizontally.
+        "flex min-w-[192px] max-w-[340px] flex-1 basis-0 flex-col rounded-xl border bg-muted/30 transition-colors",
         isOver && "border-brand-accent/60 bg-brand-accent/5",
       )}
     >
@@ -35,7 +37,9 @@ export function BoardColumn({ column, tasks, viewerId, header, ...actions }: Boa
         <span className="text-xs text-muted-foreground tabular-nums" data-testid="column-count">
           {tasks.length}
         </span>
-        <span className="ml-auto truncate text-xs text-muted-foreground">{column.hint}</span>
+        <span className="ml-auto truncate text-xs text-muted-foreground" title={column.hint}>
+          {column.hint}
+        </span>
       </header>
       <div className="flex min-h-24 flex-1 flex-col gap-2 overflow-y-auto px-2 pb-2">
         {header}

@@ -3,14 +3,19 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { authenticatedFetch } from "@/lib/identity";
 import {
   applyStreamEvent,
+  approveTask,
   createTask,
   fetchMissions,
+  missionsQueryKey,
   parseMissionStream,
+  planMission,
+  requestTaskChanges,
+  syncMission,
   tasksQueryKey,
   updateTask,
 } from "./api";
-import { makeTask } from "./fixtures";
-import type { MissionStreamEvent, Task } from "./types";
+import { makeMission, makeTask } from "./fixtures";
+import type { Mission, MissionStreamEvent, Task } from "./types";
 
 vi.mock("@/lib/identity", () => ({ authenticatedFetch: vi.fn() }));
 
@@ -61,6 +66,16 @@ describe("parseMissionStream", () => {
     ]);
   });
 
+  it("parses mission.updated events", async () => {
+    const mission = makeMission({
+      plan: { status: "imported", session_id: "conv_plan", error: null, imported_count: 3 },
+    });
+    const events = await collect(
+      streamOf([`data: ${JSON.stringify({ type: "mission.updated", mission })}\n\n`]),
+    );
+    expect(events).toEqual([{ type: "mission.updated", mission }]);
+  });
+
   it("stops at the [DONE] sentinel", async () => {
     const events = await collect(
       streamOf([
@@ -99,6 +114,32 @@ describe("applyStreamEvent", () => {
   });
 });
 
+describe("applyStreamEvent for missions", () => {
+  it("replaces the selected mission in the mission list and ignores others", () => {
+    const client = new QueryClient();
+    client.setQueryData<Mission[]>(missionsQueryKey, [
+      makeMission({ id: "mission_1" }),
+      makeMission({ id: "mission_2", title: "Other" }),
+    ]);
+    const running = makeMission({
+      id: "mission_1",
+      plan: { status: "running", session_id: "conv_plan", error: null, imported_count: 0 },
+    });
+
+    applyStreamEvent(client, "mission_1", { type: "mission.updated", mission: running });
+    applyStreamEvent(client, "mission_1", {
+      type: "mission.updated",
+      mission: makeMission({ id: "mission_2", title: "Renamed elsewhere" }),
+    });
+
+    const missions = client.getQueryData<Mission[]>(missionsQueryKey) ?? [];
+    expect(missions.map((mission) => [mission.id, mission.plan.status, mission.title])).toEqual([
+      ["mission_1", "running", "Billing launch"],
+      ["mission_2", "idle", "Other"],
+    ]);
+  });
+});
+
 describe("requests", () => {
   it("unwraps the mission list", async () => {
     fetchMock.mockResolvedValueOnce(json({ missions: [{ id: "m1" }] }));
@@ -121,6 +162,32 @@ describe("requests", () => {
     expect(patchUrl).toBe("/v1/shipcrew/tasks/t1");
     expect(patchInit?.method).toBe("PATCH");
     expect(JSON.parse(patchInit?.body as string)).toEqual({ status: "ready" });
+  });
+
+  it("posts the round-2 actions to their contract paths", async () => {
+    fetchMock.mockImplementation(async () => json(makeTask()));
+    await planMission("m1", "Ship refunds");
+    await planMission("m1");
+    await syncMission("m1");
+    await approveTask("t 1");
+    await requestTaskChanges("t1", "Split the migration");
+
+    const calls = fetchMock.mock.calls.map(([url, init]) => ({
+      url,
+      method: init?.method,
+      body: typeof init?.body === "string" ? (JSON.parse(init.body) as unknown) : undefined,
+    }));
+    expect(calls).toEqual([
+      { url: "/v1/shipcrew/missions/m1/plan", method: "POST", body: { prd: "Ship refunds" } },
+      { url: "/v1/shipcrew/missions/m1/plan", method: "POST", body: {} },
+      { url: "/v1/shipcrew/missions/m1/sync", method: "POST", body: undefined },
+      { url: "/v1/shipcrew/tasks/t%201/approve", method: "POST", body: undefined },
+      {
+        url: "/v1/shipcrew/tasks/t1/request-changes",
+        method: "POST",
+        body: { message: "Split the migration" },
+      },
+    ]);
   });
 
   it("surfaces the server's error message", async () => {

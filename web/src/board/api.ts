@@ -1,6 +1,7 @@
 // Typed client for the shipcrew board API (`/v1/shipcrew/*`): fetchers,
-// TanStack Query hooks, and the mission SSE stream. Task lists stay live
-// through the stream; while it is down the list query polls instead.
+// TanStack Query hooks, and the mission SSE stream. Task lists and the
+// mission (plan status) stay live through the stream; while it is down the
+// task list polls instead.
 
 import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient, type QueryClient } from "@tanstack/react-query";
@@ -17,6 +18,8 @@ import type {
 const BASE = "/v1/shipcrew";
 /** Poll interval for the task list while the SSE stream is not connected. */
 export const TASKS_POLL_MS = 5_000;
+/** Poll interval for the mission list while a planner run is in flight. */
+export const PLAN_POLL_MS = 5_000;
 const RECONNECT_BASE_MS = 1_000;
 const RECONNECT_MAX_MS = 30_000;
 
@@ -94,7 +97,45 @@ export function stopTask(taskId: string): Promise<Task> {
   return request<Task>(`/tasks/${encodeURIComponent(taskId)}/stop`, { method: "POST" });
 }
 
+/** Start a planner run; `prd` is optional (the planner reads the repo otherwise). */
+export function planMission(missionId: string, prd?: string): Promise<Mission> {
+  return request<Mission>(`/missions/${encodeURIComponent(missionId)}/plan`, {
+    method: "POST",
+    body: JSON.stringify(prd ? { prd } : {}),
+  });
+}
+
+/** Force a GitHub issue/PR sync of the mission now. */
+export function syncMission(missionId: string): Promise<Mission> {
+  return request<Mission>(`/missions/${encodeURIComponent(missionId)}/sync`, { method: "POST" });
+}
+
+/** Approve a merge that waits on `needs_human_approval`. */
+export function approveTask(taskId: string): Promise<Task> {
+  return request<Task>(`/tasks/${encodeURIComponent(taskId)}/approve`, { method: "POST" });
+}
+
+/** Send feedback to the developer's root session; the task goes back to running. */
+export function requestTaskChanges(taskId: string, message: string): Promise<Task> {
+  return request<Task>(`/tasks/${encodeURIComponent(taskId)}/request-changes`, {
+    method: "POST",
+    body: JSON.stringify({ message }),
+  });
+}
+
 // ---- cache helpers --------------------------------------------------------
+
+/** Insert or replace one mission in the cached mission list. */
+export function upsertCachedMission(queryClient: QueryClient, mission: Mission): void {
+  queryClient.setQueryData<Mission[]>(missionsQueryKey, (current) => {
+    if (!current) return [mission];
+    const index = current.findIndex((item) => item.id === mission.id);
+    if (index < 0) return [...current, mission];
+    const next = current.slice();
+    next[index] = mission;
+    return next;
+  });
+}
 
 /** Insert or replace one task in a mission's cached list. */
 export function upsertCachedTask(queryClient: QueryClient, task: Task): void {
@@ -122,6 +163,8 @@ export function applyStreamEvent(
 ): void {
   if (event.type === "task.updated") {
     if (event.task.mission_id === missionId) upsertCachedTask(queryClient, event.task);
+  } else if (event.type === "mission.updated") {
+    if (event.mission.id === missionId) upsertCachedMission(queryClient, event.mission);
   } else {
     removeCachedTask(queryClient, missionId, event.id);
   }
@@ -144,6 +187,9 @@ function toStreamEvent(eventName: string | null, raw: string): MissionStreamEven
   }
   if (type === "task.deleted" && typeof record.id === "string") {
     return { type, id: record.id };
+  }
+  if (type === "mission.updated" && record.mission && typeof record.mission === "object") {
+    return { type, mission: record.mission as Mission };
   }
   return null;
 }
@@ -246,8 +292,18 @@ export function useMissionStream(missionId: string | null): boolean {
 
 // ---- hooks ----------------------------------------------------------------
 
+function planRunning(missions: readonly Mission[] | undefined): boolean {
+  return missions?.some((mission) => mission.plan?.status === "running") ?? false;
+}
+
+/** Missions; polled while a planner run is in flight so its outcome shows up. */
 export function useMissions() {
-  return useQuery({ queryKey: missionsQueryKey, queryFn: fetchMissions, staleTime: 30_000 });
+  return useQuery({
+    queryKey: missionsQueryKey,
+    queryFn: fetchMissions,
+    staleTime: 30_000,
+    refetchInterval: (query) => (planRunning(query.state.data) ? PLAN_POLL_MS : false),
+  });
 }
 
 export function useCreateMission() {
@@ -324,6 +380,44 @@ export function useStopTask() {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: (task: Task) => stopTask(task.id),
+    onSuccess: (updated) => upsertCachedTask(queryClient, updated),
+  });
+}
+
+export function usePlanMission() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({ mission, prd }: { mission: Mission; prd?: string }) =>
+      planMission(mission.id, prd),
+    onSuccess: (updated) => upsertCachedMission(queryClient, updated),
+  });
+}
+
+export function useSyncMission() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (mission: Mission) => syncMission(mission.id),
+    onSuccess: (updated) => {
+      upsertCachedMission(queryClient, updated);
+      // Issue and PR links land on the tasks; reconcile in case events were missed.
+      void queryClient.invalidateQueries({ queryKey: tasksQueryKey(updated.id) });
+    },
+  });
+}
+
+export function useApproveTask() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (task: Task) => approveTask(task.id),
+    onSuccess: (updated) => upsertCachedTask(queryClient, updated),
+  });
+}
+
+export function useRequestTaskChanges() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({ task, message }: { task: Task; message: string }) =>
+      requestTaskChanges(task.id, message),
     onSuccess: (updated) => upsertCachedTask(queryClient, updated),
   });
 }

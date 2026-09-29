@@ -1,7 +1,32 @@
 // A representative mission board for stories.
 
 import { makeTask } from "./fixtures";
-import type { Task } from "./types";
+import type { Task, TaskReview } from "./types";
+
+export const SAMPLE_REVIEW: TaskReview = {
+  verdict: "changes",
+  summary: "The refund path works, but a failed Stripe call leaves the invoice half-refunded.",
+  findings: [
+    {
+      file: "src/billing/refund.py",
+      line: 48,
+      severity: "blocker",
+      message: "Wrap the Stripe call and the ledger write in one transaction.",
+    },
+    {
+      file: "src/billing/refund.py",
+      line: 71,
+      severity: "major",
+      message: "Refund amounts above the invoice total are accepted.",
+    },
+    {
+      file: "tests/test_refund.py",
+      line: null,
+      severity: "minor",
+      message: "Add a test for a partial refund.",
+    },
+  ],
+};
 
 export const SAMPLE_TASKS: Task[] = [
   makeTask({ id: "t1", title: "Invoice PDF export", acceptance: ["PDF matches the invoice"] }),
@@ -19,6 +44,9 @@ export const SAMPLE_TASKS: Task[] = [
     title: "Billing page with invoice list",
     status: "running",
     role: "frontend",
+    branch: "shipcrew/t4000000-billing-page-with-invoice-list",
+    issue_number: 11,
+    issue_url: "https://github.com/acme/app/issues/11",
     assignee: { kind: "agent", id: "frontend" },
     root_session_id: "conv_1",
     cost_usd: 0.87,
@@ -28,9 +56,13 @@ export const SAMPLE_TASKS: Task[] = [
     title: "Customer portal link",
     status: "review",
     assignee: { kind: "agent", id: "developer" },
+    branch: "shipcrew/t5000000-customer-portal-link",
+    issue_number: 12,
+    issue_url: "https://github.com/acme/app/issues/12",
     pr_number: 42,
     pr_url: "https://github.com/acme/app/pull/42",
     ci: "pending",
+    ci_attempts: 1,
     cost_usd: 1.42,
   }),
   makeTask({
@@ -38,18 +70,49 @@ export const SAMPLE_TASKS: Task[] = [
     title: "Refund flow",
     status: "intervention",
     assignee: { kind: "human", id: "ana.lopez@example.com" },
+    branch: "shipcrew/t6000000-refund-flow",
     pr_number: 43,
     pr_url: "https://github.com/acme/app/pull/43",
-    ci: "red",
+    ci: "green",
+    ci_attempts: 2,
+    review: SAMPLE_REVIEW,
+    root_session_id: "conv_6",
     cost_usd: 2.1,
+  }),
+  makeTask({
+    id: "t8",
+    title: "Migrate the invoices table",
+    status: "intervention",
+    role: "developer",
+    branch: "shipcrew/t8000000-migrate-the-invoices-table",
+    pr_number: 44,
+    pr_url: "https://github.com/acme/app/pull/44",
+    ci: "green",
+    review: { verdict: "approve", summary: "Migration is reversible.", findings: [] },
+    needs_human_approval: true,
+    approval_reasons: ["Touches migrations/**", "Diff above 400 lines"],
+    root_session_id: "conv_8",
+    position: 1,
+  }),
+  makeTask({
+    id: "t9",
+    title: "Send receipt emails",
+    status: "intervention",
+    role: "developer",
+    branch: "shipcrew/t9000000-send-receipt-emails",
+    root_session_id: "conv_9",
+    position: 2,
   }),
   makeTask({
     id: "t7",
     title: "Pricing table",
     status: "merged",
+    issue_number: 9,
+    issue_url: "https://github.com/acme/app/issues/9",
     pr_number: 40,
     pr_url: "https://github.com/acme/app/pull/40",
     ci: "green",
+    review: { verdict: "approve", summary: "", findings: [] },
     cost_usd: 0.64,
   }),
 ];
