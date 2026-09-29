@@ -457,6 +457,10 @@ _CONFIRM_DIALOG_RETRY_INTERVAL_S = 0.75
 _TERMINAL_FAILURE_TAIL_LINES = 12
 _TERMINAL_FAILURE_TAIL_CHARS = 800
 _INVOCATION_SETTINGS_FILE = "claude-settings.json"
+# Longer appended system prompts are passed with --append-system-prompt-file:
+# the whole tmux launch command must stay under tmux's 16KB imsg cap.
+_APPEND_PROMPT_INLINE_MAX_BYTES = 4096
+_APPEND_PROMPT_FILE = "append-system-prompt.md"
 
 ToolExecutor = Callable[[str, _JsonObject], Awaitable[object]]
 
@@ -2611,7 +2615,14 @@ def augment_claude_args(
         ]
     )
     if append_system_prompt:
-        args.extend(["--append-system-prompt", append_system_prompt])
+        if len(append_system_prompt.encode()) > _APPEND_PROMPT_INLINE_MAX_BYTES:
+            # tmux rejects a launch command over its 16KB imsg cap ("command
+            # too long"), so a long prompt goes through a file instead.
+            prompt_path = bridge_dir / _APPEND_PROMPT_FILE
+            prompt_path.write_text(append_system_prompt, encoding="utf-8")
+            args.extend(["--append-system-prompt-file", str(prompt_path)])
+        else:
+            args.extend(["--append-system-prompt", append_system_prompt])
     # Imported here: bundle-skills parsing rides the spec graph; launch-only.
     from omnigent.inner.bundle_skills import claude_native_skill_args
 

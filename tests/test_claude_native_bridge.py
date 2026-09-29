@@ -3492,6 +3492,25 @@ def test_augment_claude_args_appends_caller_system_prompt(
     assert args[index + 1] == framework_instruction
 
 
+def test_augment_claude_args_long_system_prompt_goes_through_a_file(
+    tmp_path: Path,
+) -> None:
+    """A long prompt must not inflate the tmux launch command past its 16KB cap."""
+    long_instruction = "Rule.\n" * 3000  # ~18KB, as a large agent bundle's instructions
+
+    args = augment_claude_args(
+        (),
+        bridge_dir=tmp_path,
+        python_executable="/venv/bin/python",
+        append_system_prompt=long_instruction,
+    )
+
+    assert "--append-system-prompt" not in args
+    index = args.index("--append-system-prompt-file")
+    assert Path(args[index + 1]).read_text(encoding="utf-8") == long_instruction
+    assert sum(len(a) for a in args) < 16 * 1024
+
+
 def test_augment_claude_args_merges_caller_allowed_tools(tmp_path: Path) -> None:
     """Framework preapproval extends rather than replaces the user's allowlist."""
     args = augment_claude_args(
