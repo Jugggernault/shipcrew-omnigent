@@ -79,6 +79,9 @@ class RootSessionRequest:
     workspace: str | None = None
     owned_paths: tuple[str, ...] = ()
     project_id: str | None = None
+    # The mission's other active tasks at start: ``{"title", "owned_paths"}``
+    # each (their files are DENY for this task, see policies.owned_paths).
+    other_tasks: tuple[dict[str, Any], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -168,19 +171,39 @@ _OWNED_PATHS_SLOT = re.compile(
     r"^(?P<indent>[ \t]*)owned_paths:[^\n]*# @task\.owned_paths[ \t]*$", re.M
 )
 _ROOT_SLOT = re.compile(r"^(?P<indent>[ \t]*)root:[^\n]*# @task\.root[ \t]*$", re.M)
+_OTHER_TASKS_SLOT = re.compile(
+    r"^(?P<indent>[ \t]*)other_tasks:[^\n]*# @task\.other_tasks[ \t]*$", re.M
+)
 
 
-def inject_task_contract(config_text: str, *, owned_paths: Sequence[str], root: str) -> str:
+def inject_task_contract(
+    config_text: str,
+    *,
+    owned_paths: Sequence[str],
+    root: str,
+    other_tasks: Sequence[dict[str, Any]] = (),
+) -> str:
     """Fill the owned-paths policy slots of a bundle ``config.yaml``.
 
     The values are written as JSON, which YAML reads as flow scalars. A config
     without the slots (a role with no owned-paths policy) is returned as is.
+
+    :param other_tasks: The mission's other active tasks (``{"title",
+        "owned_paths"}``), a start-time snapshot: writes to their files are
+        refused with a hint (the ``# @task.other_tasks`` slot; a bundle
+        without it keeps asking for them).
     """
     if not owned_paths or _OWNED_PATHS_SLOT.search(config_text) is None:
         return config_text
     text = _OWNED_PATHS_SLOT.sub(
         lambda m: f"{m['indent']}owned_paths: {json.dumps(list(owned_paths))}", config_text
     )
+    others = [
+        {"title": str(o.get("title") or ""), "owned_paths": [str(p) for p in o["owned_paths"]]}
+        for o in other_tasks
+        if o.get("owned_paths")
+    ]
+    text = _OTHER_TASKS_SLOT.sub(lambda m: f"{m['indent']}other_tasks: {json.dumps(others)}", text)
     return _ROOT_SLOT.sub(lambda m: f"{m['indent']}root: {json.dumps(root)}", text)
 
 
@@ -189,6 +212,7 @@ def bundle_agent_dir(
     *,
     owned_paths: Sequence[str] = (),
     workspace: str | None = None,
+    other_tasks: Sequence[dict[str, Any]] = (),
 ) -> bytes:
     """Pack an agent bundle directory as the ``tar.gz`` omnigent accepts.
 
@@ -196,6 +220,8 @@ def bundle_agent_dir(
         injected into the bundle's owned-paths guardrail (see
         :func:`inject_task_contract`).
     :param workspace: Absolute path of the task worktree.
+    :param other_tasks: The mission's other active tasks (see
+        :func:`inject_task_contract`).
     """
     from omnigent.spec import materialize_bundle
 
@@ -209,7 +235,10 @@ def bundle_agent_dir(
             config = root / "config.yaml"
             config.write_text(
                 inject_task_contract(
-                    config.read_text(encoding="utf-8"), owned_paths=owned_paths, root=workspace
+                    config.read_text(encoding="utf-8"),
+                    owned_paths=owned_paths,
+                    root=workspace,
+                    other_tasks=other_tasks,
                 ),
                 encoding="utf-8",
             )
@@ -383,6 +412,7 @@ class OmnigentSessionService:
             request.agent_dir,
             owned_paths=request.owned_paths,
             workspace=workspace,
+            other_tasks=request.other_tasks,
         )
         await asyncio.to_thread(_pretrust_claude_workspace, workspace)
         metadata = {

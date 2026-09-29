@@ -161,6 +161,10 @@ class SqlTask(ShipcrewBase):
     # ── sc0005vn ──
     # Automatic "end with PASS/FAIL" turns sent since the agent's last verdict.
     verdict_nudges: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    # ── sc0007ap ──
+    # Paths outside owned_paths a human accepted a write to (owned-paths ASK):
+    # the merge gate does not hold the PR again for them.
+    approved_paths: Mapped[list[Any] | None] = mapped_column(JSON, nullable=True)
 
     __table_args__ = (
         CheckConstraint(_in_check("status", TASK_STATUSES), name="ck_shipcrew_tasks_status"),

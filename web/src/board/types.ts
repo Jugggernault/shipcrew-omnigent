@@ -186,6 +186,8 @@ export interface Task {
   started_at?: number | null;
   /** Every time the card needed a human. */
   interventions?: TaskIntervention[];
+  /** Paths outside owned_paths a human accepted a write to (not held at merge). */
+  approved_paths?: string[];
   /** Unix epoch seconds (server clock). */
   created_at: number;
   updated_at: number;

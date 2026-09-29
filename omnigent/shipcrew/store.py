@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import time
 import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -129,6 +130,7 @@ class Task:
     started_at: float | None = None
     interventions: list[dict[str, Any]] = field(default_factory=list)
     verdict_nudges: int = 0
+    approved_paths: list[str] = field(default_factory=list)
 
     @property
     def human_assigned(self) -> bool:
@@ -168,6 +170,7 @@ class Task:
             "decisions": list(self.decisions),
             "started_at": self.started_at,
             "interventions": [dict(i) for i in self.interventions],
+            "approved_paths": list(self.approved_paths),
         }
 
 
@@ -259,6 +262,7 @@ def _task(row: SqlTask) -> Task:
         started_at=row.started_at,
         interventions=[dict(i) for i in row.interventions or [] if isinstance(i, dict)],
         verdict_nudges=int(row.verdict_nudges or 0),
+        approved_paths=[str(p) for p in row.approved_paths or []],
     )
 
 
@@ -295,6 +299,7 @@ _TASK_FIELDS = frozenset(
         "decisions",
         "started_at",
         "verdict_nudges",
+        "approved_paths",
     }
 )
 _MISSION_FIELDS = frozenset(
@@ -328,6 +333,7 @@ _PLAN_TASK_FIELDS = ("title", "body", "acceptance", "role", "owned_paths")
 _PLAN_EDITABLE_STATUSES = frozenset({"backlog", "ready"})
 _UNSET: Any = object()
 _MAX_INTERVENTIONS = 50
+_MAX_APPROVED_PATHS = 200
 
 
 @dataclass(frozen=True)
@@ -572,6 +578,26 @@ class ShipcrewStore:
         )
         with self._session("list_tasks_by_status") as session:
             return [_task(r) for r in session.scalars(stmt).all()]
+
+    def task_for_session(self, session_id: str) -> Task | None:
+        """The task whose root session is *session_id*, if any."""
+        stmt = select(SqlTask).where(SqlTask.root_session_id == session_id)
+        with self._session("task_for_session") as session:
+            row = session.scalars(stmt).first()
+            return _task(row) if row is not None else None
+
+    def add_approved_paths(self, task_id: str, paths: Sequence[str]) -> Task | None:
+        """Append *paths* (deduplicated, capped) to the task's ``approved_paths``."""
+        with self._session("add_approved_paths") as session:
+            row = session.get(SqlTask, task_id)
+            if row is None:
+                return None
+            existing = [str(p) for p in row.approved_paths or []]
+            merged = list(dict.fromkeys([*existing, *(str(p) for p in paths if p)]))
+            if merged != existing:
+                row.approved_paths = merged[:_MAX_APPROVED_PATHS]
+                row.updated_at = int(time.time())
+            return _task(row)
 
     def record_intervention(self, task_id: str, entry: dict[str, Any]) -> Task | None:
         """Append one intervention entry without moving the card.

@@ -11,6 +11,75 @@ live end-to-end run: 2026-09-29.
 ![Card held for a human merge approval (APPROVALS.md)](board-approval.png)
 ![Drawer with the Approve merge action](drawer-approval.png)
 
+## Round 7: refuse with a hint, ask only for real decisions (2026-09-30)
+
+Branch `shipcrew-round7` (bundles: shipcrew `v3-round7`). Live run 3 shipped
+in 40 min, 7/7 merged, with 14 approvals. Principle: ASK only when a human
+decision is genuinely needed; a command refused only because the agent chose
+the wrong tool or crossed into another task's files is DENY with an actionable
+hint (the guardrail message reaches the agent, it corrects itself).
+
+- **Complex in-place edits refused with a hint** (`policies.shell_allowlist`,
+  `_safe_sed_script`): for a role with `@sed:sed_in_place` / `@perl:perl_in_place`,
+  a `sed -i` / `perl -pi` that is not ONE simple `s///` (regex addresses
+  `/re/d`, `/re/,+1d`, several commands or `-e`, `a`/`i`/`c`, a newline or
+  `\n` in the replacement, `-i.bak`, `-f`, `w`/`e`, a `$VAR`) is DENY: "Edit
+  files with the Edit tool (it only needs the file to be in your owned
+  paths); sed -i is only for one simple s/// substitution". A simple
+  substitution stays ALLOW (owned paths judge the file); read-only roles
+  still ASK; an unanalyzable command (`$(..)`) still ASKs.
+- **Another task's files refused with a hint** (`policies.owned_paths(other_tasks=)`,
+  `sessions.inject_task_contract(other_tasks=)`, `service._other_active_tasks`):
+  at start the server injects the mission's other ready / running / review /
+  intervention tasks (title + owned paths, a start-time snapshot) into the
+  new `# @task.other_tasks` slot. A write to a file one of them owns (and this
+  task does not) is DENY: "`<path>` belongs to task '<title>' (in progress).
+  Do not edit it; work against the shared contract (e.g. lib/api-client.ts,
+  lib/db.ts) and mock it in your tests; if the contract lacks something, say
+  so in your final reply." A DENY target wins over an ASK one in the same
+  command; a file nobody else owns still asks.
+- **Inherited tests** (`omnigent/shipcrew/inherited_tests.py`,
+  `service._grant_inherited_tests`): at start the task is granted (added to
+  its `owned_paths`) every test file on the base ref (`test/**`, `tests/**`,
+  `e2e/**`, `**/*.test.*`, `**/*.spec.*`) whose app imports (relative, `@/` /
+  `~/`, bare `lib/x`-style; `import`/`export from`/`require`/`import()`) are
+  ALL modules it owns. Conservative: no app import (a URL-only e2e spec), one
+  non-owned module, or a test another active task owns, and it is not
+  granted. Fixes live runs where `test/foundation-api.test.ts` /
+  `e2e/foundation.spec.ts` pinned stub behaviour (2 approvals + 2 merge holds).
+- **Merge-gate memory** (`approvals.py`, `routes_hooks._notify_shipcrew_approval`,
+  `store.add_approved_paths`, migration `sc0007ap`): when a human accepts an
+  owned-paths ASK in a task's root session, the claude-native hook route
+  calls `app.state.shipcrew_approval_hook`; the paths named by the policy
+  reason ("`x` is outside this task's owned paths" / "is a shared contract
+  file") go to `Task.approved_paths`, and the PR loop's
+  `paths_outside_owned` hold skips them. APPROVALS.md rules still hold.
+- **Package-manager output flags** (`_strip_pm_output_flags` in
+  `_normalize_program`): `-s`/`--silent`, `--loglevel <x>`, `--reporter=<x>`,
+  `--color`/`--no-color` and (outside dependency commands) `-w`/
+  `--workspace-root` are dropped before the subcommand and after `run`:
+  `pnpm -s lint`, `npm run --silent typecheck`, `pnpm -s run test` match the
+  plain entries; the stopgap `-s` entries left `dev_tools` / `test_runners`.
+  `pnpm -s add x` = `pnpm add x`; `pnpm -w add x` / `npm -w web install x` are
+  now modelled as `package.json` writes (`_pm_subcommand`).
+- **Bundles** (shipcrew `v3-round7`): COMMON: another task's file is DENY (work
+  against the contract, mock it), inherited tests, Edit tool over any
+  non-trivial `sed -i`, every user-supplied text field of an API route has an
+  explicit max length + 400 above it + a unit test, every Next.js app ships
+  `app/icon.svg`. Planner + scaffolder: Foundation tests are shell / contract
+  smoke tests only, never on a stub route or page another task owns. qa /
+  security: input size limit checked on EVERY text field (10 000 chars ->
+  400, else `major`). Reviewer (v0.2 commit kept): trusts green CI; its
+  `test_runners` has no build / e2e (`pnpm build`, `next build`, `pnpm -s
+  e2e` ASK for it). 256 validator cases per bundle (240 feature contract with
+  one other in-progress task + 16 Foundation).
+
+Known gaps: the approval hook covers the claude-native ASK path (all worker
+roles) only, and records the path the reason names (the first out-of-contract
+target of a multi-file command); the other-tasks snapshot is not refreshed
+while a session runs; inherited tests need a static import of an owned module
+(URL-only e2e specs stay with their owner).
+
 ## Round 6: zero approvals for normal work (2026-09-29)
 
 Branch `shipcrew-round6` (bundles: shipcrew `v3-round6`). Live run 2 (real

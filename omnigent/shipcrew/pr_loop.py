@@ -1135,7 +1135,13 @@ class PrLoop:
                 shown = ", ".join(extra[:5]) + more
                 reasons.append(f"a {ctx.task.role} task changed non-test files: {shown}")
         report = REPORT_FILES.get(ctx.task.role) if ctx.task.role in VERIFY_ROLES else None
-        outside = [p for p in paths_outside_owned(changed, ctx.task.owned_paths) if p != report]
+        # A write a human already accepted during the build is not held again.
+        approved = set(ctx.task.approved_paths)
+        outside = [
+            p
+            for p in paths_outside_owned(changed, ctx.task.owned_paths)
+            if p != report and p not in approved
+        ]
         if outside:
             shown = ", ".join(outside[:5]) + (
                 f" (+{len(outside) - 5} more)" if len(outside) > 5 else ""

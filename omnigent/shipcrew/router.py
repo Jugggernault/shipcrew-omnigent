@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
 import re
 import threading
 from collections.abc import AsyncIterator, Callable
@@ -21,6 +22,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.routes._auth_helpers import require_user
+from omnigent.shipcrew.approvals import APP_STATE_HOOK, approved_write_paths
 from omnigent.shipcrew.commands import MAX_COMMAND_CHARS, classify, unknown_command_message
 from omnigent.shipcrew.events import MissionEventBus
 from omnigent.shipcrew.scheduler import ShipcrewScheduler
@@ -36,6 +38,8 @@ _ROLE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 TaskStatusLiteral = Literal[
     "backlog", "ready", "running", "review", "intervention", "merged", "blocked"
 ]
+
+_logger = logging.getLogger(__name__)
 
 
 class AssigneeBody(BaseModel):
@@ -375,6 +379,31 @@ class _Lazy:
             return self._service
 
 
+def approval_hook(get_service: Callable[[], ShipcrewService]) -> Callable[[str, str | None], None]:
+    """The ``app.state`` callback the hook route calls when a human accepts an ASK.
+
+    Called on the event loop; an owned-paths approval is recorded on the task
+    in the background (``ShipcrewService.record_approved_write``).
+    """
+    pending: set[asyncio.Task[Any]] = set()
+
+    def _log(task: asyncio.Task[Any]) -> None:
+        pending.discard(task)
+        if not task.cancelled() and task.exception() is not None:
+            _logger.warning("shipcrew: recording an approval failed: %s", task.exception())
+
+    def _on_approved(session_id: str, reason: str | None) -> None:
+        if not approved_write_paths(reason):
+            return
+        task = asyncio.get_running_loop().create_task(
+            get_service().record_approved_write(session_id, reason)
+        )
+        pending.add(task)
+        task.add_done_callback(_log)
+
+    return _on_approved
+
+
 def mount_shipcrew(
     app: FastAPI,
     *,
@@ -420,6 +449,7 @@ def mount_shipcrew(
         include_in_schema=False,
     )
     app.state.shipcrew_scheduler = scheduler
+    setattr(app.state, APP_STATE_HOOK, approval_hook(get_service))
 
     if cfg.scheduler_enabled:
         inner = app.router.lifespan_context

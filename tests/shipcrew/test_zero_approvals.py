@@ -172,6 +172,15 @@ class TestProtectionsHold:
             "npm install -g vercel",
             "pnpm add --filter web zod",
             "npm i --prefix /tmp/x lodash",
+            "$CMD --version",
+        ],
+    )
+    def test_builder_asks(self, command: str) -> None:
+        assert _verdict(_builder(FOUNDATION), _bash(command)) == "ASK"
+
+    @pytest.mark.parametrize(
+        "command",
+        [
             "sed -i 's/a/b/w /tmp/x' app/page.tsx",
             "sed -i '1e touch /tmp/x' app/page.tsx",
             "sed -i.bak 's/a/b/' app/page.tsx",
@@ -180,11 +189,11 @@ class TestProtectionsHold:
             "perl -pi -e 's/a/@{[system(1)]}/' app/page.tsx",
             "perl -pi -e 's/a/b/e' app/page.tsx",
             "perl -pie 's/a/b/' app/page.tsx",
-            "$CMD --version",
         ],
     )
-    def test_builder_asks(self, command: str) -> None:
-        assert _verdict(_builder(FOUNDATION), _bash(command)) == "ASK"
+    def test_builder_complex_in_place_edit_is_denied(self, command: str) -> None:
+        # Round 7: the agent picked the wrong tool; the refusal says to use Edit.
+        assert _verdict(_builder(FOUNDATION), _bash(command)) == "DENY"
 
     @pytest.mark.parametrize(
         "command",
@@ -268,7 +277,8 @@ class TestInPlaceEditors:
         [
             ("s/a/b/", True),
             ('s|"test": "vitest"|"test": "vitest run"|g', True),
-            ("1,3s/a/b/; $s/x/y/2", True),
+            ("1,3s/a/b/2", True),
+            ("1,3s/a/b/; $s/x/y/2", False),  # several commands (round 7)
             ("s/a\\/b/c/I", True),
             ("s/a/b/w out", False),
             ("s/a/b/e", False),
@@ -283,7 +293,8 @@ class TestInPlaceEditors:
 
     def test_sed_argv(self) -> None:
         assert _sed_in_place(["-i", "s/a/b/", "f"])
-        assert _sed_in_place(["-i", "-E", "-e", "s/a/b/", "-e", "s/c/d/", "f", "g"])
+        assert _sed_in_place(["-i", "-E", "-e", "s/a/b/", "f", "g"])
+        assert not _sed_in_place(["-i", "-e", "s/a/b/", "-e", "s/c/d/", "f"])  # two commands
         assert not _sed_in_place(["s/a/b/", "f"])  # not in place
         assert not _sed_in_place(["-i", "s/a/b/"])  # no file
         assert not _sed_in_place(["-ni", "s/a/b/p", "f"])

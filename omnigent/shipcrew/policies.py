@@ -12,7 +12,11 @@ Five :class:`FunctionPolicy` factories, registered through
   vetted names, in read-only commands or as a plain argument of a command
   that writes nothing; ``sed -i`` / ``perl -pi`` substitutions and ``curl
   -o`` are modelled as writes, ``sed`` as a stdin filter and ``curl`` to a
-  local host are built-in matchers.
+  local host are built-in matchers. For a role that may edit in place, any
+  other ``sed -i`` / ``perl -pi`` (not one simple ``s///``) is DENY with a
+  hint to use the Edit tool: the agent picked the wrong tool, no human is
+  needed. ``pnpm|npm|yarn`` output-only options (``-s``, ``--silent``,
+  ``--loglevel x``, ...) are dropped before matching.
 * :func:`owned_paths` -- the task's ``owned_paths`` contract. File writes
   (``Write`` / ``Edit`` / ``sys_os_write`` / shell redirections / ``cp``,
   ``mv``, ``rm``, ``git mv`` ... / formatter ``--write`` / dependency changes)
@@ -21,7 +25,9 @@ Five :class:`FunctionPolicy` factories, registered through
   (owning a manifest owns the lockfiles next to it).
   Reads are never gated. The shipcrew server injects ``root`` and
   ``owned_paths`` into the bundle when it starts a task; without them the
-  policy abstains.
+  policy abstains. A write to a file another active task of the mission
+  owns (``other_tasks``, injected at start) is DENY with a hint to work
+  against the shared contract.
 * :func:`test_writes_only` -- verify roles (qa, security) write test files
   and their report only; any other write is DENY, and so is removing,
   renaming or truncating a test that is already on the base branch.
@@ -29,8 +35,9 @@ Five :class:`FunctionPolicy` factories, registered through
 * :func:`push_guard` -- the orchestrator may push only task branches named
   ``shipcrew/<8 hex>-<slug>``, every push segment explicitly.
 
-These policies only return ALLOW or ASK (the push guard and the test-writes
-guard also DENY); the
+These policies return ALLOW or ASK, and DENY where no human decision is
+needed (the push guard, the test-writes guard, a complex in-place edit,
+another task's file); the
 catastrophic DENY set stays in omnigent's ``blast_radius`` and the shipcrew CEL
 fragments. Evaluation is most-restrictive-wins across policies.
 """
@@ -277,6 +284,57 @@ def _unwrap(argv: list[str]) -> list[str]:
     return argv
 
 
+# Output-only package-manager options: ``pnpm -s lint`` is ``pnpm lint``.
+_PM_OUTPUT_FLAGS = frozenset({"-s", "--silent", "--color", "--no-color", "-w", "--workspace-root"})
+_PM_OUTPUT_VALUE_FLAGS = frozenset({"--loglevel"})
+_PM_OUTPUT_PREFIXES = ("--loglevel=", "--reporter=")
+# Subcommands that change dependencies: ``-w`` there picks the root manifest,
+# so it is kept (the entries judge it as they always did).
+_PM_DEP_SUBCOMMANDS = frozenset(
+    {"add", "install", "i", "remove", "rm", "uninstall", "un", "update", "up", "upgrade",
+     "ci", "link", "unlink", "dedupe", "prune", "import"}
+)  # fmt: skip
+
+
+def _strip_pm_output_flags(argv: list[str]) -> list[str]:
+    """``pnpm|npm|yarn`` *argv* without output-only options before the script name.
+
+    Stripped: ``-s``/``--silent``, ``--color``/``--no-color``, ``--loglevel
+    <x>`` / ``--loglevel=<x>``, ``--reporter=<x>`` and (except for a
+    dependency subcommand) ``-w``/``--workspace-root``, in front of the
+    subcommand and, after ``run`` / ``run-script``, in front of the script
+    name. Later words (the script's own arguments) are kept.
+    """
+    head, rest = argv[0], argv[1:]
+
+    def _skip(words: list[str], *, keep_w: bool) -> list[str]:
+        out: list[str] = []
+        i = 0
+        while i < len(words):
+            word = words[i]
+            if word in _PM_OUTPUT_VALUE_FLAGS and i + 1 < len(words):
+                i += 2
+                continue
+            if word.startswith(_PM_OUTPUT_PREFIXES) or (
+                word in _PM_OUTPUT_FLAGS and not (keep_w and word in ("-w", "--workspace-root"))
+            ):
+                i += 1
+                continue
+            if not word.startswith("-"):
+                return [*out, *words[i:]]
+            out.append(word)
+            i += 1
+        return out
+
+    rest = _skip(rest, keep_w=bool(_PM_DEP_SUBCOMMANDS.intersection(rest)))
+    lead = 0
+    while lead < len(rest) and rest[lead].startswith("-"):
+        lead += 1
+    if lead < len(rest) and rest[lead] in ("run", "run-script"):
+        rest = [*rest[: lead + 1], *_skip(rest[lead + 1 :], keep_w=False)]
+    return [head, *rest]
+
+
 def _normalize_program(argv: list[str]) -> list[str]:
     argv = _unwrap(argv)
     if not argv:
@@ -286,6 +344,8 @@ def _normalize_program(argv: list[str]) -> list[str]:
         if head.startswith(prefix) and "/" not in head[len(prefix) :]:
             argv = [head[len(prefix) :], *argv[1:]]
             break
+    if argv[0] in ("pnpm", "npm", "yarn"):
+        argv = _strip_pm_output_flags(argv)
     if len(argv) >= 2 and argv[0] in ("pnpm", "npm", "yarn") and argv[1] == "exec":
         rest = argv[2:]
         if rest[:1] == ["--"]:
@@ -685,38 +745,48 @@ def _delimited(script: str, i: int, delim: str) -> int | None:
 
 
 def _safe_sed_script(script: str) -> bool:
-    """Only ``s`` commands (``[N[,M]]s<d>re<d>repl<d>[gIiMm0-9]``), ``;``/newline separated.
+    """One simple substitution: ``[N[,M]]s<d>re<d>repl<d>[gIiMm0-9]``.
 
-    No ``w``/``e``/``r`` commands or flags: those write files or run commands.
+    Anything else is refused (and, for a role that may edit files, DENY with a
+    hint to use the Edit tool, see :func:`shell_allowlist`): several commands
+    (``;``, newlines, several ``-e``), regex addresses (``/re/d``,
+    ``/re/,+1d``), ``w``/``e``/``r`` commands or flags (they write files or
+    run commands), a newline in the script, and a replacement escape other
+    than a back-reference (``\\1``), ``\\&``, the delimiter or a backslash
+    (``\\n`` inserts a line).
     """
-    i, count = 0, 0
-    while True:
-        while i < len(script) and script[i] in " \t\n;":
-            i += 1
-        if i >= len(script):
-            return count > 0
-        address = _SED_ADDRESS.match(script, i)
-        if address:
-            i = address.end()
-        if not script.startswith("s", i) or i + 1 >= len(script):
-            return False
-        delim = script[i + 1]
-        if delim in "\\\n" or delim.isspace():
-            return False
-        end = _delimited(script, i + 2, delim)
-        end = _delimited(script, end, delim) if end is not None else None
-        if end is None:
-            return False
-        i = end
-        while i < len(script) and script[i] in _SED_FLAGS:
-            i += 1
-        count += 1
-        if i < len(script) and script[i] not in " \t\n;":
-            return False
+    text = script.strip(" \t")
+    if "\n" in text:
+        return False
+    i = 0
+    address = _SED_ADDRESS.match(text, i)
+    if address:
+        i = address.end()
+    if not text.startswith("s", i) or i + 1 >= len(text):
+        return False
+    delim = text[i + 1]
+    if delim in "\\;" or delim.isspace() or delim.isalnum():
+        return False
+    mid = _delimited(text, i + 2, delim)
+    end = _delimited(text, mid, delim) if mid is not None else None
+    if mid is None or end is None:
+        return False
+    replacement = text[mid : end - 1]
+    j = 0
+    while j < len(replacement):
+        if replacement[j] == "\\":
+            nxt = replacement[j + 1 : j + 2]
+            if not (nxt.isdigit() or nxt in ("&", "\\", delim)):
+                return False
+            j += 2
+            continue
+        j += 1
+    flags = text[end:].rstrip("; \t")
+    return set(flags) <= _SED_FLAGS
 
 
 def _sed_in_place(args: list[str]) -> bool:
-    """``sed -i [-E] [-e SCRIPT]... SCRIPT FILE...`` with substitution scripts only.
+    """``sed -i [-E] [-e SCRIPT] SCRIPT FILE...`` with one simple substitution.
 
     Exact flags only (``-i.bak``, ``-ni``, ``-f file``, ``--expression=`` ask),
     at least one file. :func:`shell_write_targets` reports the files as writes.
@@ -747,7 +817,8 @@ def _sed_in_place(args: list[str]) -> bool:
         i += 1
     if not scripts and files:
         scripts.append(files.pop(0))
-    return in_place and bool(scripts) and bool(files) and all(map(_safe_sed_script, scripts))
+    # One script only: several ``-e`` are several commands.
+    return in_place and len(scripts) == 1 and bool(files) and _safe_sed_script(scripts[0])
 
 
 # sed commands that only transform the stream: no r/R (read a file), w/W
@@ -970,6 +1041,30 @@ def _perl_in_place(args: list[str]) -> bool:
     """``perl -pi -e 's/a/b/g' FILE...``: one code-free substitution, in place."""
     parts = _perl_in_place_parts(args)
     return parts is not None and bool(parts[1]) and _safe_perl_substitution(parts[0])
+
+
+IN_PLACE_EDIT_HINT = (
+    "Edit files with the Edit tool (it only needs the file to be in your owned paths); "
+    "sed -i is only for one simple s/// substitution."
+)
+
+
+def _in_place_editor(argv: list[str]) -> bool:
+    """Whether *argv* is a ``sed`` / ``perl`` run that rewrites files in place.
+
+    ``sed -i`` / ``-i.bak`` / ``-ni`` / ``--in-place[=SUF]``, ``perl -pi`` /
+    ``-i`` / ``-pi.bak`` (an ``-i`` in an option cluster before ``--``).
+    """
+    if not argv or argv[0] not in ("sed", "perl"):
+        return False
+    for arg in argv[1:]:
+        if arg == "--":
+            return False
+        if argv[0] == "sed" and arg.startswith("--in-place"):
+            return True
+        if re.match(r"^-[A-Za-z0-9]*i", arg) and not arg.startswith("--"):
+            return True
+    return False
 
 
 _BUILTIN_MATCHERS: dict[str, Callable[[list[str]], bool]] = {
@@ -1208,11 +1303,20 @@ def shell_allowlist(
     expandable = envs | frozenset(DEFAULT_EXPAND_ALLOW if expand_allow is None else expand_allow)
     suffix = f" {reason}" if reason else ""
 
+    # A role that may edit files in place: any other ``sed -i`` / ``perl -pi``
+    # is refused with a hint (the agent picked the wrong tool; no human needed).
+    edits_in_place = any(p.builtin in ("sed:sed_in_place", "perl:perl_in_place") for p in patterns)
+
     def _ask(what: str) -> _Json:
         return {
             "result": "ASK",
             "reason": f"{what} is not on the {role} shell allowlist.{suffix}",
         }
+
+    def _refuse(seg: Segment) -> _Json:
+        if edits_in_place and _in_place_editor(seg.argv):
+            return {"result": "DENY", "reason": f"`{seg.text}` refused. {IN_PLACE_EDIT_HINT}"}
+        return _ask(f"`{seg.text}`")
 
     def _evaluate(event: _Json, config: _Json | None = None) -> _Json:  # noqa: ARG001
         command = _shell_command(event)
@@ -1227,6 +1331,8 @@ def shell_allowlist(
         read_only_after = False  # a bare assignment of an unvetted name happened
         for seg in segments:
             unknown = sorted({n for n in seg.expanded if n not in expandable | assigned})
+            if unknown and edits_in_place and _in_place_editor(seg.argv):
+                return _refuse(seg)
             if unknown:
                 return _ask(f"`{seg.text}` (expands {', '.join('$' + n for n in unknown)})")
             if not seg.argv and seg.env and not seg.writes:
@@ -1251,7 +1357,7 @@ def shell_allowlist(
             argv_expanded = any(EXPANSION_MARK in a for a in seg.argv)
             if not argv_expanded:
                 if not any(p.matches(seg.argv) for p in patterns):
-                    return _ask(f"`{seg.text}`")
+                    return _refuse(seg)
                 if read_only_after and not any(p.matches(seg.argv) for p in safe):
                     return _ask(
                         f"`{seg.text}` (runs after a shell variable; only read-only commands may)"
@@ -1265,6 +1371,8 @@ def shell_allowlist(
             # comes from the session's environment, or the ``:-`` default), as
             # a plain argument, and never in a file / git writer.
             untrusted = sorted({n for n in seg.expanded if n in assigned})
+            if edits_in_place and _in_place_editor(seg.argv):
+                return _refuse(seg)  # a variable in an in-place edit: use the Edit tool
             if read_only_after or untrusted or _expansion_smuggles(seg.argv):
                 return _ask(f"`{seg.text}` (expands a variable; only read-only commands may)")
             if not any(p.matches([_substitute_expansions(a) for a in seg.argv]) for p in patterns):
@@ -1424,6 +1532,27 @@ _MANIFESTS = {
 }
 
 
+# Global package-manager options that take a value (``npm -w web install x``).
+_PM_GLOBAL_VALUE_FLAGS = frozenset(
+    {"-w", "--workspace", "-F", "--filter", "-C", "--dir", "--prefix", "--cwd"}
+)
+
+
+def _pm_subcommand(args: list[str]) -> str | None:
+    """The subcommand of a package-manager *args*, past its leading options.
+
+    ``pnpm -w add x`` -> ``add``; ``npm -w web install x`` -> ``install``
+    (``-w`` takes a value for npm; either reading finds the dependency command).
+    """
+    words = [a for a in args if not a.startswith("-")]
+    if not words:
+        return None
+    first = args.index(words[0])
+    if first > 0 and args[first - 1] in _PM_GLOBAL_VALUE_FLAGS and len(words) > 1:
+        return words[0] if words[0] in _PM_DEP_SUBCOMMANDS else words[1]
+    return words[0]
+
+
 def shell_write_targets(argv: list[str]) -> list[str]:
     """Paths a simple command writes, as written (relative or absolute).
 
@@ -1519,7 +1648,7 @@ def shell_write_targets(argv: list[str]) -> list[str]:
         return []
     if prog == "black":
         return _positionals(args) or ["."]
-    if prog in _DEP_SUBCOMMANDS and args and args[0] in _DEP_SUBCOMMANDS[prog]:
+    if prog in _DEP_SUBCOMMANDS and _pm_subcommand(args) in _DEP_SUBCOMMANDS[prog]:
         if _FROZEN_FLAGS.intersection(args):
             return []
         return list(_MANIFESTS[prog])
@@ -1575,6 +1704,14 @@ def _with_lockfiles(owned_list: Sequence[str]) -> list[str]:
     return out
 
 
+# Marks a :func:`owned_paths` finding as "another task's file" (DENY).
+_OTHER_TASK = "\x00other-task:"
+OTHER_TASK_HINT = (
+    "Do not edit it; work against the shared contract (e.g. lib/api-client.ts, lib/db.ts) "
+    "and mock it in your tests; if the contract lacks something, say so in your final reply."
+)
+
+
 def owned_paths(
     *,
     owned_paths: Sequence[str] | None = None,
@@ -1583,8 +1720,13 @@ def owned_paths(
     free_paths: Sequence[str] | None = None,
     extra_free_paths: Sequence[str] | None = None,
     reason: str | None = None,
+    other_tasks: Sequence[Any] | None = None,
 ) -> _Evaluator:
     """Factory: ASK when a write leaves the task's owned paths.
+
+    A write to a file another in-progress task of the mission owns (see
+    *other_tasks*) is DENY with a hint instead: the agent crossed into
+    another task's files and corrects itself, no human needed.
 
     :param owned_paths: The task's owned globs, relative to *root*
         (``["app/cart/**", "e2e/cart.spec.ts"]``). ``None`` or empty: no task
@@ -1598,6 +1740,9 @@ def owned_paths(
     :param extra_free_paths: Added to *free_paths*, e.g. a role's report file
         (``.shipcrew/qa.json``).
     :param reason: Optional text appended to the approval-card reason.
+    :param other_tasks: The mission's other active tasks at session start,
+        ``[{"title": ..., "owned_paths": [...]}]`` (injected by the server,
+        see ``omnigent.shipcrew.sessions.inject_task_contract``).
     :returns: An evaluator ``fn(event, config)``; reads always ALLOW.
     """
     owned_list = [p for p in (owned_paths or []) if isinstance(p, str) and p.strip()]
@@ -1625,6 +1770,17 @@ def owned_paths(
     shared_names = [
         p.rsplit("/", 1)[-1] for p in shared.patterns if not _WILDCARD.search(p.rsplit("/", 1)[-1])
     ]
+    others: list[tuple[str, _GlobSet]] = []
+    for other in other_tasks or ():
+        if not isinstance(other, dict):
+            continue
+        globs = [g for g in other.get("owned_paths") or [] if isinstance(g, str) and g.strip()]
+        if globs:
+            others.append((str(other.get("title") or "another task"), _GlobSet(globs)))
+
+    def _other_owner(rel: str) -> str | None:
+        """Title of the other active task that owns *rel*, if any."""
+        return next((title for title, globs in others if globs.match(rel)), None)
 
     def _check(target: str, cwd: str | None) -> str | None:
         """Why writing *target* needs approval, or ``None`` when it is fine."""
@@ -1665,34 +1821,42 @@ def owned_paths(
             return f"`{rel}` is outside this task's owned paths ({owned_text})"
         if free_rel.match(rel):
             return None
-        if shared.match(rel) and rel not in exact_owned:
-            return f"`{rel}` is a shared contract file (own it by name to change it)"
-        if rel and owned.match(rel):
+        is_shared = shared.match(rel) and rel not in exact_owned
+        if rel and not is_shared and owned.match(rel):
             return None
+        owner = _other_owner(rel) if rel else None
+        if owner is not None:
+            return _OTHER_TASK + f"`{rel}` belongs to task '{owner}' (in progress)"
+        if is_shared:
+            return f"`{rel}` is a shared contract file (own it by name to change it)"
         return f"`{rel or '.'}` is outside this task's owned paths ({owned_text})"
 
     def _ask(why: str) -> _Json:
+        if why.startswith(_OTHER_TASK):
+            return {
+                "result": "DENY",
+                "reason": f"{why.removeprefix(_OTHER_TASK)}. {OTHER_TASK_HINT}",
+            }
         return {"result": "ASK", "reason": f"Write needs approval: {why}.{suffix}"}
+
+    def _verdict(found: list[str | None]) -> _Json:
+        """Another task's file first (DENY), else the first approval (ASK)."""
+        problems = [w for w in found if w]
+        if not problems:
+            return _ALLOW
+        return _ask(next((w for w in problems if w.startswith(_OTHER_TASK)), problems[0]))
 
     def _evaluate(event: _Json, config: _Json | None = None) -> _Json:  # noqa: ARG001
         paths = _write_tool_paths(event)
         if paths is not None:
-            for path in paths:
-                why = _check(path, root_abs)
-                if why:
-                    return _ask(why)
-            return _ALLOW
+            return _verdict([_check(path, root_abs) for path in paths])
         command = _shell_command(event)
         if command is None:
             return _ALLOW
         targets = _shell_targets(command, root_abs)
         if targets is None:
             return _ALLOW  # unanalyzable: shell_allowlist asks for it
-        for target, seg_cwd in targets:
-            why = _check(target, seg_cwd)
-            if why:
-                return _ask(why)
-        return _ALLOW
+        return _verdict([_check(target, seg_cwd) for target, seg_cwd in targets])
 
     return _evaluate
 
