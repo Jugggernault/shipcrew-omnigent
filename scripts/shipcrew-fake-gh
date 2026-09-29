@@ -1,0 +1,4 @@
+#!/bin/sh
+# Fake `gh` for shipcrew tests and the local e2e: SHIPCREW_GH=<this file>.
+# State: SHIPCREW_FAKE_GH_STATE (see scripts/shipcrew_fake_gh.py).
+exec "${SHIPCREW_FAKE_GH_PYTHON:-python3}" "$(dirname "$0")/shipcrew_fake_gh.py" "$@"

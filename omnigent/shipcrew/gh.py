@@ -146,7 +146,7 @@ def pr_for_branch(cwd: Path, branch: str) -> int | None:
         cwd=cwd,
         timeout=DEFAULT_TIMEOUT_S,
     )
-    return int(out) if out else None
+    return int(out) if out and out != "null" else None
 
 
 def pr_checks(cwd: Path, pr: int) -> tuple[bool, str]:
