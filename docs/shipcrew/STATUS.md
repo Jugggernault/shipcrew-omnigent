@@ -100,6 +100,61 @@ project (`src/sum.js`, node:test tests, `"test": "node --test test/"`) whose
 - Round 1 behaviour (board, drawer tree, 4 scheduler gates, session state ->
   card, folder pre-trust, ACL per owner) is unchanged.
 
+## Round 2 review fixes (2026-09-29)
+
+An independent review of the round-2 diff led to these fixes. Each one has a
+regression test.
+
+- **Allowlist bypasses closed** (`policies.py`):
+  - A refused option also matches its getopt/git abbreviations. `git fetch
+    --upload-p=<cmd>` ran a local command on a local remote, and `git reset
+    --har` / `sort --out=` got past `!--hard` / `!--output*`.
+  - A refused one-letter option also matches short-option clusters and stuck
+    values (`git rebase -xcmd`, `sort -uo f`).
+  - `$VAR` / `${..}` / `$'..'` outside single quotes, brace expansion and a
+    glob in an option name make a command unanalyzable: the allowlist asks
+    and the push guard denies (`CI=--output=f; git diff $CI` used to pass).
+  - `git checkout <tree-ish> <path>` counts as a write.
+- **Merge gates** (`pr_loop.py`, `gh.py`):
+  - `gh pr merge --match-head-commit <reviewed sha>`.
+  - Only a verified clean merge of main (the parents and the `git merge-tree`
+    result match) keeps the review and the human approval. A foreign push to
+    the PR branch, or the integrator's conflict resolution, is reviewed and
+    approved again.
+  - The policy diff uses `-z --no-renames` (quoted names and renames out of a
+    gated path used to slip through).
+  - The default approval rules always apply; `APPROVALS.md` only adds rules.
+  - Changed files outside `owned_paths` need approval (the server-side
+    backstop for anything the guardrail cannot see, such as code run by
+    tests).
+  - `APPROVE` with a `blocker` finding counts as `CHANGES`.
+  - With workflow files present, "no checks reported" waits up to 180 s for
+    CI to report before counting as green.
+  - A PR head that is not a SHA is refused before it reaches git.
+- **Untrusted CI output**: check names and failed logs reach the developer
+  inside an `<untrusted-ci-output>` block. Its fence is longer than any
+  backtick run in the text, and the block says to treat it as data.
+- **Approve** releases only a loop hold (409 during CI or review, and for a
+  guardrail ask), and clears `needs_human_approval`.
+- **Leaks**: a blocked card stops its in-flight reviewer and integrator. A PR
+  merged outside the loop gets the loop's cleanup (sessions, worktree,
+  branch). Cleanup drops the stale `origin/<branch>` ref.
+- **plan.json**:
+  - `role` must be a task role (not `shipcrew`, `planner` or `reviewer`).
+  - `owned_paths` must be repo-relative, with no `..`, backslash or control
+    character.
+  - Sizes are capped (200 tasks).
+  - A re-import leaves tasks past Ready unchanged.
+- **Board**:
+  - The approval section only shows while the card is held.
+  - The approval badge hides on merged cards.
+  - A leftover `changes` verdict no longer labels a later guardrail ask as
+    "review rounds exhausted".
+  - Other loop holds get a "Held by the PR loop" label.
+- **Accepted risks** are documented in the agents README: test runners and
+  `npm run` execute arbitrary code, `npx` downloads fixed package names, and
+  `kill`/`pkill` and `curl localhost` are allowed for qa and security.
+
 ## What is left / known issues
 
 - **A reviewer or integrator ask does not move the card.** While a loop child
@@ -124,8 +179,10 @@ project (`src/sum.js`, node:test tests, `"test": "node --test test/"`) whose
   because both carry `blocked_reason`.
 - **Loop holds use a capacity slot** (intervention is an active status).
 - **A card dragged to Merged by hand** skips the loop cleanup (worktree stays,
-  PR stays open). The local repo keeps stale `origin/shipcrew/*` refs (fetch
-  without prune).
+  PR stays open). A PR merged on GitHub and found by the sync is now cleaned
+  up. The hand drag is not, because removing the worktree would drop commits
+  that were never pushed.
+- **Review snapshots** (`.git/shipcrew/reviews/*.diff`) are never pruned.
 - **Orchestrator full mode** sub-agents get no owned-paths contract (the policy
   abstains there).
 - **Local filesystem assumption**: `plan.json`, worktrees and git/gh calls run
@@ -182,7 +239,8 @@ server side is `omnigent/shipcrew/router.py` and the client side is
   tests/server/test_shipcrew_mount.py` plus the upstream tests next to the
   touched files (`tests/policies/test_registry.py`,
   `tests/server/routes/test_policy_registry.py`,
-  `tests/server/routes/test_sessions_yolo_launch_args.py`): 376 passed;
+  `tests/server/routes/test_sessions_yolo_launch_args.py`): 416 passed after
+  the review fixes (376 before);
   `pre-commit run --files <changed>`.
 - **Web:** `pnpm lint`, `pnpm type-check`, `pnpm build`, and the full
   `vitest run` with `NODE_OPTIONS=--no-experimental-webstorage LANG=C.UTF-8`:
@@ -191,7 +249,7 @@ server side is `omnigent/shipcrew/router.py` and the client side is
   out under load and pass when rerun alone.
 - **Bundles:** `python3 scripts/build_agents.py --check`, and `uv run python
   <shipcrew>/scripts/validate_agents.py` run from this checkout: 10 bundles
-  valid, 110 guardrail cases each.
+  valid, 117 guardrail cases each (7 bypass cases added by the review).
 
 ## Upstream footprint (rebase surface)
 
