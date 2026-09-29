@@ -109,3 +109,11 @@ def test_registered_for_uploaded_bundles() -> None:
 def test_is_test_path_custom_globs() -> None:
     assert is_test_path("spec/a_spec.rb", ["spec/**"])
     assert not is_test_path("", ["**"])
+
+
+def test_owned_paths_extra_free_paths_frees_the_report_file() -> None:
+    plain = owned_paths(owned_paths=["e2e/**"], root=ROOT)
+    qa = owned_paths(owned_paths=["e2e/**"], root=ROOT, extra_free_paths=[".shipcrew/qa.json"])
+    report = _write(f"{ROOT}/.shipcrew/qa.json")
+    assert (plain(report, {})["result"], qa(report, {})["result"]) == ("ASK", "ALLOW")
+    assert qa(_write(f"{ROOT}/node_modules/x"), {})["result"] == "ALLOW"  # defaults kept

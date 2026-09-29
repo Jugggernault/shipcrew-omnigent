@@ -807,6 +807,7 @@ def owned_paths(
     root: str | None = None,
     shared_paths: Sequence[str] | None = None,
     free_paths: Sequence[str] | None = None,
+    extra_free_paths: Sequence[str] | None = None,
     reason: str | None = None,
 ) -> _Evaluator:
     """Factory: ASK when a write leaves the task's owned paths.
@@ -820,6 +821,8 @@ def owned_paths(
         (default :data:`DEFAULT_SHARED_PATHS`).
     :param free_paths: Always-writable build output / caches / scratch
         (default :data:`DEFAULT_FREE_PATHS`); absolute entries start with ``/``.
+    :param extra_free_paths: Added to *free_paths*, e.g. a role's report file
+        (``.shipcrew/qa.json``).
     :param reason: Optional text appended to the approval-card reason.
     :returns: An evaluator ``fn(event, config)``; reads always ALLOW.
     """
@@ -834,7 +837,10 @@ def owned_paths(
     owned = _GlobSet(owned_list)
     exact_owned = {_norm_glob(p) for p in owned_list if not _WILDCARD.search(_norm_glob(p))}
     shared = _GlobSet(DEFAULT_SHARED_PATHS if shared_paths is None else shared_paths)
-    free_all = list(DEFAULT_FREE_PATHS if free_paths is None else free_paths)
+    free_all = [
+        *(DEFAULT_FREE_PATHS if free_paths is None else free_paths),
+        *(extra_free_paths or ()),
+    ]
     free_rel = _GlobSet(p for p in free_all if not p.startswith("/"))
     free_abs = _GlobSet(p for p in free_all if p.startswith("/"))
     root_abs = posixpath.normpath(root) if root else None
@@ -1208,6 +1214,7 @@ POLICY_REGISTRY: list[dict[str, object]] = [
                 "root": {"type": "string", "description": "Absolute task worktree path."},
                 "shared_paths": _STRING_LIST,
                 "free_paths": _STRING_LIST,
+                "extra_free_paths": _STRING_LIST,
                 "reason": {"type": "string"},
             },
         },

@@ -62,7 +62,7 @@ from omnigent.shipcrew.review_policy import (
 from omnigent.shipcrew.sessions import ChildSessionRequest, SessionServiceError
 from omnigent.shipcrew.store import Mission, Task
 from omnigent.shipcrew.tools import session_env
-from omnigent.shipcrew.verify import VERIFY_ROLES, VerifyLoop, verify_writable
+from omnigent.shipcrew.verify import REPORT_FILES, VERIFY_ROLES, VerifyLoop, verify_writable
 
 if TYPE_CHECKING:
     from omnigent.shipcrew.service import ShipcrewService
@@ -977,7 +977,8 @@ class PrLoop:
                 more = f" (+{len(extra) - 5} more)" if len(extra) > 5 else ""
                 shown = ", ".join(extra[:5]) + more
                 reasons.append(f"a {ctx.task.role} task changed non-test files: {shown}")
-        outside = paths_outside_owned(changed, ctx.task.owned_paths)
+        report = REPORT_FILES.get(ctx.task.role) if ctx.task.role in VERIFY_ROLES else None
+        outside = [p for p in paths_outside_owned(changed, ctx.task.owned_paths) if p != report]
         if outside:
             shown = ", ".join(outside[:5]) + (
                 f" (+{len(outside) - 5} more)" if len(outside) > 5 else ""

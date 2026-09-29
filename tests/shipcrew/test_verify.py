@@ -365,3 +365,17 @@ class TestVerifyLoop:
         assert any("qa task changed non-test files: src/app.js" in r for r in reasons)
         assert sessions.roles() == ["reviewer"]  # not tests-only: reviewed
         await asyncio.sleep(0)
+
+    async def test_its_report_file_in_the_pr_needs_no_approval(
+        self,
+        service: ShipcrewService,
+        sessions: RoleSessions,
+        repo: Path,
+        scheduler: ShipcrewScheduler,
+    ) -> None:
+        sessions.agents["qa"] = [
+            _says("PASS", {"tests/a.test.js": "ok\n", ".shipcrew/qa.json": '{"pass": true}\n'}),
+        ]
+        task = await _verify_task(service, repo)
+        done = await run_until(scheduler, service, task.id, status_is("merged"))
+        assert (done.needs_human_approval, done.approval_reasons) == (False, [])
