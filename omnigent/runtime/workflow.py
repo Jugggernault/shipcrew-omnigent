@@ -1394,6 +1394,11 @@ def _build_claude_sdk_spawn_env(
     permission_mode = spec.executor.config.get("permission_mode")
     if permission_mode is not None:
         env["HARNESS_CLAUDE_SDK_PERMISSION_MODE"] = str(permission_mode)
+    # shipcrew fork: per-role MCP scoping (see omnigent/shipcrew/launch_args.py).
+    from omnigent.shipcrew.launch_args import strict_mcp_enabled
+
+    if strict_mcp_enabled(spec.executor.config):
+        env["HARNESS_CLAUDE_SDK_STRICT_MCP_CONFIG"] = "1"
     return env
 
 

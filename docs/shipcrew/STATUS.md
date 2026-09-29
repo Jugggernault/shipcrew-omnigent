@@ -11,6 +11,58 @@ live end-to-end run: 2026-09-29.
 ![Card held for a human merge approval (APPROVALS.md)](board-approval.png)
 ![Drawer with the Approve merge action](drawer-approval.png)
 
+## Round 3: run everything, MCP scoping (2026-09-29)
+
+- **Run all tasks** (`omnigent/shipcrew/router.py`, `service.py`, `store.py`):
+  `POST /missions/{id}/start-all` -> `{mission, started: [task ids]}` moves
+  every backlog task that is not human-assigned to Ready in one transaction and
+  emits `task.updated` for each. It only queues: the four scheduler gates
+  (deps, capacity, owned paths, budget) still decide what starts. Idempotent,
+  same auth and per-owner ACL (404 for someone else's mission).
+- **Auto run** (`sc0003ar`, `shipcrew_missions.auto_run`, default false):
+  `PATCH /missions/{id} {auto_run}` (emits `mission.updated`); the Mission
+  payload carries `auto_run`. With it on, a plan import moves the imported
+  tasks (only those) to Ready right after `plan.status=imported`, so the same
+  scheduler tick starts them.
+- **Mission commands** (`omnigent/shipcrew/commands.py`):
+  `POST /missions/{id}/command {text}` maps a short order to one action with
+  fixed rules, no LLM: `run all / start / lance tout / démarre` -> start-all,
+  `plan / planifie` -> planner on the repo PRD, `sync / synchronise` -> GitHub
+  sync, `stop all / arrête tout` -> stop every running task. Accents and case
+  are ignored. The text must be one verb plus filler words, so a negation
+  ("don't run all", "ne lance pas") or two verbs is refused: 400 with the
+  supported list. The response has `intent`, `message` (the board toast),
+  `mission` and `started` / `stopped` / `sync`. A real LLM orchestrator chat
+  (free text to a mission-scoped `shipcrew` session) is a later step; the
+  orchestrator bundle documents the command table.
+- **Board** (English, like the rest of the board): mission header gets an
+  "Ask the crew…" box (toast with the server's message, or its error), a
+  primary "Run all tasks" button with the runnable backlog count (disabled at
+  0) and a "Run N tasks?" confirm, and the Plan from PRD dialog a "Run
+  automatically after planning" checkbox bound to `auto_run`
+  (`web/src/board/MissionRun.tsx`, `MissionPlan.tsx`).
+- **MCP scoped per role** (`omnigent/shipcrew/launch_args.py`): sessions used
+  to inherit every MCP server of the host user (claude.ai connectors such as
+  Gmail, Canva, Notion, Vercel, Figma, plus `~/.claude.json` servers and plugin
+  servers). Bundles now declare `executor.config.strict_mcp_config: true` and
+  optionally `mcp_config` (JSON `{"mcpServers": ...}`):
+  - claude-native: `--strict-mcp-config --mcp-config <json>` launch args,
+    next to the `allowed_tools` mapping in
+    `_derive_terminal_launch_args_from_spec`. The bridge still appends its own
+    `--mcp-config` for omnigent's relay; Claude merges repeated
+    `--mcp-config` flags and strict mode keeps all of them.
+  - claude-sdk: `HARNESS_CLAUDE_SDK_STRICT_MCP_CONFIG=1` (workflow spawn env)
+    -> the SDK executor adds `--strict-mcp-config` to `extra_args`; the
+    in-process `omnigent` server is passed through `--mcp-config` and stays.
+  - Roles: developer / scaffolder / designer = shadcn, qa = chrome-devtools
+    (headless, isolated, `${CHROMIUM_PATH:-/usr/bin/chromium}`, expanded by
+    Claude), everyone else none (devops uses the vercel CLI).
+  - Verified live (port 16780, own state dir, fake gh): the developer's
+    `claude` argv had `--strict-mcp-config`, the shadcn config and the relay
+    config; the agent saw exactly two MCP servers (`omnigent`, `shadcn`, deferred
+    tools included) and a `sys_os_read` call through the relay worked. A plain
+    `claude -p` on this machine lists 28 servers (claude.ai, plugins, user).
+
 ## Round 2 end-to-end (verified live, 2026-09-29)
 
 Real `omnigent server` + `host` (`scripts/shipcrew_stack.sh`, port 16772, own
@@ -96,7 +148,7 @@ project (`src/sum.js`, node:test tests, `"test": "node --test test/"`) whose
   Review findings, Request changes), `mission.updated` over SSE, six columns
   without horizontal scroll at 1600 px.
 - **Schema**: Alembic lineage `sc0001 -> sc0002pr (PR loop) -> sc0002p (plan +
-  issue sync)`, single head.
+  issue sync) -> sc0003ar (mission auto_run)`, single head.
 - Round 1 behaviour (board, drawer tree, 4 scheduler gates, session state ->
   card, folder pre-trust, ACL per owner) is unchanged.
 
@@ -156,6 +208,15 @@ regression test.
   `kill`/`pkill` and `curl localhost` are allowed for qa and security.
 
 ## What is left / known issues
+
+- **Command box is rule-based.** Free text to an LLM orchestrator session is
+  not wired; `plan` from the box always uses the repo's `.shipcrew/prd.md`.
+- **`stop all` stops Running / Intervention cards only**; Review cards and
+  loop children (reviewer, integrator, planner) keep going.
+- **MCP scoping trade-offs**: the designer lost the optional open-pencil brand
+  board and security lost chrome-devtools (it uses curl and Playwright). Both
+  are one line in `MCP_SERVERS` / the config marker to change back. The MCP
+  servers run through `npx -y <pkg>@latest` (network on first use).
 
 - **A reviewer or integrator ask does not move the card.** While a loop child
   waits on an approval card the task stays in Review (contract: Intervention);
@@ -231,6 +292,24 @@ It is hidden from OpenAPI so the upstream `openapi.json` does not drift. The
 server side is `omnigent/shipcrew/router.py` and the client side is
 `web/src/board/api.ts`.
 
+## Checks (round 3, 2026-09-29)
+
+- `ruff check` / `ruff format --check` on `omnigent/shipcrew`, `tests/shipcrew`
+  and the four touched upstream files; `pyrefly check omnigent/shipcrew` 0
+  errors (the touched upstream files add none).
+- `pytest tests/shipcrew tests/server/test_shipcrew_mount.py
+  tests/inner/test_claude_sdk_executor.py tests/inner/test_claude_sdk_harness.py
+  tests/server/routes/test_sessions_yolo_launch_args.py
+  tests/runner/test_app_claude_native_launch_args.py
+  tests/runtime/test_claude_sdk_spawn_env.py tests/runtime/test_spawn_env_cwd.py
+  tests/policies/test_registry.py tests/server/routes/test_policy_registry.py`:
+  726 passed (new: `test_run_all.py`, `test_launch_args.py`).
+- Web: `pnpm lint`, `pnpm type-check`, `pnpm build`, prettier on the touched
+  files, `vitest run src/board src/pages/BoardPage.test.tsx src/shell/Sidebar`:
+  454 passed.
+- Bundles: `build_agents.py --check`, `validate_agents.py` from this worktree:
+  10 bundles valid, 117 guardrail cases each, MCP set asserted per bundle.
+
 ## Checks (integration, 2026-09-29)
 
 - **Backend:** `ruff check` / `ruff format --check` on `omnigent/shipcrew`,
@@ -262,7 +341,13 @@ server side is `omnigent/shipcrew/router.py` and the client side is
   shipcrew guardrails.
 - `omnigent/server/routes/_sessions/helpers.py`: claude-native
   `executor.config.allowed_tools` becomes the `--allowedTools` launch flag
-  (+8 lines in `_derive_terminal_launch_args_from_spec`).
+  (+8 lines in `_derive_terminal_launch_args_from_spec`), and
+  `strict_mcp_config` / `mcp_config` become `--strict-mcp-config` /
+  `--mcp-config` (+4 lines, logic in `omnigent/shipcrew/launch_args.py`).
+- `omnigent/runtime/workflow.py` (+5), `omnigent/inner/claude_sdk_harness.py`
+  (+3), `omnigent/inner/claude_sdk_executor.py` (+10): the claude-sdk
+  `strict_mcp_config` flag (env `HARNESS_CLAUDE_SDK_STRICT_MCP_CONFIG`, then
+  `extra_args["strict-mcp-config"]`).
 
 Everything else is new: `omnigent/shipcrew/`, its own Alembic lineage
 (`shipcrew_alembic_version`), `web/src/board/`, `web/src/pages/BoardPage*`,

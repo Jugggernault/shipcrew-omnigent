@@ -58,6 +58,8 @@ class SqlMission(ShipcrewBase):
     plan_imported_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
     # Wall-clock start of the planner run: a plan.json older than this is stale.
     plan_started_at: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # A plan import moves its backlog tasks to ready right away (sc0003ar).
+    auto_run: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=false())
 
     __table_args__ = (
         CheckConstraint(_in_check("status", MISSION_STATUSES), name="ck_shipcrew_missions_status"),

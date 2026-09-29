@@ -10,7 +10,10 @@ import type {
   CreateMissionInput,
   CreateTaskInput,
   Mission,
+  MissionCommandResponse,
+  MissionPatch,
   MissionStreamEvent,
+  StartAllResponse,
   SyncMissionResponse,
   Task,
   TaskPatch,
@@ -110,6 +113,32 @@ export function planMission(missionId: string, prd?: string): Promise<Mission> {
 export function syncMission(missionId: string): Promise<SyncMissionResponse> {
   return request<SyncMissionResponse>(`/missions/${encodeURIComponent(missionId)}/sync`, {
     method: "POST",
+  });
+}
+
+/** Mission settings (`auto_run`). */
+export function updateMission(missionId: string, patch: MissionPatch): Promise<Mission> {
+  return request<Mission>(`/missions/${encodeURIComponent(missionId)}`, {
+    method: "PATCH",
+    body: JSON.stringify(patch),
+  });
+}
+
+/** Move every backlog task of the mission to Ready; the scheduler gates decide what runs. */
+export function startAllTasks(missionId: string): Promise<StartAllResponse> {
+  return request<StartAllResponse>(`/missions/${encodeURIComponent(missionId)}/start-all`, {
+    method: "POST",
+  });
+}
+
+/** Send a free-text command ("run all", "lance tout", "sync", ...) to the mission. */
+export function sendMissionCommand(
+  missionId: string,
+  text: string,
+): Promise<MissionCommandResponse> {
+  return request<MissionCommandResponse>(`/missions/${encodeURIComponent(missionId)}/command`, {
+    method: "POST",
+    body: JSON.stringify({ text }),
   });
 }
 
@@ -404,6 +433,39 @@ export function useSyncMission() {
       upsertCachedMission(queryClient, updated);
       // Issue and PR links land on the tasks; reconcile in case events were missed.
       void queryClient.invalidateQueries({ queryKey: tasksQueryKey(updated.id) });
+    },
+  });
+}
+
+export function useUpdateMission() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({ mission, patch }: { mission: Mission; patch: MissionPatch }) =>
+      updateMission(mission.id, patch),
+    onSuccess: (updated) => upsertCachedMission(queryClient, updated),
+  });
+}
+
+export function useStartAllTasks() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (mission: Mission) => startAllTasks(mission.id),
+    onSuccess: ({ mission }) => {
+      upsertCachedMission(queryClient, mission);
+      // The moved cards arrive over SSE; reconcile in case the stream is down.
+      void queryClient.invalidateQueries({ queryKey: tasksQueryKey(mission.id) });
+    },
+  });
+}
+
+export function useMissionCommand() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({ mission, text }: { mission: Mission; text: string }) =>
+      sendMissionCommand(mission.id, text),
+    onSuccess: ({ mission }) => {
+      upsertCachedMission(queryClient, mission);
+      void queryClient.invalidateQueries({ queryKey: tasksQueryKey(mission.id) });
     },
   });
 }

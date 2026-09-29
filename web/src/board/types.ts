@@ -21,8 +21,37 @@ export interface Mission {
   repo_url: string | null;
   status: MissionStatus;
   plan: MissionPlan;
+  /**
+   * A plan import moves its tasks to Ready right away ("Run automatically after
+   * planning"). Optional: servers that predate it omit the field.
+   */
+  auto_run?: boolean;
   /** Unix epoch seconds (server clock). */
   created_at: number;
+}
+
+/** `POST /missions/{id}/start-all`: backlog tasks moved to Ready. */
+export interface StartAllResponse {
+  mission: Mission;
+  /** Ids of the tasks moved to Ready (the scheduler gates decide what runs). */
+  started: string[];
+}
+
+export type MissionCommandIntent = "start_all" | "plan" | "sync" | "stop_all";
+
+/** `POST /missions/{id}/command`: what the rule-based command box did. */
+export interface MissionCommandResponse {
+  intent: MissionCommandIntent;
+  /** Human-readable outcome, shown as a toast. */
+  message: string;
+  mission: Mission;
+  started?: string[];
+  stopped?: string[];
+  sync?: MissionSyncReport;
+}
+
+export interface MissionPatch {
+  auto_run?: boolean;
 }
 
 /**

@@ -84,6 +84,44 @@ describe("PlanFromPrdDialog", () => {
     );
   });
 
+  it("binds the auto-run checkbox to the mission setting", async () => {
+    const onAutoRunChange = vi.fn();
+    const { rerender } = render(
+      <PlanFromPrdDialog
+        mission={makeMission()}
+        onPlan={vi.fn()}
+        onAutoRunChange={onAutoRunChange}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Plan from PRD" }));
+    const dialog = await screen.findByRole("dialog", { name: "Plan from PRD" });
+    const box = within(dialog).getByRole("checkbox", { name: "Run automatically after planning" });
+    expect(box).not.toBeChecked();
+    fireEvent.click(box);
+    expect(onAutoRunChange).toHaveBeenLastCalledWith(true);
+
+    rerender(
+      <PlanFromPrdDialog
+        mission={makeMission({ auto_run: true })}
+        onPlan={vi.fn()}
+        onAutoRunChange={onAutoRunChange}
+      />,
+    );
+    const checked = within(screen.getByRole("dialog")).getByRole("checkbox", {
+      name: "Run automatically after planning",
+    });
+    expect(checked).toBeChecked();
+    fireEvent.click(checked);
+    expect(onAutoRunChange).toHaveBeenLastCalledWith(false);
+  });
+
+  it("hides the auto-run checkbox without a handler", async () => {
+    render(<PlanFromPrdDialog mission={makeMission()} onPlan={vi.fn()} />);
+    fireEvent.click(screen.getByRole("button", { name: "Plan from PRD" }));
+    const dialog = await screen.findByRole("dialog", { name: "Plan from PRD" });
+    expect(within(dialog).queryByRole("checkbox")).not.toBeInTheDocument();
+  });
+
   it("is disabled while the planner runs", () => {
     render(
       <PlanFromPrdDialog

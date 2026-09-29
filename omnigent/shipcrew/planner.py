@@ -334,9 +334,14 @@ class PlanRunner:
         tasks = await asyncio.to_thread(self._service.store.upsert_plan_tasks, mission.id, specs)
         for task in tasks:
             self._service.bus.task_updated(task)
-        return await self._set(
+        mission = await self._set(
             mission.id, plan_status="imported", plan_error=None, plan_imported_count=len(tasks)
         )
+        if mission.auto_run:
+            # Same as "Run all tasks", for this import's tasks only; the
+            # scheduler tick that imported the plan starts them next.
+            await self._service.start_all(mission.id, {t.id for t in tasks})
+        return mission
 
     async def _finish(self, mission: Mission, snap: SessionSnapshot | None) -> None:
         if snap is None:
