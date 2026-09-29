@@ -24,7 +24,22 @@ SHIPCREW_FAKE_GH_STATE=/tmp/gh.json``.
 Supported: ``auth status``, ``repo view``, ``label create``, ``api`` (no-op),
 ``pr create|view|list|ready|checks|merge|update-branch|close``,
 ``run view [--log-failed]``, ``issue create|view|list|edit|close|reopen|comment``.
-Every invocation is appended to ``calls`` in the state file.
+``--repo``/``-R`` (``OWNER/REPO`` or a URL) is accepted on every command and
+names the repository in the URLs it prints. Every invocation is appended to
+``calls`` in the state file.
+
+State keys (tests may seed or edit them directly)::
+
+    {"authenticated": true,          # false: `auth status` exits 1
+     "remote": "/path/origin.git",   # optional; git-backed commands need it
+     "repo": "owner/name", "base": "main", "next": 1,
+     "labels": {"name": "color"},
+     "issues": {"1": {"number", "title", "body", "state": "OPEN|CLOSED",
+                      "url", "labels": ["name"], "assignees": ["login"]}},
+     "prs": {"7": {"number", "title", "body", "head", "base",
+                   "state": "OPEN|CLOSED|MERGED", "isDraft", "url"}},
+     "ci": {"command": "sh ci.sh", "async": true} | null,
+     "calls": [[argv...]]}
 """
 
 from __future__ import annotations
@@ -88,16 +103,49 @@ def _defaults(state: dict[str, Any]) -> dict[str, Any]:
     state.setdefault("base", "main")
     state.setdefault("next", 1)
     state.setdefault("next_run", 1000)
-    for key in ("prs", "issues", "runs", "ci_by_sha"):
+    for key in ("prs", "issues", "runs", "ci_by_sha", "labels"):
         state.setdefault(key, {})
     state.setdefault("calls", [])
-    if not state.get("remote"):
-        raise Fail("fake gh: state has no 'remote' (path of the bare repository)")
     return state
 
 
+def _remote(state: dict[str, Any]) -> str:
+    if not state.get("remote"):
+        raise Fail("fake gh: state has no 'remote' (path of the bare repository)")
+    return str(state["remote"])
+
+
+# ``--repo``/``-R`` of the current invocation (see ``_strip_repo``).
+_REPO_OVERRIDE: str | None = None
+
+
+def _repo_name(state: dict[str, Any]) -> str:
+    return _REPO_OVERRIDE or state["repo"]
+
+
+def _strip_repo(argv: list[str]) -> list[str]:
+    """Drop ``--repo X``/``-R X``/``--repo=X`` (any position); remember the repo."""
+    global _REPO_OVERRIDE
+    out: list[str] = []
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg in ("--repo", "-R") and i + 1 < len(argv):
+            raw, i = argv[i + 1], i + 2
+        elif arg.startswith("--repo="):
+            raw, i = arg.split("=", 1)[1], i + 1
+        else:
+            out.append(arg)
+            i += 1
+            continue
+        for prefix in ("https://", "http://"):
+            raw = raw.removeprefix(prefix)
+        _REPO_OVERRIDE = raw.removeprefix("github.com/").removesuffix(".git").strip("/")
+    return out
+
+
 def _url(state: dict[str, Any], kind: str, number: int | str) -> str:
-    return f"https://github.com/{state['repo']}/{kind}/{number}"
+    return f"https://github.com/{_repo_name(state)}/{kind}/{number}"
 
 
 def _next_number(state: dict[str, Any]) -> int:
@@ -124,6 +172,8 @@ def _git(*args: str, cwd: str | Path, check: bool = True) -> subprocess.Complete
 
 
 def _ref_sha(state: dict[str, Any], branch: str) -> str:
+    if not state.get("remote"):
+        return ""  # seeded PRs without a git remote
     r = _git(
         "rev-parse",
         "--verify",
@@ -139,7 +189,7 @@ def _ref_sha(state: dict[str, Any], branch: str) -> str:
 def _clone(state: dict[str, Any]) -> Iterator[Path]:
     tmp = Path(tempfile.mkdtemp(prefix="fake-gh-"))
     try:
-        _git("clone", "--quiet", state["remote"], str(tmp / "repo"), cwd=tmp)
+        _git("clone", "--quiet", _remote(state), str(tmp / "repo"), cwd=tmp)
         yield tmp / "repo"
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
@@ -211,13 +261,13 @@ def _pr_obj(state: dict[str, Any], pr: dict[str, Any]) -> dict[str, Any]:
     head_sha = pr.get("mergedHeadOid") if pr["state"] == "MERGED" else None
     return {
         "number": pr["number"],
-        "title": pr["title"],
-        "body": pr["body"],
+        "title": pr.get("title", ""),
+        "body": pr.get("body", ""),
         "state": pr["state"],
-        "isDraft": pr["isDraft"],
-        "url": pr["url"],
+        "isDraft": bool(pr.get("isDraft")),
+        "url": pr.get("url") or _url(state, "pull", pr["number"]),
         "headRefName": pr["head"],
-        "baseRefName": pr["base"],
+        "baseRefName": pr.get("base", state["base"]),
         "headRefOid": head_sha or _ref_sha(state, pr["head"]),
         "labels": [{"name": n} for n in pr.get("labels", [])],
         "mergedAt": pr.get("mergedAt"),
@@ -379,7 +429,7 @@ def _check_for(state: dict[str, Any], pr: dict[str, Any], *, wait: bool) -> dict
         "name": ci.get("name", "ci"),
         "state": {"pass": "SUCCESS", "fail": "FAILURE"}.get(bucket, "IN_PROGRESS"),
         "bucket": bucket,
-        "link": f"https://github.com/{state['repo']}/actions/runs/{run['id']}/job/{run['id']}",
+        "link": f"https://github.com/{_repo_name(state)}/actions/runs/{run['id']}/job/{run['id']}",
         "workflow": ci.get("name", "ci"),
         "description": "",
         "event": "pull_request",
@@ -469,7 +519,7 @@ def run_view(state: dict[str, Any], a: argparse.Namespace) -> None:
         "headSha": run["sha"],
         "status": run["status"],
         "conclusion": run.get("conclusion") or "",
-        "url": f"https://github.com/{state['repo']}/actions/runs/{run['id']}",
+        "url": f"https://github.com/{_repo_name(state)}/actions/runs/{run['id']}",
     }
     _emit(obj, a.json, a.q) if (a.json or a.q) else print(json.dumps(obj))
 
@@ -665,14 +715,22 @@ def _parser() -> argparse.ArgumentParser:
 
 def _dispatch(state: dict[str, Any], a: argparse.Namespace) -> int:
     if a.cmd == "auth":
+        if state.get("authenticated") is False:
+            print("You are not logged into any GitHub hosts. To log in, run: gh auth login",
+                  file=sys.stderr)  # fmt: skip
+            return 1
         print("github.com\n  ✓ Logged in to github.com account fake (fake gh)")
         print("  - Token scopes: 'repo', 'workflow'")
         return 0
     if a.cmd == "repo":
-        obj = {"url": f"https://github.com/{state['repo']}", "nameWithOwner": state["repo"]}
+        name = _repo_name(state)
+        obj = {"url": f"https://github.com/{name}", "nameWithOwner": name}
         _emit(obj, a.json, a.q) if (a.json or a.q) else print(obj["url"])
         return 0
-    if a.cmd in ("label", "api"):
+    if a.cmd == "label":
+        state["labels"][a.name] = a.color or "ededed"
+        return 0
+    if a.cmd == "api":
         return 0
     if a.cmd == "run":
         run_view(state, a)
@@ -742,12 +800,14 @@ def _init(argv: list[str]) -> int:
 
 
 def main(argv: list[str]) -> int:
+    global _REPO_OVERRIDE
+    _REPO_OVERRIDE = None
     if argv[:1] == ["init"]:
         return _init(argv[1:])
     if argv[:1] == ["__ci-run"]:
         return _ci_run(argv[1])
     try:
-        args = _parser().parse_args(argv)
+        args = _parser().parse_args(_strip_repo(list(argv)))
     except SystemExit as exc:
         return int(exc.code or 2)
     try:

@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import stat
 import sys
 from pathlib import Path
 from typing import Any
@@ -22,11 +21,11 @@ from .conftest import USER_HEADER, FakeSessions
 
 P = "/v1/shipcrew"
 REPO_URL = "https://github.com/acme/shop"
-FAKE_GH = Path(__file__).with_name("fake_gh.py")
+FAKE_GH = Path(__file__).resolve().parents[2] / "scripts" / "shipcrew-fake-gh"
 
 
 class FakeGitHub:
-    """The fake ``gh``'s JSON state, read and edited by tests."""
+    """The fake ``gh``'s JSON state (``scripts/shipcrew_fake_gh.py``), read and edited by tests."""
 
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -37,16 +36,23 @@ class FakeGitHub:
     def save(self, state: dict[str, Any]) -> None:
         self.path.write_text(json.dumps(state))
 
+    def issues(self) -> dict[int, dict[str, Any]]:
+        return {int(k): v for k, v in self.load().get("issues", {}).items()}
+
     def edit_issue(self, number: int, **fields: Any) -> None:
         state = self.load()
-        issue = next(i for i in state["issues"] if i["number"] == number)
-        issue.update(fields)
+        state["issues"][str(number)].update(fields)
         self.save(state)
 
-    def add_pr(self, **pr: Any) -> None:
-        state = self.load()
-        state.setdefault("prs", []).append(pr)
-        self.save(state)
+    def add_pr(self, *, number: int, state: str, head: str, url: str) -> None:
+        data = self.load()
+        data.setdefault("prs", {})[str(number)] = {
+            "number": number,
+            "state": state,
+            "head": head,
+            "url": url,
+        }
+        self.save(data)
 
     def calls(self) -> list[list[str]]:
         return self.load().get("calls", [])
@@ -54,14 +60,11 @@ class FakeGitHub:
 
 @pytest.fixture
 def github(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> FakeGitHub:
-    wrapper = tmp_path / "bin" / "gh"
-    wrapper.parent.mkdir()
-    wrapper.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{FAKE_GH}" "$@"\n')
-    wrapper.chmod(wrapper.stat().st_mode | stat.S_IXUSR)
     state = tmp_path / "gh_state.json"
-    monkeypatch.setenv("SHIPCREW_GH", str(wrapper))
-    monkeypatch.setenv("FAKE_GH_STATE", str(state))
-    assert os.access(wrapper, os.X_OK)
+    monkeypatch.setenv("SHIPCREW_GH", str(FAKE_GH))
+    monkeypatch.setenv("SHIPCREW_FAKE_GH_PYTHON", sys.executable)
+    monkeypatch.setenv("SHIPCREW_FAKE_GH_STATE", str(state))
+    assert os.access(FAKE_GH, os.X_OK)
     fake = FakeGitHub(state)
     fake.save({"authenticated": True})
     return fake
@@ -134,12 +137,12 @@ class TestIssueCreation:
         b_now = await _get(client, mission["id"], b["id"])
         assert (a_now["issue_number"], b_now["issue_number"]) == (1, 2)
         assert a_now["issue_url"] == f"{REPO_URL}/issues/1"
-        issues = {i["number"]: i for i in github.load()["issues"]}
+        issues = github.issues()
         assert issues[1]["title"] == "Cart"
         assert "Build the cart." in issues[1]["body"]
         assert "- [ ] adding an item shows it" in issues[1]["body"]
-        assert [lb["name"] for lb in issues[1]["labels"]] == ["shipcrew", "role:developer"]
-        assert [lb["name"] for lb in issues[2]["labels"]] == ["shipcrew", "role:security"]
+        assert issues[1]["labels"] == ["shipcrew", "role:developer"]
+        assert issues[2]["labels"] == ["shipcrew", "role:security"]
         assert {"shipcrew", "shipcrew:human", "role:developer"} <= set(github.load()["labels"])
         # Every call targets the mission's repository explicitly.
         creates = [c for c in github.calls() if c[:2] == ["issue", "create"]]
@@ -148,7 +151,7 @@ class TestIssueCreation:
         # A second sync opens nothing new.
         again = await _sync(client, mission["id"])
         assert again["sync"]["created"] == 0
-        assert len(github.load()["issues"]) == 2
+        assert len(github.issues()) == 2
 
     async def test_merged_tasks_get_no_issue(
         self, client: httpx.AsyncClient, github: FakeGitHub, service: ShipcrewService
@@ -157,7 +160,7 @@ class TestIssueCreation:
         task = await _task(client, mission["id"])
         await asyncio.to_thread(service.store.update_task, task["id"], status="merged")
         assert (await _sync(client, mission["id"]))["sync"]["created"] == 0
-        assert github.load().get("issues", []) == []
+        assert github.issues() == {}
 
 
 class TestPullFromGitHub:
@@ -175,7 +178,7 @@ class TestPullFromGitHub:
         self, client: httpx.AsyncClient, github: FakeGitHub, sessions: FakeSessions
     ) -> None:
         mission, task = await self._running_task_with_issue(client)
-        github.edit_issue(1, assignees=[{"login": "octocat"}])
+        github.edit_issue(1, assignees=["octocat"])
         body = await _sync(client, mission["id"])
         assert body["sync"]["updated"] == 1
         now = await _get(client, mission["id"], task["id"])
@@ -189,7 +192,7 @@ class TestPullFromGitHub:
         self, client: httpx.AsyncClient, github: FakeGitHub
     ) -> None:
         mission, task = await self._running_task_with_issue(client)
-        github.edit_issue(1, labels=[{"name": "shipcrew"}, {"name": "shipcrew:human"}])
+        github.edit_issue(1, labels=["shipcrew", "shipcrew:human"])
         await _sync(client, mission["id"])
         now = await _get(client, mission["id"], task["id"])
         assert now["assignee"]["kind"] == "human"
@@ -212,7 +215,7 @@ class TestPullFromGitHub:
         github.add_pr(
             number=7,
             state="MERGED",
-            headRefName=task_branch(task["id"], task["title"]),
+            head=task_branch(task["id"], task["title"]),
             url=f"{REPO_URL}/pull/7",
         )
         # GitHub closes the issue on merge; merged wins over "closed".
