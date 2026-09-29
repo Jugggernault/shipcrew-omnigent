@@ -14,6 +14,32 @@ export interface MissionPlan {
   imported_count: number;
 }
 
+export type ShipStatus = "idle" | "deploying" | "verifying" | "done" | "failed";
+
+/**
+ * The ship stage: once every agent task is merged, a devops session deploys
+ * `main` to Vercel and the server checks the URL itself, then writes the
+ * report (`POST /missions/{id}/ship` runs it by hand).
+ */
+export interface MissionShip {
+  status: ShipStatus;
+  /** Deployment URL, set once the agent reported it (verified when `done`). */
+  url: string | null;
+  /** Server-generated Markdown report (done or failed). */
+  report_md: string | null;
+  /** Why the ship failed, or (while idle) why the mission does not ship. */
+  error: string | null;
+  /** E.g. the deployment is protected (HTTP 401/403). */
+  note: string | null;
+  /** Unix epoch seconds (server clock). */
+  started_at: number | null;
+  finished_at: number | null;
+  /** The devops session while it deploys. */
+  session_id: string | null;
+  decisions: string[];
+  cost_usd: number;
+}
+
 export interface Mission {
   id: string;
   title: string;
@@ -26,6 +52,11 @@ export interface Mission {
    * planning"). Optional: servers that predate it omit the field.
    */
   auto_run?: boolean;
+  /** The planner's "Decisions:" list. Optional: older servers omit it. */
+  plan_decisions?: string[];
+  /** Deploy as soon as every agent task is merged (default on). */
+  auto_ship?: boolean;
+  ship?: MissionShip;
   /** Unix epoch seconds (server clock). */
   created_at: number;
 }
@@ -37,7 +68,7 @@ export interface StartAllResponse {
   started: string[];
 }
 
-export type MissionCommandIntent = "start_all" | "plan" | "sync" | "stop_all";
+export type MissionCommandIntent = "start_all" | "plan" | "sync" | "stop_all" | "ship";
 
 /** `POST /missions/{id}/command`: what the rule-based command box did. */
 export interface MissionCommandResponse {
@@ -52,6 +83,7 @@ export interface MissionCommandResponse {
 
 export interface MissionPatch {
   auto_run?: boolean;
+  auto_ship?: boolean;
 }
 
 /**
@@ -141,9 +173,21 @@ export interface Task {
   cost_usd: number;
   position: number;
   blocked_reason: string | null;
+  /** What the agent chose without asking (its "Decisions:" lists). */
+  decisions?: string[];
+  /** Unix epoch seconds of the first start, or null. */
+  started_at?: number | null;
+  /** Every time the card needed a human. */
+  interventions?: TaskIntervention[];
   /** Unix epoch seconds (server clock). */
   created_at: number;
   updated_at: number;
+}
+
+export interface TaskIntervention {
+  /** Unix epoch seconds. */
+  at: number;
+  reason: string;
 }
 
 export interface CreateMissionInput {

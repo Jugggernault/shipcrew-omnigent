@@ -40,6 +40,13 @@ class ShipcrewSettings:
     :param pr_base: Branch PRs target and diffs are taken against
         (``SHIPCREW_PR_BASE``).
     :param sync_interval_s: Seconds between GitHub issue syncs of a mission.
+    :param ship_enabled: Whether ticks auto-ship missions whose agent tasks are
+        all merged (``SHIPCREW_SHIP``; ``POST /ship`` works either way).
+    :param ship_verify_s: How long the server retries the deployment URL
+        before the ship fails (``SHIPCREW_SHIP_VERIFY_S``).
+    :param ship_verify_interval_s: Pause between two URL checks.
+    :param ship_allow_private_urls: Accept ``http://`` and private / loopback
+        hosts as the deployment URL (tests and local fakes only).
     """
 
     agents_dir: Path = Path(DEFAULT_AGENTS_DIR)
@@ -53,6 +60,10 @@ class ShipcrewSettings:
     pr_loop_enabled: bool = True
     pr_base: str = "main"
     sync_interval_s: float = 60.0
+    ship_enabled: bool = True
+    ship_verify_s: float = 120.0
+    ship_verify_interval_s: float = 5.0
+    ship_allow_private_urls: bool = False
 
     @classmethod
     def from_env(cls) -> ShipcrewSettings:
@@ -70,4 +81,12 @@ class ShipcrewSettings:
             pr_loop_enabled=env.get("SHIPCREW_PR_LOOP", "1").strip().lower() not in _FALSEY,
             pr_base=env.get("SHIPCREW_PR_BASE") or "main",
             sync_interval_s=max(5.0, float(env.get("SHIPCREW_SYNC_INTERVAL_S") or 60.0)),
+            ship_enabled=env.get("SHIPCREW_SHIP", "1").strip().lower() not in _FALSEY,
+            ship_verify_s=max(1.0, float(env.get("SHIPCREW_SHIP_VERIFY_S") or 120.0)),
+            ship_verify_interval_s=max(
+                0.1, float(env.get("SHIPCREW_SHIP_VERIFY_INTERVAL_S") or 5.0)
+            ),
+            ship_allow_private_urls=(
+                env.get("SHIPCREW_SHIP_ALLOW_PRIVATE_URLS", "0").strip().lower() not in _FALSEY
+            ),
         )

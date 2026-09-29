@@ -2,6 +2,7 @@
 // human), the approval gate, pull request and review, a "request changes"
 // box, acceptance checklist, dependencies, and the live sub-agent tree of the
 // task's root session (reviewer and integrator children show up there too),
+// plus the agent's "Decisions:" (what it chose without asking),
 // reusing the chat view's SubagentsGraphView.
 
 import { useState, type FormEvent } from "react";
@@ -27,6 +28,7 @@ import { cn } from "@/lib/utils";
 import { SubagentsGraphView } from "@/shell/SubagentsGraphView";
 import { STATUS_LABELS } from "./columns";
 import { interventionReason } from "./intervention";
+import { DecisionsList } from "./MissionShip";
 import {
   assigneeLabel,
   BranchChip,
@@ -461,6 +463,12 @@ function TaskDrawerBody({
         {showPullRequest && <PullRequestSection task={task} />}
 
         {task.review && <ReviewSection task={task} review={task.review} />}
+
+        {(task.decisions?.length ?? 0) > 0 && (
+          <Section title="Decisions">
+            <DecisionsList decisions={task.decisions ?? []} label="Agent decisions" />
+          </Section>
+        )}
 
         {canRequestChanges(task) && (
           <RequestChangesForm key={task.id} task={task} onRequestChanges={onRequestChanges} />

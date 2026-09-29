@@ -11,6 +11,106 @@ live end-to-end run: 2026-09-29.
 ![Card held for a human merge approval (APPROVALS.md)](board-approval.png)
 ![Drawer with the Approve merge action](drawer-approval.png)
 
+## Round 4: ship stage, report, decisions (2026-09-29)
+
+![Board after a ship: status chip with the verified URL, Ship again, Report](board-shipped.png)
+![Ship report dialog: deploy link first, rendered Markdown, copy](ship-report.png)
+
+- **Decisions** (`omnigent/shipcrew/decisions.py`): every worker role ends its
+  final reply with a `Decisions:` list before the verdict (shipcrew
+  `_shared/COMMON.md`). `parse_decisions` is lenient (`**Decisions:**`,
+  `## Decisions`, `*`/`1.` bullets, `Decisions: none`, code fences skipped, the
+  last list wins, 20 items x 300 chars) and returns `[]` when absent. The PR
+  loop merges it into `Task.decisions` each time it reads a developer or
+  integrator reply (dedup across fix turns); the planner's goes to
+  `Mission.plan_decisions`. Board: a Decisions section in the drawer, a folded
+  "Decisions (n)" under the mission header.
+- **Ship stage** (`omnigent/shipcrew/ship.py`, scheduler tick after the
+  merges, so the last merge ships in the same tick). `Mission.auto_ship`
+  (default true, `PATCH /missions/{id} {auto_ship}`) and `Mission.ship
+  {status: idle|deploying|verifying|done|failed, url, report_md, error, note,
+  started_at, finished_at, session_id, decisions, cost_usd}`.
+  1. Ready = every non-human task merged. A blocked / intervention card stops
+     it and `ship.error` says why ("not shipping: 1 card needs a human: 'QA'");
+     `POST /missions/{id}/ship` answers 409 with the same reason. Auto ship
+     runs once per mission (from idle); after done/failed only a manual ship
+     (button "Ship again", or the command box: `ship`, `deploy`, `déploie`).
+  2. Server preflight: `vercel` through `tools.resolve` (`SHIPCREW_VERCEL`),
+     `vercel whoami` (30 s): not found / not logged in fails in a second, no
+     agent session.
+  3. A `devops` session in a fresh worktree of `origin/main` on a throwaway
+     `shipcrew/<mission8>-ship-<epoch>` branch (host worktree, like tasks):
+     `vercel whoami`, `vercel link --yes --project <repo-name>`,
+     `vercel deploy --prod --yes`, final line `DEPLOYED: <url>` or
+     `FAIL: <reason>` (env var names only, never values).
+  4. The server reads the reply, stops the session, removes the worktree and
+     branch, then checks the URL itself (httpx GET, redirects followed; 2xx =
+     live, 401/403 = live but protected, with a note), every
+     `SHIPCREW_SHIP_VERIFY_INTERVAL_S` (5) until `ship_verify_until`
+     (`SHIPCREW_SHIP_VERIFY_S`, 120). Only `https` to a public host name is
+     probed (no IP literal, localhost, `.local`, `.internal`, userinfo);
+     `SHIPCREW_SHIP_ALLOW_PRIVATE_URLS=1` lifts that for local fakes.
+  5. Restart safety: deploying resumes polling the stored session; verifying
+     resumes the check within the stored deadline; a deploying row with no
+     session (start cut off) fails with "interrupted, ship again".
+- **Report** (`omnigent/shipcrew/report.py`, deterministic, stored in
+  `ship.report_md`, committed nowhere, also for a failed ship): title, repo,
+  deploy URL, status, note, total cost (tasks + deploy session), wall time
+  (first task start -> ship end, `Task.started_at`), task table (status, PR
+  link, CI fixes, review verdict, cost), decisions (plan, per task, deploy),
+  major/blocker review findings, security tasks, and every intervention
+  (`Task.interventions`, appended by the store whenever a card enters
+  intervention, with its reason).
+- **Board**: status chip Planning / Building / Shipping / Shipped <host link> /
+  Ship failed; the reason a mission does not ship; Ship now / Ship again;
+  Report dialog (deploy link first, GFM Markdown, links open in a new tab,
+  Copy Markdown). Missions poll while a ship runs.
+- **Bundles** (shipcrew `v3-ship`): devops `ROLE.md` rewritten for the ship;
+  new allowlist group `vercel_deploy` = exactly `vercel link --yes --project
+  <name>` and `vercel deploy --prod --yes`, plus `curl` to
+  `https://*.vercel.app` (GET/HEAD, `-o /dev/null` only); `vercel_read`
+  trimmed to `whoami/ls/inspect/logs` (no `npx`, no `env ls`). The planner no
+  longer plans a devops task. 26 new validator cases (143 per bundle).
+- **Schema**: `sc0004sh` (after `sc0003ar`): mission `plan_decisions`,
+  `auto_ship`, `ship_*`; task `decisions`, `started_at`, `interventions`.
+- **Fake vercel**: `scripts/shipcrew_fake_vercel.py`. Symlink it as `vercel`
+  in a temp bin dir first on `PATH` (agent sessions get the host's `PATH`,
+  not the server's other env), and configure it with `fake-vercel.json` next
+  to the symlink (`url`, `log`, `logged_out`, `fail_deploy`).
+
+### Verified live (port 16797, own state dir, fake vercel + fake gh)
+
+A local repo with a bare `origin`, one task PATCHed to Merged. Nothing
+reached Vercel.
+
+1. Auto ship started within one tick of the merge: preflight `whoami`, then
+   the devops claude-native session ran `vercel whoami` and
+   `vercel link --yes --project repo && vercel deploy --prod --yes` with no
+   approval card (allowlist), wrote a two-item `Decisions:` list and
+   `DEPLOYED: https://repo.vercel.app`. The server verified it, stored the
+   decisions, cost $0.21, and removed the ship worktree and branch. ~20 s.
+2. Re-ship from the command box (`déploie sur vercel`): the agent reported
+   the unique deployment URL, which answered 404; the server retried for the
+   60 s window and marked **Ship failed** ("did not answer 2xx after 11
+   attempts (last: HTTP 404)"), report included. The agent's word was not
+   trusted.
+3. `POST /ship` again with the fake printing a local URL: done in ~25 s, the
+   local server logged the check GET. Screenshots above.
+
+### Known gaps (round 4)
+
+- Auto ship runs once: tasks merged after a finished ship need "Ship again".
+- The ship worktree is created by the host like task worktrees; a leftover
+  `.vercel/` link dies with it, so every ship links again (1 CLI call).
+- A devops ask (non-allowlisted command) shows only in the Inbox; the mission
+  chip stays "Shipping".
+- The report's wall time is n/a when no task was started by shipcrew (cards
+  merged by hand).
+- A planned `devops` task (old plans) would end with `DEPLOYED:`, not `PASS`,
+  and block in the PR loop; the planner no longer plans one.
+- Parallel rounds may add their own `sc0004*` revision: the integrator must
+  rechain `down_revision` to keep one head.
+
 ## Round 3: run everything, MCP scoping (2026-09-29)
 
 - **Run all tasks** (`omnigent/shipcrew/router.py`, `service.py`, `store.py`):
@@ -148,7 +248,7 @@ project (`src/sum.js`, node:test tests, `"test": "node --test test/"`) whose
   Review findings, Request changes), `mission.updated` over SSE, six columns
   without horizontal scroll at 1600 px.
 - **Schema**: Alembic lineage `sc0001 -> sc0002pr (PR loop) -> sc0002p (plan +
-  issue sync) -> sc0003ar (mission auto_run)`, single head.
+  issue sync) -> sc0003ar (mission auto_run) -> sc0004sh (ship stage)`, single head.
 - Round 1 behaviour (board, drawer tree, 4 scheduler gates, session state ->
   card, folder pre-trust, ACL per owner) is unchanged.
 
@@ -285,7 +385,10 @@ scripts/shipcrew_stack.sh stop $E/state 16772
 ```
 
 New settings: `SHIPCREW_PR_LOOP` (default on), `SHIPCREW_PR_BASE` (default
-`main`), `SHIPCREW_SYNC_INTERVAL_S` (default 60, min 5), `SHIPCREW_GH`.
+`main`), `SHIPCREW_SYNC_INTERVAL_S` (default 60, min 5), `SHIPCREW_GH`,
+`SHIPCREW_SHIP` (auto ship, default on), `SHIPCREW_SHIP_VERIFY_S` (120),
+`SHIPCREW_SHIP_VERIFY_INTERVAL_S` (5), `SHIPCREW_SHIP_ALLOW_PRIVATE_URLS`
+(off), `SHIPCREW_VERCEL`.
 
 API contract: `/v1/shipcrew/*`, with the same auth as the other `/v1` routes.
 It is hidden from OpenAPI so the upstream `openapi.json` does not drift. The

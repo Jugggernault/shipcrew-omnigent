@@ -171,3 +171,25 @@ describe("canRequestChanges", () => {
     expect(canRequestChanges(makeTask({ status: "merged", root_session_id: "c" }))).toBe(false);
   });
 });
+
+describe("TaskDrawer decisions", () => {
+  it("lists the agent's decisions", () => {
+    const { drawer } = renderDrawer(
+      makeTask({ decisions: ["Stored the cart in memory", "Used zod"], root_session_id: "r" }),
+    );
+    const list = drawer.getByRole("list", { name: "Agent decisions" });
+    expect(
+      within(list)
+        .getAllByRole("listitem")
+        .map((item) => item.textContent),
+    ).toEqual(["Stored the cart in memory", "Used zod"]);
+  });
+
+  it("has no decisions section when there are none (or the server predates them)", () => {
+    const { drawer } = renderDrawer(makeTask({ decisions: [] }));
+    expect(drawer.queryByRole("heading", { name: "Decisions" })).not.toBeInTheDocument();
+    cleanup();
+    const legacy = renderDrawer(makeTask({ decisions: undefined }));
+    expect(legacy.drawer.queryByRole("heading", { name: "Decisions" })).not.toBeInTheDocument();
+  });
+});

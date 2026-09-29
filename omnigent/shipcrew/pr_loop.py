@@ -52,6 +52,7 @@ from typing import TYPE_CHECKING, Any
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.shipcrew import gh
 from omnigent.shipcrew.branches import task_branch
+from omnigent.shipcrew.decisions import merge_decisions, parse_decisions
 from omnigent.shipcrew.policies import paths_outside_owned
 from omnigent.shipcrew.sessions import ChildSessionRequest, SessionServiceError
 from omnigent.shipcrew.store import Mission, Task
@@ -710,7 +711,19 @@ class PrLoop:
         text = await self._svc.sessions.last_agent_text(
             ctx.task.root_session_id, acting_user=ctx.owner
         )
+        await self.record_decisions(ctx.task, text)
         return parse_verdict(text)
+
+    async def record_decisions(self, task: Task, text: str | None) -> None:
+        """Merge the ``Decisions:`` list of an agent reply into ``task.decisions``."""
+        new = parse_decisions(text)
+        if not new:
+            return
+        current = await self._io(self._svc.store.get_task, task.id)
+        base = current.decisions if current is not None else task.decisions
+        merged = merge_decisions(base, new)
+        if merged != base:
+            await self._svc._update(task.id, decisions=merged)
 
     async def _open_pr(self, ctx: _Ctx) -> Task:
         verdict = await self._developer_verdict(ctx)
@@ -994,6 +1007,7 @@ class PrLoop:
             else None
         )
         await self._stop(ctx, session_id)
+        await self.record_decisions(ctx.task, text)
         verdict = parse_verdict(text)
         task = await self._update(ctx.task, integrator_session_id=None, blocked_reason=None)
         if verdict is None or verdict[0] != "pass":

@@ -116,12 +116,17 @@ export function syncMission(missionId: string): Promise<SyncMissionResponse> {
   });
 }
 
-/** Mission settings (`auto_run`). */
+/** Mission settings (`auto_run`, `auto_ship`). */
 export function updateMission(missionId: string, patch: MissionPatch): Promise<Mission> {
   return request<Mission>(`/missions/${encodeURIComponent(missionId)}`, {
     method: "PATCH",
     body: JSON.stringify(patch),
   });
+}
+
+/** Deploy the mission now (every agent task must be merged); 409 says why not. */
+export function shipMission(missionId: string): Promise<Mission> {
+  return request<Mission>(`/missions/${encodeURIComponent(missionId)}/ship`, { method: "POST" });
 }
 
 /** Move every backlog task of the mission to Ready; the scheduler gates decide what runs. */
@@ -325,10 +330,17 @@ export function useMissionStream(missionId: string | null): boolean {
 // ---- hooks ----------------------------------------------------------------
 
 function planRunning(missions: readonly Mission[] | undefined): boolean {
-  return missions?.some((mission) => mission.plan?.status === "running") ?? false;
+  return (
+    missions?.some(
+      (mission) =>
+        mission.plan?.status === "running" ||
+        mission.ship?.status === "deploying" ||
+        mission.ship?.status === "verifying",
+    ) ?? false
+  );
 }
 
-/** Missions; polled while a planner run is in flight so its outcome shows up. */
+/** Missions; polled while a planner or ship run is in flight so its outcome shows up. */
 export function useMissions() {
   return useQuery({
     queryKey: missionsQueryKey,
@@ -455,6 +467,14 @@ export function useStartAllTasks() {
       // The moved cards arrive over SSE; reconcile in case the stream is down.
       void queryClient.invalidateQueries({ queryKey: tasksQueryKey(mission.id) });
     },
+  });
+}
+
+export function useShipMission() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (mission: Mission) => shipMission(mission.id),
+    onSuccess: (updated) => upsertCachedMission(queryClient, updated),
   });
 }
 

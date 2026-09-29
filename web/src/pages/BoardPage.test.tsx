@@ -90,6 +90,25 @@ function serve(input: RequestInfo | URL, init?: RequestInit): Response {
     }
     return json({ intent: "start_all", message: "Moved 1 task to Ready.", mission: missions[0] });
   }
+  if (url === "/v1/shipcrew/missions/mission_1/ship" && method === "POST") {
+    const shipping: Mission = {
+      ...missions[0],
+      ship: {
+        status: "deploying",
+        url: null,
+        report_md: null,
+        error: null,
+        note: null,
+        started_at: 1_788_260_000,
+        finished_at: null,
+        session_id: "conv_ship",
+        decisions: [],
+        cost_usd: 0,
+      },
+    };
+    missions = [shipping];
+    return json(shipping);
+  }
   if (url.endsWith("/stream")) return new Response("unavailable", { status: 503 });
   if (/^\/v1\/sessions\/[^/]+\/child_sessions$/.test(url)) {
     return json({ object: "list", data: [] });
@@ -506,6 +525,27 @@ describe("BoardPage", () => {
     ];
     renderBoard();
     expect(await screen.findByText("Imported 4 tasks")).toBeInTheDocument();
+  });
+
+  it("ships a merged mission and shows the chip, the report and the plan decisions", async () => {
+    tasks = [makeTask({ id: "t_done", title: "Parse args", status: "merged" })];
+    missions = [makeMission({ plan_decisions: ["Kept one task"] })];
+    renderBoard();
+    await screen.findByText("Parse args");
+    expect(screen.getByTestId("mission-status-chip")).toHaveTextContent("Building");
+    expect(screen.getByText("Decisions (1)")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Report" })).toBeDisabled();
+    fireEvent.click(screen.getByRole("button", { name: "Ship now" }));
+    await waitFor(() =>
+      expect(screen.getByTestId("mission-status-chip")).toHaveTextContent("Shipping"),
+    );
+    expect(requests).toContainEqual({
+      method: "POST",
+      url: "/v1/shipcrew/missions/mission_1/ship",
+      body: undefined,
+    });
+    expect(vi.mocked(showToast)).toHaveBeenCalledWith("Deploying to Vercel…");
+    expect(screen.getByRole("button", { name: "Ship now" })).toBeDisabled();
   });
 
   it("forces a GitHub sync", async () => {

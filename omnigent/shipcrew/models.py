@@ -19,6 +19,7 @@ from sqlalchemy import (
     String,
     Text,
     false,
+    true,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -27,6 +28,7 @@ TASK_STATUSES = ("backlog", "ready", "running", "review", "intervention", "merge
 CI_STATES = ("none", "pending", "green", "red")
 ASSIGNEE_KINDS = ("agent", "human")
 PLAN_STATUSES = ("idle", "running", "imported", "failed")
+SHIP_STATUSES = ("idle", "deploying", "verifying", "done", "failed")
 
 
 def _in_check(column: str, values: tuple[str, ...]) -> str:
@@ -60,11 +62,34 @@ class SqlMission(ShipcrewBase):
     plan_started_at: Mapped[float | None] = mapped_column(Float, nullable=True)
     # A plan import moves its backlog tasks to ready right away (sc0003ar).
     auto_run: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=false())
+    # ── Ship stage (sc0004sh, see omnigent/shipcrew/ship.py) ──
+    # The planner's "Decisions:" list.
+    plan_decisions: Mapped[list[Any] | None] = mapped_column(JSON, nullable=True)
+    # Deploy once every agent task is merged.
+    auto_ship: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=true())
+    ship_status: Mapped[str] = mapped_column(String(16), nullable=False, server_default="idle")
+    ship_url: Mapped[str | None] = mapped_column(String(2048), nullable=True)
+    ship_report_md: Mapped[str | None] = mapped_column(Text, nullable=True)
+    ship_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Protected deployment (HTTP 401/403) and similar remarks of the URL check.
+    ship_note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    ship_started_at: Mapped[float | None] = mapped_column(Float, nullable=True)
+    ship_finished_at: Mapped[float | None] = mapped_column(Float, nullable=True)
+    ship_session_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # Branch of the throwaway worktree of main the devops session deploys from.
+    ship_branch: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    # The URL check gives up at this wall-clock time (restart-safe deadline).
+    ship_verify_until: Mapped[float | None] = mapped_column(Float, nullable=True)
+    ship_decisions: Mapped[list[Any] | None] = mapped_column(JSON, nullable=True)
+    ship_cost_usd: Mapped[float] = mapped_column(Float, nullable=False, server_default="0")
 
     __table_args__ = (
         CheckConstraint(_in_check("status", MISSION_STATUSES), name="ck_shipcrew_missions_status"),
         CheckConstraint(
             _in_check("plan_status", PLAN_STATUSES), name="ck_shipcrew_missions_plan_status"
+        ),
+        CheckConstraint(
+            _in_check("ship_status", SHIP_STATUSES), name="ck_shipcrew_missions_ship_status"
         ),
         Index("ix_shipcrew_missions_created_at", "created_at"),
     )
@@ -123,6 +148,13 @@ class SqlTask(ShipcrewBase):
     approval_reasons: Mapped[list[Any] | None] = mapped_column(JSON, nullable=True)
     # POST /approve was pressed for the current changes; reset by a developer push.
     human_approved: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=false())
+    # ── Ship stage (sc0004sh) ──
+    # The agent's "Decisions:" lists, merged across its turns.
+    decisions: Mapped[list[Any] | None] = mapped_column(JSON, nullable=True)
+    # Wall-clock time of the first start (the report's wall time begins here).
+    started_at: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # Every time the card entered intervention: [{"at": float, "reason": str}].
+    interventions: Mapped[list[Any] | None] = mapped_column(JSON, nullable=True)
 
     __table_args__ = (
         CheckConstraint(_in_check("status", TASK_STATUSES), name="ck_shipcrew_tasks_status"),

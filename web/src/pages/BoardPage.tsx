@@ -14,6 +14,9 @@
  *   "Run automatically after planning" setting), shows its run, forces a
  *   GitHub sync, moves every backlog card to Ready ("Run all tasks"), and
  *   sends short orders to the crew ("Ask the crew…", rule-based server side).
+ * - The ship stage: a status chip (Planning / Building / Shipping / Shipped
+ *   <url> / Ship failed), "Ship now", and the server's report (deploy link,
+ *   rendered Markdown, copy); the planner's decisions fold under the header.
  * - The selected mission and task live in `?mission=` / `?task=`.
  */
 
@@ -43,6 +46,7 @@ import {
   useMissionTasks,
   usePlanMission,
   useRequestTaskChanges,
+  useShipMission,
   useStartAllTasks,
   useStartTask,
   useStopTask,
@@ -61,6 +65,13 @@ import {
 import { columnKeyboardCoordinates } from "@/board/keyboard";
 import { MissionPlanStatus, missionPlan, PlanFromPrdDialog } from "@/board/MissionPlan";
 import { MissionCommandBox, RunAllTasksButton, runnableBacklog } from "@/board/MissionRun";
+import {
+  MissionShipNotice,
+  MissionStatusChip,
+  PlanDecisions,
+  ShipButton,
+  ShipReportPanel,
+} from "@/board/MissionShip";
 import { NewMissionDialog } from "@/board/NewMissionDialog";
 import { NewTaskForm } from "@/board/NewTaskForm";
 import { TaskCard } from "@/board/TaskCard";
@@ -134,6 +145,7 @@ export function BoardPage() {
   const { mutate: mutateStartAll, isPending: startingAll } = useStartAllTasks();
   const { mutate: mutateMission } = useUpdateMission();
   const { mutateAsync: commandAsync } = useMissionCommand();
+  const { mutate: mutateShip, isPending: shipping } = useShipMission();
 
   const selectedTaskId = searchParams.get(TASK_QUERY_PARAM);
   const selectedTask = tasks.find((task) => task.id === selectedTaskId) ?? null;
@@ -224,6 +236,19 @@ export function BoardPage() {
         { onError: (error) => showToast(`Could not save the setting: ${errorMessage(error)}`) },
       ),
     [mutateMission],
+  );
+  const ship = useCallback(
+    (target: Mission) =>
+      mutateShip(target, {
+        onSuccess: (updated) =>
+          showToast(
+            updated.ship?.status === "failed"
+              ? `Ship failed: ${updated.ship.error ?? "unknown error"}`
+              : "Deploying to Vercel…",
+          ),
+        onError: (error) => showToast(`Could not ship: ${errorMessage(error)}`),
+      }),
+    [mutateShip],
   );
   const command = useCallback(
     async (target: Mission, text: string) => {
@@ -342,7 +367,10 @@ export function BoardPage() {
     >
       <header className="flex items-start justify-between gap-4 px-6 pt-5">
         <div className="min-w-0">
-          <h1 className="text-2xl font-semibold">Board</h1>
+          <div className="flex items-center gap-2">
+            <h1 className="text-2xl font-semibold">Board</h1>
+            {mission && <MissionStatusChip mission={mission} tasks={tasks} />}
+          </div>
           <div className="flex items-center gap-1.5 text-ui text-muted-foreground">
             {mission ? (
               <span className="truncate font-mono text-xs" title={mission.repo_path}>
@@ -360,6 +388,8 @@ export function BoardPage() {
           {mission && (
             <MissionPlanStatus plan={missionPlan(mission)} className="mt-1 max-w-[480px]" />
           )}
+          {mission && <PlanDecisions mission={mission} />}
+          {mission && <MissionShipNotice mission={mission} />}
         </div>
         {mission && (
           <div className="flex shrink-0 flex-wrap items-center justify-end gap-1.5">
@@ -369,6 +399,13 @@ export function BoardPage() {
               pending={startingAll}
               onRun={() => startAll(mission)}
             />
+            <ShipButton
+              mission={mission}
+              tasks={tasks}
+              pending={shipping}
+              onShip={() => ship(mission)}
+            />
+            <ShipReportPanel mission={mission} />
             <PlanFromPrdDialog
               mission={mission}
               onPlan={(prd) => planAsync({ mission, prd })}
