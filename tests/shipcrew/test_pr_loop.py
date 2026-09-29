@@ -1133,6 +1133,87 @@ class TestChildWorkspaces:
         assert not second.exists()
         assert "shipcrew-review-" not in git(repo, "worktree", "list")
 
+    async def test_reviewer_checkout_is_seeded_from_the_task_worktree(
+        self,
+        service: ShipcrewService,
+        sessions: LoopSessions,
+        repo: Path,
+        scheduler: ShipcrewScheduler,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Live run 2: the reviewer's fresh checkout had no node_modules and the
+        # reviewer installed. The main checkout has none (and not this lockfile
+        # yet), so the seed comes from the task worktree at the same head.
+        prepared: list[tuple[Path, bool, str]] = []
+        real = pr_loop.prepare_worktree
+
+        def spy(repo_path: str, workspace: str, *, seed_from: Any = ()) -> str | None:
+            method = real(repo_path, workspace, seed_from=seed_from)
+            ws = Path(workspace)
+            ignored = subprocess.run(
+                ["git", "check-ignore", "-q", "AGENTS.md"], cwd=ws, check=False
+            ).returncode
+            prepared.append((ws, (ws / "node_modules" / "left-pad.js").is_file(), str(ignored)))
+            return method
+
+        monkeypatch.setattr(pr_loop, "prepare_worktree", spy)
+        task, wt = await start(
+            service,
+            sessions,
+            repo,
+            files={
+                ".gitignore": "node_modules\n",
+                "pnpm-lock.yaml": "lockfileVersion: '9.0'\n",
+                "src/a.txt": "a\n",
+                "ok": "",
+            },
+        )
+        (wt / "node_modules").mkdir()
+        (wt / "node_modules" / "left-pad.js").write_text("module.exports = 1\n")
+        await run_until(scheduler, service, task.id, status_is("merged"))
+        (ws, seeded, ignored) = prepared[0]
+        assert ws.name.startswith("shipcrew-review-")
+        assert seeded, "reviewer checkout got the task worktree's node_modules"
+        assert ignored == "0", "AGENTS.md is excluded in the reviewer checkout"
+
+    async def test_reviewer_asks_count_as_interventions(
+        self,
+        service: ShipcrewService,
+        sessions: LoopSessions,
+        repo: Path,
+        scheduler: ShipcrewScheduler,
+    ) -> None:
+        task, _wt = await start(service, sessions, repo, files={"src/a.txt": "a\n", "ok": ""})
+        started = await run_until(
+            scheduler, service, task.id, lambda t: t.reviewer_session_id is not None
+        )
+        child = started.reviewer_session_id
+        assert child is not None
+        sessions.snapshots[child] = SessionSnapshot(
+            status="waiting",
+            awaiting_human=True,
+            pending_ask={"policy": "shipcrew_shell_allowlist", "preview": "pnpm install"},
+            pending_ask_id="elicit_1",
+        )
+        for _ in range(3):  # polled every tick, recorded once
+            await scheduler.tick()
+        held = await service.require_task(task.id)
+        assert held.status == "review"  # the card does not move
+        assert len(held.interventions) == 1
+        entry = held.interventions[0]
+        assert entry["role"] == "reviewer" and entry["ask_id"] == "elicit_1"
+        assert entry["reason"] == "reviewer: shipcrew_shell_allowlist: pnpm install"
+        # A second prompt of the same child is a second intervention.
+        sessions.snapshots[child] = dataclasses.replace(
+            sessions.snapshots[child],
+            pending_ask_id="elicit_2",  # type: ignore[arg-type]
+        )
+        await scheduler.tick()
+        assert len((await service.require_task(task.id)).interventions) == 2
+        del sessions.snapshots[child]
+        merged = await run_until(scheduler, service, task.id, status_is("merged"))
+        assert len(merged.interventions) == 2
+
     async def test_integrator_owns_the_task_worktree_after_the_developer_stops(
         self,
         service: ShipcrewService,

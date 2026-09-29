@@ -54,7 +54,6 @@ from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.shipcrew import gh, main_deps
 from omnigent.shipcrew.branches import task_branch
 from omnigent.shipcrew.decisions import merge_decisions, parse_decisions
-from omnigent.shipcrew.deps_seed import seed_node_modules
 from omnigent.shipcrew.policies import paths_outside_owned
 from omnigent.shipcrew.review_policy import (
     changed_lines,
@@ -62,7 +61,7 @@ from omnigent.shipcrew.review_policy import (
     review_skip_reason,
     split_nul,
 )
-from omnigent.shipcrew.sessions import ChildSessionRequest, SessionServiceError
+from omnigent.shipcrew.sessions import ChildSessionRequest, SessionServiceError, SessionSnapshot
 from omnigent.shipcrew.store import Mission, Task
 from omnigent.shipcrew.tools import session_env
 from omnigent.shipcrew.verify import (
@@ -72,6 +71,7 @@ from omnigent.shipcrew.verify import (
     drop_tests_branches,
     verify_writable,
 )
+from omnigent.shipcrew.worktree_prep import prepare_worktree
 
 if TYPE_CHECKING:
     from omnigent.shipcrew.service import ShipcrewService
@@ -525,11 +525,7 @@ def add_review_worktree(repo: Path, task_id: str, head: str) -> Path:
         _remove_worktree_dir(repo, path)
     path.parent.mkdir(parents=True, exist_ok=True)
     _git(["worktree", "add", "--detach", "--force", str(path), head], repo)
-    # Best effort: the reviewer may re-run the suite (same seed as task worktrees).
-    try:
-        seed_node_modules(str(repo), str(path))
-    except Exception:  # noqa: BLE001 - seeding never blocks a review
-        _logger.debug("shipcrew: node_modules seed failed for %s", path, exc_info=True)
+    # node_modules and the agent-notes exclude: PrLoop._start_child (prepare_worktree).
     return path
 
 
@@ -703,12 +699,18 @@ class PrLoop:
                 f"no agent bundle for role {role!r} in {self._svc.settings.agents_dir}"
             )
         assert ctx.task.root_session_id is not None and ctx.worktree is not None
+        workspace = workspace or ctx.worktree
+        # Same preparation as a task worktree: node_modules from the main
+        # checkout, else from the task worktree (a reviewer checks out its head,
+        # so their lockfiles match), and AGENTS.md / CLAUDE.md never committed.
+        fallback = [str(ctx.worktree)] if Path(workspace) != ctx.worktree else []
+        await self._io(prepare_worktree, str(ctx.repo), str(workspace), seed_from=fallback)
         return await self._svc.sessions.create_child_session(
             ChildSessionRequest(
                 parent_session_id=ctx.task.root_session_id,
                 title=title,
                 prompt=prompt,
-                workspace=str(workspace or ctx.worktree),
+                workspace=str(workspace),
                 agent_dir=agent_dir,
                 acting_user=ctx.owner,
                 labels={
@@ -720,6 +722,33 @@ class PrLoop:
                 project_id=await self._svc.mission_project_id(ctx.mission, ctx.owner),
             )
         )
+
+    async def _note_child_ask(
+        self, ctx: _Ctx, role: str, session_id: str, snap: SessionSnapshot
+    ) -> Task:
+        """Record an ask of a loop child (reviewer, integrator) on the task.
+
+        The card stays in Review (the child waits in the Inbox), but the
+        report's "Human interventions" counts it, once per prompt, with the
+        child's role in the reason.
+        """
+        ask = snap.pending_ask or {}
+        policy, preview = ask.get("policy") or "", ask.get("preview") or ""
+        what = f"{policy}: {preview or '(no preview)'}" if policy else "asked a human"
+        entry = {
+            "reason": f"{role}: {what}",
+            "policy": policy,
+            "preview": preview,
+            "role": role,
+            "ask_id": snap.pending_ask_id or f"{session_id}:{policy}:{preview}",
+        }
+        before = len(ctx.task.interventions)
+        task = await self._io(self._svc.store.record_intervention, ctx.task.id, entry)
+        if task is None:
+            return ctx.task
+        if len(task.interventions) != before:
+            self._svc.bus.task_updated(task)
+        return task
 
     # ── tick ──
 
@@ -1068,7 +1097,9 @@ class PrLoop:
             await self._stop(ctx, session_id)
             await self._io(remove_review_worktrees, ctx.repo, ctx.task.id)
             return await self._hold(ctx, f"reviewer session failed: {snap.error or 'unknown'}")
-        if snap.awaiting_human or snap.status != "idle" or not snap.agent_replied:
+        if snap.awaiting_human:
+            return await self._note_child_ask(ctx, REVIEWER_ROLE, session_id, snap)
+        if snap.status != "idle" or not snap.agent_replied:
             return ctx.task
         text = await sessions.last_agent_text(session_id, acting_user=ctx.owner)
         await self._stop(ctx, session_id)
@@ -1179,7 +1210,10 @@ class PrLoop:
         sessions = self._svc.sessions
         snap = await sessions.snapshot(session_id, acting_user=ctx.owner)
         if snap is not None and snap.status != "failed":
-            if snap.awaiting_human or snap.status != "idle" or not snap.agent_replied:
+            if snap.awaiting_human:
+                await self._note_child_ask(ctx, INTEGRATOR_ROLE, session_id, snap)
+                return None
+            if snap.status != "idle" or not snap.agent_replied:
                 return None
         text = (
             await sessions.last_agent_text(session_id, acting_user=ctx.owner)

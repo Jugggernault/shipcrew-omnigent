@@ -573,6 +573,30 @@ class ShipcrewStore:
         with self._session("list_tasks_by_status") as session:
             return [_task(r) for r in session.scalars(stmt).all()]
 
+    def record_intervention(self, task_id: str, entry: dict[str, Any]) -> Task | None:
+        """Append one intervention entry without moving the card.
+
+        For asks raised in a task's loop children (reviewer, integrator): the
+        card stays in Review, but the report counts them. An entry whose
+        ``ask_id`` is already recorded is ignored (the loop polls every tick).
+
+        :param entry: ``{"reason", "policy", "preview", "role", "ask_id"}``;
+            ``at`` is stamped here.
+        :returns: The task (unchanged when the entry was a duplicate), or
+            ``None`` when it does not exist.
+        """
+        with self._session("record_intervention") as session:
+            row = session.get(SqlTask, task_id)
+            if row is None:
+                return None
+            existing = [i for i in row.interventions or [] if isinstance(i, dict)]
+            ask_id = entry.get("ask_id")
+            if not ask_id or not any(i.get("ask_id") == ask_id for i in existing):
+                clean = {k: str(v)[:500] for k, v in entry.items() if v and k != "at"}
+                row.interventions = [*existing, {"at": time.time(), **clean}][-_MAX_INTERVENTIONS:]
+                row.updated_at = int(time.time())
+            return _task(row)
+
     def update_task(
         self,
         task_id: str,

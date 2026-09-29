@@ -234,6 +234,28 @@ class TestVerifyLoop:
         assert done.review["summary"] == "review skipped: tests-only diff with CI green"
         assert (repo / "e2e" / "cart.spec.ts").exists()
 
+    async def test_fix_task_owns_the_minor_findings_too(
+        self,
+        service: ShipcrewService,
+        sessions: RoleSessions,
+        repo: Path,
+        scheduler: ShipcrewScheduler,
+    ) -> None:
+        # Live run 2: a missing favicon (minor) survived the fix cycle because
+        # the fix task did not own it. Cheap minor fixes ride along now.
+        reply = FINDINGS_FAIL.replace(
+            "}]}",
+            '}, {"file": "app/favicon.ico", "line": null, "severity": "minor", '
+            '"message": "GET /favicon.ico is 404"}]}',
+        )
+        sessions.agents["qa"] = [_says(reply)]
+        task = await _verify_task(service, repo)
+        await run_until(scheduler, service, task.id, lambda t: len(t.depends_on) == 1)
+        (fix,) = [t for t in await _tasks(service, task.mission_id) if t.id != task.id]
+        assert fix.owned_paths[:2] == ["src/cart.js", "app/favicon.ico"]
+        assert "[minor] `app/favicon.ico`" in fix.body
+        assert "Fix the minor findings too when that is cheap" in fix.body
+
     async def test_fail_creates_one_fix_task_and_requeues_the_verify_card(
         self,
         service: ShipcrewService,
