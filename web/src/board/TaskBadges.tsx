@@ -96,7 +96,8 @@ export function ReviewBadge({ task, className }: { task: Task; className?: strin
 
 /** "Needs approval", with the policy reasons in a tooltip. */
 export function ApprovalBadge({ task, className }: { task: Task; className?: string }) {
-  if (!task.needs_human_approval) return null;
+  // Merged work needs nothing more (older rows may still carry the flag).
+  if (!task.needs_human_approval || task.status === "merged") return null;
   const reasons = task.approval_reasons;
   const label =
     reasons.length > 0 ? `Needs approval: ${reasons.join("; ")}` : "Needs approval before merge";

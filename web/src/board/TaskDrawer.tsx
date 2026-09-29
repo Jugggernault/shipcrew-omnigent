@@ -454,7 +454,7 @@ function TaskDrawerBody({
       <div className="flex min-h-0 flex-1 flex-col gap-5 overflow-y-auto px-5 py-4">
         {task.body && <p className="whitespace-pre-wrap text-ui">{task.body}</p>}
 
-        {task.needs_human_approval && (
+        {task.needs_human_approval && task.status === "intervention" && (
           <ApprovalSection task={task} onApprove={onApprove} approving={approving} />
         )}
 

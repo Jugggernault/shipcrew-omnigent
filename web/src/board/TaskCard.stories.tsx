@@ -104,6 +104,7 @@ export const ReviewRoundsExhausted: Story = {
       pr_url: "https://github.com/acme/app/pull/43",
       ci: "red",
       ci_attempts: 3,
+      blocked_reason: "reviewer requested changes 3 times: refunds are not idempotent",
       review: SAMPLE_REVIEW,
     }),
   },

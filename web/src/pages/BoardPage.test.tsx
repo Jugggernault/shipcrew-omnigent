@@ -424,6 +424,8 @@ describe("BoardPage", () => {
         id: "t_rounds",
         title: "Refund flow",
         status: "intervention",
+        pr_number: 9,
+        blocked_reason: "reviewer requested changes 3 times: refunds untested",
         review: { verdict: "changes", summary: "", findings: [] },
         position: 1,
       }),

@@ -1,10 +1,13 @@
-// Why a task sits in Intervention. The server sets the status for three
-// reasons (a guardrail ask, a merge awaiting approval, review rounds used up);
-// the task fields tell them apart, most specific first.
+// Why a task sits in Intervention. The server sets the status for a guardrail
+// ask, a merge awaiting approval, review rounds used up, or another PR-loop
+// hold (CI still red, a failed reviewer...); the task fields tell them apart,
+// most specific first. Loop holds always carry a blocked_reason, a guardrail
+// ask never does (the loop clears it before each developer turn), so a
+// "changes" verdict left over from an earlier round is not mistaken for one.
 
 import type { Task } from "./types";
 
-export type InterventionKind = "approval" | "review" | "guardrail";
+export type InterventionKind = "approval" | "review" | "hold" | "guardrail";
 
 export interface InterventionReason {
   kind: InterventionKind;
@@ -25,6 +28,11 @@ const REASONS: Record<InterventionKind, Omit<InterventionReason, "kind">> = {
     short: "Reviews used up",
     detail: "The reviewer asked for changes three times. Read the review and step in.",
   },
+  hold: {
+    label: "Held by the PR loop",
+    short: "PR loop hold",
+    detail: "The PR loop stopped on this card. Read the reason, then request changes or fix it.",
+  },
   guardrail: {
     label: "Guardrail ask pending",
     short: "Guardrail ask",
@@ -34,10 +42,13 @@ const REASONS: Record<InterventionKind, Omit<InterventionReason, "kind">> = {
 
 export function interventionReason(task: Task): InterventionReason | null {
   if (task.status !== "intervention") return null;
+  const loopHold = task.pr_number !== null && Boolean(task.blocked_reason);
   const kind: InterventionKind = task.needs_human_approval
     ? "approval"
-    : task.review?.verdict === "changes"
+    : loopHold && task.review?.verdict === "changes"
       ? "review"
-      : "guardrail";
+      : loopHold
+        ? "hold"
+        : "guardrail";
   return { kind, ...REASONS[kind] };
 }

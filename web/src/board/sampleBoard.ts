@@ -75,6 +75,7 @@ export const SAMPLE_TASKS: Task[] = [
     pr_url: "https://github.com/acme/app/pull/43",
     ci: "green",
     ci_attempts: 2,
+    blocked_reason: "reviewer requested changes 3 times: refunds are not idempotent",
     review: SAMPLE_REVIEW,
     root_session_id: "conv_6",
     cost_usd: 2.1,

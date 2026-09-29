@@ -18,9 +18,11 @@ describe("interventionReason", () => {
     expect(interventionReason(task)?.kind).toBe("approval");
   });
 
-  it("names exhausted review rounds when the last verdict asked for changes", () => {
+  it("names exhausted review rounds when the loop holds a changes verdict", () => {
     const task = makeTask({
       status: "intervention",
+      pr_number: 3,
+      blocked_reason: "reviewer requested changes 3 times: x",
       review: { verdict: "changes", summary: "", findings: [] },
     });
     expect(interventionReason(task)).toMatchObject({
@@ -39,5 +41,21 @@ describe("interventionReason", () => {
       review: { verdict: "approve", summary: "", findings: [] },
     });
     expect(interventionReason(approved)?.kind).toBe("guardrail");
+    // A guardrail ask during a fix turn after an earlier CHANGES round.
+    const fixing = makeTask({
+      status: "intervention",
+      pr_number: 3,
+      review: { verdict: "changes", summary: "", findings: [] },
+    });
+    expect(interventionReason(fixing)?.kind).toBe("guardrail");
+  });
+
+  it("names other PR-loop holds", () => {
+    const task = makeTask({
+      status: "intervention",
+      pr_number: 3,
+      blocked_reason: "CI still red after 3 fix attempts: ci",
+    });
+    expect(interventionReason(task)).toMatchObject({ kind: "hold", short: "PR loop hold" });
   });
 });
