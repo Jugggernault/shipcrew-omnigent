@@ -71,6 +71,7 @@ import {
 } from "@/components/ui/dialog";
 import { Spinner } from "@/components/ui/spinner";
 import { showToast } from "@/components/ui/toast";
+import { syncToast } from "@/board/syncReport";
 import { useViewerId } from "@/hooks/useViewerId";
 import { useSearchParams } from "@/lib/routing";
 import { cn } from "@/lib/utils";
@@ -187,7 +188,7 @@ export function BoardPage() {
   const sync = useCallback(
     (target: Mission) =>
       mutateSync(target, {
-        onSuccess: () => showToast("GitHub sync done"),
+        onSuccess: ({ sync: report }) => showToast(syncToast(report)),
         onError: (error) => showToast(`Could not sync with GitHub: ${errorMessage(error)}`),
       }),
     [mutateSync],

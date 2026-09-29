@@ -11,6 +11,7 @@ import type {
   CreateTaskInput,
   Mission,
   MissionStreamEvent,
+  SyncMissionResponse,
   Task,
   TaskPatch,
 } from "./types";
@@ -106,8 +107,10 @@ export function planMission(missionId: string, prd?: string): Promise<Mission> {
 }
 
 /** Force a GitHub issue/PR sync of the mission now. */
-export function syncMission(missionId: string): Promise<Mission> {
-  return request<Mission>(`/missions/${encodeURIComponent(missionId)}/sync`, { method: "POST" });
+export function syncMission(missionId: string): Promise<SyncMissionResponse> {
+  return request<SyncMissionResponse>(`/missions/${encodeURIComponent(missionId)}/sync`, {
+    method: "POST",
+  });
 }
 
 /** Approve a merge that waits on `needs_human_approval`. */
@@ -397,7 +400,7 @@ export function useSyncMission() {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: (mission: Mission) => syncMission(mission.id),
-    onSuccess: (updated) => {
+    onSuccess: ({ sync: _report, ...updated }) => {
       upsertCachedMission(queryClient, updated);
       // Issue and PR links land on the tasks; reconcile in case events were missed.
       void queryClient.invalidateQueries({ queryKey: tasksQueryKey(updated.id) });

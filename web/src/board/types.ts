@@ -25,6 +25,22 @@ export interface Mission {
   created_at: number;
 }
 
+/**
+ * Outcome of `POST /missions/{id}/sync`. The route returns the Mission plus this
+ * `sync` key (an additive extension of the contract) so a no-op can say why.
+ */
+export interface MissionSyncReport {
+  /** The sync ran against GitHub. */
+  ok: boolean;
+  /** Why it did not run or failed (e.g. gh not logged in), else null. */
+  reason: string | null;
+  created: number;
+  updated: number;
+  synced_at: number;
+}
+
+export type SyncMissionResponse = Mission & { sync?: MissionSyncReport };
+
 export const TASK_STATUSES = [
   "backlog",
   "ready",
