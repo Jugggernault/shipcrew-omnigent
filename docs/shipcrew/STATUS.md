@@ -52,6 +52,21 @@ claude-native sessions on the Claude subscription login:
   allowlist on. `scripts/validate_agents.py` also runs 49 guardrail cases per
   bundle.
 
+- **Worker permissions.** There is no `bypassPermissions`.
+  - Each role has a shell allowlist (`omnigent/shipcrew/policies.py`,
+    configured in the bundles' `_shared/policies/`). Allowlisted commands run
+    with no prompt.
+  - Any other command is an ASK approval card, and the card goes to
+    Intervention.
+  - A write outside the task's `owned_paths`, or to `package.json` or a
+    lockfile that the task does not own by name, is an ASK too. Task start
+    injects the owned paths and the worktree root into the bundle.
+  - claude-native bundles run in Claude's `default` mode with `--allowedTools`
+    set to the tools that the guardrails govern, so Claude adds no second
+    prompt.
+  - Verified live, 2026-09-29: see the shipcrew repo `agents/README.md`, "Live
+    check".
+
 ## What is stubbed or missing
 
 - **PR loop** (`omnigent/shipcrew/pr_loop.py`): only signatures and TODOs. This
@@ -147,6 +162,12 @@ server side is `omnigent/shipcrew/router.py` and the client side is
 - `pyproject.toml`: 1 package-data line.
 - `web/src/App.tsx`: a lazy `/board` route (+5 lines).
 - `web/src/shell/Sidebar.tsx`: the Board nav item (+3 lines).
+- `omnigent/policies/builtins/__init__.py`: registers `omnigent.shipcrew.policies`
+  in `BUILTIN_POLICY_MODULES` (+2 lines), so uploaded bundles may use the
+  shipcrew guardrails.
+- `omnigent/server/routes/_sessions/helpers.py`: claude-native
+  `executor.config.allowed_tools` becomes the `--allowedTools` launch flag
+  (+8 lines in `_derive_terminal_launch_args_from_spec`).
 
 Everything else is new: `omnigent/shipcrew/`, its own Alembic lineage
 (`shipcrew_alembic_version`), `web/src/board/`, `web/src/pages/BoardPage*`,
