@@ -51,8 +51,10 @@ class ShipcrewScheduler:
             except Exception:
                 # A failing tick must never kill the loop; the next one retries.
                 # Log the traceback once per failure streak, not every tick.
-                log = _logger.debug if failing else _logger.exception
-                log("shipcrew scheduler tick failed")
+                if failing:
+                    _logger.debug("shipcrew scheduler tick still failing", exc_info=True)
+                else:
+                    _logger.exception("shipcrew scheduler tick failed")
                 failing = True
             else:
                 failing = False

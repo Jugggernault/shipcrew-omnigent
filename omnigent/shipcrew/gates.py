@@ -121,7 +121,13 @@ class GateContext:
 
     @property
     def active(self) -> list[Task]:
+        """In-flight tasks, whoever works them (they all own their paths)."""
         return [t for t in self.tasks_by_id.values() if t.status in ACTIVE_STATUSES]
+
+    @property
+    def agent_active(self) -> list[Task]:
+        """In-flight tasks that hold an agent slot (a human took the others)."""
+        return [t for t in self.active if not t.human_assigned]
 
     @property
     def spent_usd(self) -> float:
@@ -133,7 +139,7 @@ def evaluate_gates(task: Task, ctx: GateContext) -> str | None:
     active = ctx.active
     return (
         deps_gate(task, ctx.tasks_by_id)
-        or capacity_gate(len(active), ctx.max_parallel)
+        or capacity_gate(len(ctx.agent_active), ctx.max_parallel)
         or overlap_gate(task, active, ctx.repo_of)
         or budget_gate(ctx.spent_usd, ctx.max_usd)
     )

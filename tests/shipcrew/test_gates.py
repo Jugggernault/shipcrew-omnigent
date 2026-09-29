@@ -17,7 +17,7 @@ from omnigent.shipcrew.gates import (
     overlap_gate,
     paths_overlap,
 )
-from omnigent.shipcrew.store import Task
+from omnigent.shipcrew.store import Assignee, Task
 
 
 def _t(tid: str, mission_id: str = "m1", **kw: Any) -> Task:
@@ -144,6 +144,15 @@ class TestEvaluateGates:
         task = _t("a", status="ready", owned_paths=["p3/**"])
         reason = evaluate_gates(task, self._ctx(r1, r2, task, max_parallel=2))
         assert reason == "capacity: 2/2 agents running"
+
+    def test_human_taken_task_frees_its_agent_slot_but_keeps_its_paths(self) -> None:
+        human = Assignee(kind="human", id="alice")
+        taken = _t("h", status="running", assignee=human, owned_paths=["p1/**"])
+        task = _t("a", status="ready", owned_paths=["p2/**"])
+        assert evaluate_gates(task, self._ctx(taken, task, max_parallel=1)) is None
+        clash = _t("b", status="ready", owned_paths=["p1/x.py"])
+        reason = evaluate_gates(clash, self._ctx(taken, clash, max_parallel=1))
+        assert reason is not None and reason.startswith("owned paths overlap")
 
     def test_budget_sums_every_task(self) -> None:
         done = _t("done", status="merged", cost_usd=7.5, owned_paths=["p1/**"])
