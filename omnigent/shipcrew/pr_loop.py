@@ -287,6 +287,7 @@ def reviewer_prompt(
         f"- Branch `{branch}`, head `{head_sha}`.",
         f"- Base `{base_ref}` at `{base_sha}`.",
         f"- Saved diff snapshot (`git diff {base_ref}...HEAD`): `{diff_path}`",
+        f"  If that file is unreadable, run `git diff {base_ref}...HEAD` in this worktree.",
         "",
         "## Task contract",
         f"### {task.title}",
@@ -510,10 +511,20 @@ class PrLoop:
     # ── tick ──
 
     async def tick(self) -> None:
-        """Advance every agent-run review card one step, concurrently."""
-        tasks = await self._io(self._svc.store.list_tasks_by_status, {"review"})
-        runnable = [t for t in tasks if t.root_session_id and not t.human_assigned]
-        await asyncio.gather(*(self._advance_safely(t) for t in runnable))
+        """Advance every agent-run review card one step, concurrently.
+
+        Held cards (:func:`is_loop_hold`) are only checked for a PR that a
+        human merged or closed on GitHub meanwhile.
+        """
+        tasks = await self._io(self._svc.store.list_tasks_by_status, {"review", "intervention"})
+        steps = [
+            self._advance_safely(t)
+            for t in tasks
+            if t.root_session_id
+            and not t.human_assigned
+            and (t.status == "review" or is_loop_hold(t))
+        ]
+        await asyncio.gather(*steps)
 
     async def _advance_safely(self, task: Task) -> None:
         try:
@@ -537,6 +548,8 @@ class PrLoop:
             return await self._finish_merged(ctx)
         if pr.state == "CLOSED":
             return await self._block(ctx, f"PR #{task.pr_number} was closed without merging")
+        if task.status != "review":
+            return task  # a hold waits for a human
         if ctx.worktree is None:
             return await self._hold(ctx, f"worktree of branch {ctx.branch} is missing")
         integrated = False

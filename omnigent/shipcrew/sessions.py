@@ -43,7 +43,7 @@ class SessionServiceError(RuntimeError):
 class RootSessionRequest:
     """Everything needed to start a task's root session.
 
-    :param branch: Git branch for the task worktree, e.g. ``"task/<id>"``.
+    :param branch: Git branch for the task worktree, e.g. ``"shipcrew/<id8>-<slug>"``.
     :param acting_user: Identity the session is created for (its owner).
     """
 

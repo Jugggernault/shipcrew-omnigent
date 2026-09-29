@@ -442,6 +442,15 @@ class TestCi:
             await scheduler.tick()
         assert (await service.require_task(task.id)).status == "intervention"
         assert sessions.children == []
+        # A human merges the PR on GitHub: the card follows and cleans up.
+        fake_gh = [str(FAKE_GH)]
+        subprocess.run([*fake_gh, "pr", "ready", str(held.pr_number)], check=True, cwd=repo)
+        subprocess.run(
+            [*fake_gh, "pr", "merge", str(held.pr_number), "--squash"], check=True, cwd=repo
+        )
+        merged = await run_until(scheduler, service, task.id, status_is("merged"), 2)
+        assert task.root_session_id in sessions.stopped
+        assert merged.blocked_reason is None
 
     async def test_no_checks_counts_as_green(
         self,
