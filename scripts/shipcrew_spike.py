@@ -262,6 +262,10 @@ class Run:
     error: str | None = None
 
 
+def branch(tag: str, run: Run) -> str:
+    return f"spike/{tag}-{run.name}"
+
+
 def create_session(
     client: httpx.Client, run: Run, host_id: str, agent_id: str, repo: str, tag: str
 ) -> None:
@@ -269,7 +273,7 @@ def create_session(
         "agent_id": agent_id,
         "host_id": host_id,
         "workspace": repo,
-        "git": {"branch_name": f"spike/{tag}-{run.name}"},
+        "git": {"branch_name": branch(tag, run)},
         "title": f"spike {run.name}",
         "labels": NATIVE_LABELS,
         "terminal_launch_args": LAUNCH_ARGS,
@@ -347,6 +351,27 @@ def drive(
 
 def stop_session(client: httpx.Client, session_id: str) -> None:
     client.post(f"/v1/sessions/{session_id}/events", json={"type": "stop_session", "data": {}})
+
+
+def pretrust_worktrees(repo: str, branches: list[str]) -> list[str]:
+    """Seed Claude's folder-trust flag for every worktree a batch will create.
+
+    omnigent pre-accepts trust per worktree (``ensure_claude_workspace_trusted``)
+    right before each launch, but that read-modify-write of ``~/.claude.json``
+    races with the other Claude processes starting at the same moment: with 6
+    simultaneous launches 3 lost their entry and hung on the "Accessing
+    workspace" dialog. Trust on the parent ``<repo>-worktrees/`` directory is
+    NOT inherited (tested). Writing every entry up front, before any Claude
+    of the batch starts, means each one boots from a file that already holds
+    all of them. The paths are deterministic (omnigent's own resolver).
+    """
+    from omnigent.harnesses.claude_native.bridge import ensure_claude_workspace_trusted
+    from omnigent.host.git_worktree import _resolve_worktree_path
+
+    paths = [_resolve_worktree_path(str(Path(repo).resolve()), b) for b in branches]
+    for path in paths:
+        ensure_claude_workspace_trusted(path)
+    return [str(p) for p in paths]
 
 
 def git_changes(workspace: str | None) -> str:
@@ -429,6 +454,11 @@ def main() -> None:
     )
     ap.add_argument("--parallel", type=int, default=3, help="phase-1 session count")
     ap.add_argument("--skip-child", action="store_true", help="skip the sub-agent phases")
+    ap.add_argument(
+        "--pretrust",
+        action="store_true",
+        help="seed ~/.claude.json trust for every phase-1 worktree before launching",
+    )
     ap.add_argument("--keep", action="store_true", help="leave sessions running")
     ap.add_argument("--out", default=None, help="write the JSON report here")
     args = ap.parse_args()
@@ -448,6 +478,8 @@ def main() -> None:
 
     # Phase 1: N parallel sessions, one worktree each.
     runs = [Run(name=f"p{i + 1}", prompt=PROMPTS[i % len(PROMPTS)]) for i in range(args.parallel)]
+    if args.pretrust:
+        report["pretrusted"] = pretrust_worktrees(args.repo, [branch(tag, r) for r in runs])
     t_all = time.monotonic()
     with ThreadPoolExecutor(len(runs)) as pool:
         futures = []
