@@ -1,4 +1,7 @@
-# Installed by shipcrew. Job name `ci` is the required status check on main: keep it.
+# Installed by shipcrew on main before the first task branch (omnigent/shipcrew/ci_install.py).
+# Job name `ci` is the required status check on main: keep it. Agents do not edit
+# this file (a change needs human approval); they make package.json scripts match it:
+# lint, typecheck, test, build, e2e. Each one runs only when the script exists.
 name: ci
 on:
   pull_request:
@@ -15,41 +18,70 @@ jobs:
     timeout-minutes: 30
     env:
       CI: "1"
-      CHROMIUM_PATH: /usr/bin/google-chrome  # preinstalled on GitHub runners: no Playwright download
+      # Google Chrome is preinstalled on ubuntu-latest: Playwright uses it
+      # (launchOptions.executablePath = process.env.CHROMIUM_PATH), never `playwright install`.
+      CHROMIUM_PATH: /usr/bin/google-chrome
+      PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1"
       NEXT_TELEMETRY_DISABLED: "1"
     steps:
       - uses: actions/checkout@v4
-      # pnpm when the repo has pnpm-lock.yaml (version from package.json "packageManager"), else npm.
+      # Package manager from the lockfile: pnpm-lock.yaml -> pnpm, yarn.lock -> yarn,
+      # else npm. No package.json yet (before the Foundation task): nothing to run.
       - id: pm
         run: |
+          out() { echo "$1=$2" >> "$GITHUB_OUTPUT"; }
+          if [ ! -f package.json ]; then out name ""; exit 0; fi
           if [ -f pnpm-lock.yaml ]; then
-            echo "name=pnpm" >> "$GITHUB_OUTPUT"
-            echo "install=pnpm install --frozen-lockfile --prefer-offline" >> "$GITHUB_OUTPUT"
-            echo "audit=pnpm audit --prod --audit-level high" >> "$GITHUB_OUTPUT"
+            out name pnpm; out cache pnpm
+            out install "pnpm install --frozen-lockfile --prefer-offline"
+            out audit "pnpm audit --prod --audit-level high"
+            # pnpm version: package.json "packageManager" when set, else pnpm 10.
+            grep -q '"packageManager": *"pnpm@' package.json && out pnpm "" || out pnpm 10
+          elif [ -f yarn.lock ]; then
+            out name yarn; out cache yarn
+            out install "yarn install --frozen-lockfile"
+            out audit "true"
+          elif [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ]; then
+            out name npm; out cache npm
+            out install "npm ci --prefer-offline --no-audit --no-fund"
+            out audit "npm audit --omit=dev --audit-level=high"
           else
-            echo "name=npm" >> "$GITHUB_OUTPUT"
-            echo "install=npm ci --prefer-offline --no-audit --no-fund" >> "$GITHUB_OUTPUT"
-            echo "audit=npm audit --omit=dev --audit-level=high" >> "$GITHUB_OUTPUT"
+            out name npm; out cache ""
+            out install "npm install --no-audit --no-fund"
+            out audit "true"
           fi
       - uses: pnpm/action-setup@v4
         if: steps.pm.outputs.name == 'pnpm'
+        with: { version: "${{ steps.pm.outputs.pnpm }}" }
       - uses: actions/setup-node@v4
-        with: { node-version: 22, cache: "${{ steps.pm.outputs.name }}" }
-      - run: ${{ steps.pm.outputs.install }}
+        if: steps.pm.outputs.name != ''
+        with: { node-version: 22, cache: "${{ steps.pm.outputs.cache }}" }
+      - if: steps.pm.outputs.name == 'yarn'
+        run: corepack enable
+      - if: steps.pm.outputs.name != ''
+        run: ${{ steps.pm.outputs.install }}
       # Next.js build cache: incremental builds across runs of the same lockfile.
       - uses: actions/cache@v4
+        if: steps.pm.outputs.name != ''
         with:
           path: .next/cache
-          key: next-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml', 'package-lock.json') }}-${{ github.sha }}
-          restore-keys: next-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml', 'package-lock.json') }}-
+          key: next-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml', 'package-lock.json', 'yarn.lock') }}-${{ github.sha }}
+          restore-keys: next-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml', 'package-lock.json', 'yarn.lock') }}-
       # lint, typecheck and unit tests are independent: run them at the same time,
       # then print each log in its own group; the step fails if any of them failed.
+      # A script that package.json does not define is skipped (the --if-present rule).
       - name: lint + typecheck + test (parallel)
+        if: steps.pm.outputs.name != ''
         env: { PM: "${{ steps.pm.outputs.name }}" }
         run: |
+          has() { node -e 'process.exit(require("./package.json").scripts?.[process.argv[1]] ? 0 : 1)' "$1"; }
           d="${RUNNER_TEMP:-/tmp}/ci"; mkdir -p "$d"
           for s in lint typecheck test; do
-            ( $PM run --if-present "$s" > "$d/$s.log" 2>&1; echo $? > "$d/$s.rc" ) &
+            if has "$s"; then
+              ( "$PM" run "$s" > "$d/$s.log" 2>&1; echo $? > "$d/$s.rc" ) &
+            else
+              echo "no \"$s\" script: skipped" > "$d/$s.log"; echo 0 > "$d/$s.rc"
+            fi
           done
           wait
           status=0
@@ -59,13 +91,21 @@ jobs:
             [ "$rc" = 0 ] || { echo "::error::$s failed"; status=1; }
           done
           exit $status
-      - run: ${{ steps.pm.outputs.name }} run build
-      - run: ${{ steps.pm.outputs.audit }}
-      - name: e2e (production build)
-        run: if [ -f playwright.config.ts ]; then npx playwright test; fi
+      - name: build
+        if: steps.pm.outputs.name != ''
+        env: { PM: "${{ steps.pm.outputs.name }}" }
+        run: |
+          if node -e 'process.exit(require("./package.json").scripts?.build ? 0 : 1)'; then "$PM" run build; else echo "no build script: skipped"; fi
+      - if: steps.pm.outputs.name != ''
+        run: ${{ steps.pm.outputs.audit }}
+      - name: e2e (production build, preinstalled Chrome)
+        if: steps.pm.outputs.name != ''
+        env: { PM: "${{ steps.pm.outputs.name }}" }
+        run: |
+          if node -e 'process.exit(require("./package.json").scripts?.e2e ? 0 : 1)'; then "$PM" run e2e; else echo "no e2e script: skipped"; fi
       - uses: actions/upload-artifact@v4
         if: failure()
-        with: { name: playwright-report, path: playwright-report, retention-days: 7 }
+        with: { name: playwright-report, path: playwright-report, retention-days: 7, if-no-files-found: ignore }
 
   codeql:
     # Code scanning is free on public repos only; private repos need GitHub Advanced Security.

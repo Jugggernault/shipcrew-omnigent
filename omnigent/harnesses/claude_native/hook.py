@@ -1082,7 +1082,10 @@ def _main_evaluate_policy(argv: list[str]) -> int:
         print("omnigent evaluate-policy hook: malformed Omnigent response", file=sys.stderr)
         return _fail_closed()
 
-    hook_output = evaluation_response_to_hook_output(hook_event, eval_response)
+    # shipcrew fork: an accepted ASK answers `allow` (no second Claude prompt).
+    hook_output = evaluation_response_to_hook_output(
+        hook_event, eval_response, honor_human_approval=True
+    )
     if hook_output is not None:
         sys.stdout.write(json.dumps(hook_output))
     return 0

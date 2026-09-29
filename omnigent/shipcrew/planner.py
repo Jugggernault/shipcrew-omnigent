@@ -22,6 +22,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.shipcrew.decisions import parse_decisions
+from omnigent.shipcrew.owned_tests import with_own_tests
 from omnigent.shipcrew.sessions import RootSessionRequest, SessionServiceError, SessionSnapshot
 from omnigent.shipcrew.store import Mission, PlanTaskSpec
 
@@ -192,7 +193,8 @@ def parse_plan(text: str) -> list[PlanTaskSpec]:
             acceptance=[a for a in t.acceptance if a.strip()],
             role=t.role,
             depends_on=deps[t.key],
-            owned_paths=list(t.owned_paths),
+            # The task's own tests (e2e spec, colocated tests) are owned too.
+            owned_paths=with_own_tests(t.title, t.owned_paths),
         )
         for t in plan.tasks
     ]

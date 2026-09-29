@@ -6554,7 +6554,10 @@ def _tool_relay_handler_factory(
                 )
                 self._respond_hook_output(fail_ask_hook_output(hook_event, last_error))
                 return
-            hook_output = evaluation_response_to_hook_output(hook_event, verdict)
+            # shipcrew fork: an accepted ASK answers `allow` (no second Claude prompt).
+            hook_output = evaluation_response_to_hook_output(
+                hook_event, verdict, honor_human_approval=True
+            )
             hook_specific = (hook_output or {}).get("hookSpecificOutput")
             decision = (
                 hook_specific.get("permissionDecision")

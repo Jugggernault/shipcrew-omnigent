@@ -42,6 +42,7 @@ import asyncio
 import json
 import logging
 import re
+import shutil
 import subprocess
 import time
 from collections.abc import Sequence
@@ -50,9 +51,10 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.shipcrew import gh
+from omnigent.shipcrew import gh, main_deps
 from omnigent.shipcrew.branches import task_branch
 from omnigent.shipcrew.decisions import merge_decisions, parse_decisions
+from omnigent.shipcrew.deps_seed import seed_node_modules
 from omnigent.shipcrew.policies import paths_outside_owned
 from omnigent.shipcrew.review_policy import (
     changed_lines,
@@ -77,6 +79,13 @@ if TYPE_CHECKING:
 _logger = logging.getLogger(__name__)
 
 MAX_CI_FIX_ATTEMPTS = 3
+# A turn that ends without PASS/FAIL (a declined ask interrupted it, or the
+# agent forgot) gets this many automatic nudges before the card blocks.
+MAX_VERDICT_NUDGES = 1
+VERDICT_NUDGE = (
+    "That action was declined or no verdict was found: continue without it, finish the "
+    "task, end with Decisions + a single PASS or FAIL line."
+)
 MAX_REVIEW_ROUNDS = 3
 # A reviewer/integrator that fails to start is retried on the next ticks
 # before the card is held for a human.
@@ -486,6 +495,65 @@ def default_base_ref(repo_path: str, base: str) -> str | None:
         return None
 
 
+# ── reviewer worktrees ──────────────────────────────────────────
+#
+# Every loop child runs in its own workspace, on its own host runner: a child
+# sharing the developer's runner took it down when the loop stopped the child
+# (the host stops the runner bound to the stopped session). The reviewer gets
+# a detached checkout of the PR head next to the task worktrees
+# (``<repo>-worktrees/``, the host's layout), removed once its verdict is read.
+
+_REVIEW_PREFIX = "shipcrew-review-"
+
+
+def review_worktree_path(repo: Path, task_id: str, head: str) -> Path:
+    """Where the reviewer of ``task_id`` at ``head`` works, e.g.
+    ``/work/app-worktrees/shipcrew-review-1a2b3c4d-deadbeef``."""
+    return repo.parent / f"{repo.name}-worktrees" / f"{_REVIEW_PREFIX}{task_id[:8]}-{head[:8]}"
+
+
+def add_review_worktree(repo: Path, task_id: str, head: str) -> Path:
+    """A detached worktree of ``head`` for the reviewer (reused when already there)."""
+    path = review_worktree_path(repo, task_id, head)
+    remove_review_worktrees(repo, task_id, keep=path)
+    if path.exists():
+        try:
+            if _rev(path, "HEAD") == head:
+                return path
+        except GitError:
+            pass
+        _remove_worktree_dir(repo, path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _git(["worktree", "add", "--detach", "--force", str(path), head], repo)
+    # Best effort: the reviewer may re-run the suite (same seed as task worktrees).
+    try:
+        seed_node_modules(str(repo), str(path))
+    except Exception:  # noqa: BLE001 - seeding never blocks a review
+        _logger.debug("shipcrew: node_modules seed failed for %s", path, exc_info=True)
+    return path
+
+
+def remove_review_worktrees(repo: Path, task_id: str, *, keep: Path | None = None) -> None:
+    """Remove the task's reviewer worktrees (all, or all but ``keep``). Idempotent."""
+    base = repo.parent / f"{repo.name}-worktrees"
+    if not base.is_dir():
+        return
+    removed = False
+    for path in base.glob(f"{_REVIEW_PREFIX}{task_id[:8]}-*"):
+        if keep is not None and path == keep:
+            continue
+        _remove_worktree_dir(repo, path)
+        removed = True
+    if removed:
+        _git(["worktree", "prune"], repo, check=False)
+
+
+def _remove_worktree_dir(repo: Path, path: Path) -> None:
+    _git(["worktree", "remove", "--force", str(path)], repo, check=False)
+    if path.exists():
+        shutil.rmtree(path, ignore_errors=True)
+
+
 # ── The loop ────────────────────────────────────────────────────
 
 
@@ -556,6 +624,7 @@ class PrLoop:
         if ctx.task.reviewer_session_id and (ctx.task.review or {}).get("verdict") is None:
             await self._stop(ctx, ctx.task.reviewer_session_id)
         await self._stop(ctx, ctx.task.integrator_session_id)
+        await self._io(remove_review_worktrees, ctx.repo, ctx.task.id)
 
     @staticmethod
     async def _io(fn: Any, *args: Any, **kwargs: Any) -> Any:
@@ -620,7 +689,14 @@ class PrLoop:
         prompt: str,
         *,
         reasoning_effort: str | None = None,
+        workspace: Path | None = None,
     ) -> str:
+        """Start a loop child in ``workspace`` (default: the task worktree).
+
+        The child is host-bound (its own runner, see
+        ``OmnigentSessionService.create_child_session``): stopping it never
+        takes down the developer's runner.
+        """
         agent_dir = self._bundle(role)
         if agent_dir is None:
             raise SessionServiceError(
@@ -632,7 +708,7 @@ class PrLoop:
                 parent_session_id=ctx.task.root_session_id,
                 title=title,
                 prompt=prompt,
-                workspace=str(ctx.worktree),
+                workspace=str(workspace or ctx.worktree),
                 agent_dir=agent_dir,
                 acting_user=ctx.owner,
                 labels={
@@ -735,7 +811,25 @@ class PrLoop:
             ctx.task.root_session_id, acting_user=ctx.owner
         )
         await self.record_decisions(ctx.task, text)
-        return parse_verdict(text)
+        verdict = parse_verdict(text)
+        if verdict is not None:
+            await self.clear_verdict_nudges(ctx.task)
+        return verdict
+
+    async def clear_verdict_nudges(self, task: Task) -> None:
+        """A verdict arrived: the next verdict-less turn gets its nudge again."""
+        if task.verdict_nudges:
+            await self._svc._update(task.id, verdict_nudges=0)
+
+    async def _nudge_or_block(self, ctx: _Ctx, reason: str) -> Task:
+        """No PASS/FAIL line: one automatic nudge turn, then block.
+
+        The count is stored before the message is sent, so a restart never
+        nudges twice.
+        """
+        if ctx.task.verdict_nudges < MAX_VERDICT_NUDGES:
+            return await self._send(ctx, VERDICT_NUDGE, verdict_nudges=ctx.task.verdict_nudges + 1)
+        return await self._block(ctx, reason)
 
     async def record_decisions(self, task: Task, text: str | None) -> None:
         """Merge the ``Decisions:`` list of an agent reply into ``task.decisions``."""
@@ -756,7 +850,9 @@ class PrLoop:
                 return handled
         verdict = await self._developer_verdict(ctx)
         if verdict is None:
-            return await self._block(ctx, "developer ended its turn without a PASS/FAIL line")
+            return await self._nudge_or_block(
+                ctx, "developer ended its turn without a PASS/FAIL line"
+            )
         if verdict[0] == "fail":
             return await self._block(ctx, f"developer reported FAIL: {verdict[1]}")
         if ctx.worktree is None:
@@ -816,9 +912,12 @@ class PrLoop:
             )
         if not integrated:
             verdict = await self._developer_verdict(ctx)
-            if verdict is None or verdict[0] != "pass":
-                reason = verdict[1] if verdict else "no PASS/FAIL line"
-                return await self._block(ctx, f"developer did not pass its fix turn: {reason}")
+            if verdict is None:
+                return await self._nudge_or_block(
+                    ctx, "developer did not pass its fix turn: no PASS/FAIL line"
+                )
+            if verdict[0] != "pass":
+                return await self._block(ctx, f"developer did not pass its fix turn: {verdict[1]}")
         push = await self._io(
             _git, ["push", "origin", f"HEAD:refs/heads/{ctx.branch}"], ctx.worktree, check=False
         )
@@ -897,6 +996,7 @@ class PrLoop:
         if reason is None:
             return None
         await self._stop(ctx, ctx.task.reviewer_session_id)
+        await self._io(remove_review_worktrees, ctx.repo, ctx.task.id)
         task = await self._update(
             ctx.task,
             review={"verdict": "approve", "summary": f"review skipped: {reason}", "findings": []},
@@ -929,6 +1029,9 @@ class PrLoop:
             head_sha=head,
             diff_path=str(diff_path),
         )
+        # Its own detached checkout of the head: its own runner, and nothing it
+        # runs (tests, builds) touches the developer's worktree.
+        review_dir = await self._io(add_review_worktree, ctx.repo, ctx.task.id, head)
         try:
             session_id = await self._start_child(
                 ctx,
@@ -937,6 +1040,7 @@ class PrLoop:
                 prompt,
                 # A small diff needs less thinking: a faster, cheaper review.
                 reasoning_effort=review_effort(lines),
+                workspace=review_dir,
             )
         except SessionServiceError as exc:
             if not self._child_start_failed(ctx, REVIEWER_ROLE):
@@ -961,11 +1065,13 @@ class PrLoop:
             return await self._start_reviewer(ctx, head)
         if snap.status == "failed":
             await self._stop(ctx, session_id)
+            await self._io(remove_review_worktrees, ctx.repo, ctx.task.id)
             return await self._hold(ctx, f"reviewer session failed: {snap.error or 'unknown'}")
         if snap.awaiting_human or snap.status != "idle" or not snap.agent_replied:
             return ctx.task
         text = await sessions.last_agent_text(session_id, acting_user=ctx.owner)
         await self._stop(ctx, session_id)
+        await self._io(remove_review_worktrees, ctx.repo, ctx.task.id)
         review = parse_review(text)
         if review is None:
             return await self._hold(ctx, "reviewer ended without an APPROVE / CHANGES line")
@@ -1043,6 +1149,10 @@ class PrLoop:
 
     async def _start_integrator(self, ctx: _Ctx) -> Task:
         prompt = integrator_prompt(ctx.task, branch=ctx.branch, base_ref=ctx.base_ref)
+        # git allows one worktree per branch, so the integrator works in the
+        # task worktree: stop the (idle) developer first so only one agent owns
+        # it. A later developer turn (CI fix) relaunches its runner on message.
+        await self._stop(ctx, ctx.task.root_session_id)
         try:
             session_id = await self._start_child(
                 ctx, INTEGRATOR_ROLE, f"Merge main: {ctx.task.title}", prompt
@@ -1095,6 +1205,7 @@ class PrLoop:
             task.root_session_id,
         ):
             await self._stop(ctx, session_id)
+        await self._io(remove_review_worktrees, ctx.repo, task.id)
         await self._io(_cleanup_worktree, ctx.repo, ctx.worktree, ctx.branch, ctx.base)
         if task.role in VERIFY_ROLES:
             await self._io(drop_tests_branches, ctx.repo, task.id)
@@ -1177,6 +1288,7 @@ def _replace(ctx: _Ctx, task: Task) -> _Ctx:
 
 def _cleanup_worktree(repo: Path, worktree: Path | None, branch: str, base: str) -> None:
     """Remove the task worktree + local branch; fast-forward a clean local base."""
+    staged = main_deps.stage_worktree_modules(repo, worktree)
     if worktree is not None and worktree.exists():
         _git(["worktree", "remove", "--force", str(worktree)], repo, check=False)
     _git(["worktree", "prune"], repo, check=False)
@@ -1188,3 +1300,5 @@ def _cleanup_worktree(repo: Path, worktree: Path | None, branch: str, base: str)
     clean = _git(["status", "--porcelain", "--untracked-files=no"], repo, check=False)
     if current.stdout.strip() == base and clean.returncode == 0 and not clean.stdout.strip():
         _git(["merge", "--ff-only", "--quiet", f"origin/{base}"], repo, check=False)
+    # Keep the main checkout's node_modules current so new worktrees seed from it.
+    main_deps.refresh_after_merge(repo, base, staged)

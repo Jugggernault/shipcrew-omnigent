@@ -381,26 +381,77 @@ class TestCiTemplate:
         assert wf["concurrency"]["cancel-in-progress"] is True
         steps = wf["jobs"]["ci"]["steps"]
         setup_node = next(s for s in steps if s.get("uses", "").startswith("actions/setup-node"))
-        assert setup_node["with"]["cache"] == "${{ steps.pm.outputs.name }}"
+        assert setup_node["with"]["cache"] == "${{ steps.pm.outputs.cache }}"
         pm = next(s for s in steps if s.get("id") == "pm")["run"]
         assert "pnpm install --frozen-lockfile --prefer-offline" in pm
         assert "npm ci --prefer-offline --no-audit --no-fund" in pm
+        assert "yarn install --frozen-lockfile" in pm
         assert any(s.get("uses", "").startswith("pnpm/action-setup") for s in steps)
+        env = wf["jobs"]["ci"]["env"]
+        assert env["CHROMIUM_PATH"] == "/usr/bin/google-chrome"
+        assert "playwright install" not in yaml.safe_dump(wf)
+
+    @pytest.mark.parametrize(
+        ("files", "outputs"),
+        [
+            ({}, {"name": ""}),  # before the Foundation task: nothing to run
+            ({"package.json": "{}", "pnpm-lock.yaml": ""}, {"name": "pnpm", "pnpm": "10"}),
+            (
+                {"package.json": '{"packageManager": "pnpm@9.1.0"}', "pnpm-lock.yaml": ""},
+                {"name": "pnpm", "pnpm": ""},
+            ),
+            ({"package.json": "{}", "yarn.lock": ""}, {"name": "yarn", "cache": "yarn"}),
+            ({"package.json": "{}", "package-lock.json": "{}"}, {"name": "npm", "cache": "npm"}),
+            ({"package.json": "{}"}, {"name": "npm", "cache": ""}),
+        ],
+    )
+    def test_package_manager_from_the_lockfile(
+        self, tmp_path: Path, files: dict[str, str], outputs: dict[str, str]
+    ) -> None:
+        steps = self._workflow()["jobs"]["ci"]["steps"]
+        script = next(s for s in steps if s.get("id") == "pm")["run"]
+        for name, content in files.items():
+            (tmp_path / name).write_text(content)
+        out = tmp_path / "out"
+        env = {**os.environ, "GITHUB_OUTPUT": str(out)}
+        subprocess.run(["bash", "-e", "-c", script], cwd=tmp_path, env=env, check=True, timeout=30)
+        got = dict(line.split("=", 1) for line in out.read_text().splitlines())
+        assert {k: got[k] for k in outputs} == outputs
 
     def test_parallel_checks_step_runs_all_three_and_fails_on_any(self, tmp_path: Path) -> None:
         steps = self._workflow()["jobs"]["ci"]["steps"]
         script = next(s for s in steps if s.get("name", "").startswith("lint + typecheck"))["run"]
         fake_pm = tmp_path / "pm"
-        # `pm run --if-present <script>`: every script sleeps 0.5 s; typecheck fails.
-        fake_pm.write_text('#!/bin/sh\nsleep 0.5\necho "ran $3"\n[ "$3" != typecheck ]\n')
+        # `pm run <script>`: every script sleeps 0.5 s; typecheck fails.
+        fake_pm.write_text('#!/bin/sh\nsleep 0.5\necho "ran $2"\n[ "$2" != typecheck ]\n')
         fake_pm.chmod(0o755)
+        (tmp_path / "package.json").write_text(
+            '{"scripts": {"lint": "x", "typecheck": "x", "test": "x"}}'
+        )
         env = {**os.environ, "PM": str(fake_pm), "RUNNER_TEMP": str(tmp_path)}
         began = time.monotonic()
         done = subprocess.run(
-            ["bash", "-c", script], env=env, capture_output=True, text=True, timeout=30
-        )
+            ["bash", "-c", script], cwd=tmp_path, env=env, capture_output=True, text=True,
+            timeout=30,
+        )  # fmt: skip
         elapsed = time.monotonic() - began
         assert done.returncode == 1
         assert "::error::typecheck failed" in done.stdout
         assert all(f"ran {s}" in done.stdout for s in ("lint", "typecheck", "test"))
         assert elapsed < 1.4  # three 0.5 s scripts side by side, not 1.5 s in a row
+
+    def test_missing_scripts_are_skipped(self, tmp_path: Path) -> None:
+        steps = self._workflow()["jobs"]["ci"]["steps"]
+        script = next(s for s in steps if s.get("name", "").startswith("lint + typecheck"))["run"]
+        fake_pm = tmp_path / "pm"
+        fake_pm.write_text('#!/bin/sh\necho "ran $2"\n')
+        fake_pm.chmod(0o755)
+        (tmp_path / "package.json").write_text('{"scripts": {"test": "x"}}')
+        env = {**os.environ, "PM": str(fake_pm), "RUNNER_TEMP": str(tmp_path)}
+        done = subprocess.run(
+            ["bash", "-c", script], cwd=tmp_path, env=env, capture_output=True, text=True,
+            timeout=30,
+        )  # fmt: skip
+        assert done.returncode == 0
+        assert "ran test" in done.stdout and "ran lint" not in done.stdout
+        assert 'no "lint" script: skipped' in done.stdout

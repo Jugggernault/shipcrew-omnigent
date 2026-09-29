@@ -901,3 +901,47 @@ def test_documented_tool_response_takes_precedence() -> None:
     )
     assert result is not None
     assert result["event"]["data"]["result"] == "actual result"
+
+
+# ── shipcrew fork: an accepted ASK is not asked twice ─────────────────
+
+
+def test_pre_tool_use_human_approved_allow_answers_allow_for_claude() -> None:
+    """An ASK the human accepted maps to ``allow``, so Claude does not prompt again."""
+    response = {"result": "POLICY_ACTION_ALLOW", "human_approved": True}
+    output = evaluation_response_to_hook_output("PreToolUse", response, honor_human_approval=True)
+    assert output is not None
+    assert output["hookSpecificOutput"]["permissionDecision"] == "allow"
+
+
+@pytest.mark.parametrize(
+    ("response", "honor"),
+    [
+        ({"result": "POLICY_ACTION_ALLOW"}, True),  # plain / no-match ALLOW
+        ({"result": "POLICY_ACTION_ALLOW", "human_approved": "yes"}, True),  # not a bool
+        ({"result": "POLICY_ACTION_ALLOW", "human_approved": True}, False),  # other harnesses
+    ],
+)
+def test_pre_tool_use_other_allows_keep_no_opinion(
+    response: dict[str, object], honor: bool
+) -> None:
+    """Only a flagged ALLOW on claude-native forces allow; the rest defers to Claude."""
+    assert (
+        evaluation_response_to_hook_output("PreToolUse", response, honor_human_approval=honor)
+        is None
+    )
+
+
+def test_human_approved_flag_never_overrides_a_deny() -> None:
+    response = {"result": "POLICY_ACTION_DENY", "reason": "no", "human_approved": True}
+    output = evaluation_response_to_hook_output("PreToolUse", response, honor_human_approval=True)
+    assert output is not None
+    assert output["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
+def test_post_tool_use_ignores_human_approved() -> None:
+    response = {"result": "POLICY_ACTION_ALLOW", "human_approved": True}
+    assert (
+        evaluation_response_to_hook_output("PostToolUse", response, honor_human_approval=True)
+        is None
+    )

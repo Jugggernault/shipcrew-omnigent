@@ -7,17 +7,21 @@ Five :class:`FunctionPolicy` factories, registered through
   with no prompt only when every simple command in it matches the role's
   allowlist; anything else is ASK (an approval card in the Inbox, which moves
   the board card to Intervention). Unanalyzable commands (command
-  substitution, heredocs, unbalanced quotes) are ASK too.
+  substitution, heredocs, unbalanced quotes) are ASK too. ``$?``-style
+  special parameters always pass; ``$VAR`` only in read-only commands and for
+  vetted names; ``sed -i`` / ``perl -pi`` substitutions are modelled as writes.
 * :func:`owned_paths` -- the task's ``owned_paths`` contract. File writes
   (``Write`` / ``Edit`` / ``sys_os_write`` / shell redirections / ``cp``,
   ``mv``, ``rm``, ``git mv`` ... / formatter ``--write`` / dependency changes)
   outside the owned globs are ASK, and so are writes to the shared contract
-  files (``package.json``, lockfiles) unless the task owns them by name.
+  files (``package.json``, lockfiles) unless the task owns them by name
+  (owning a manifest owns the lockfiles next to it).
   Reads are never gated. The shipcrew server injects ``root`` and
   ``owned_paths`` into the bundle when it starts a task; without them the
   policy abstains.
 * :func:`test_writes_only` -- verify roles (qa, security) write test files
-  and their report only; any other write is DENY.
+  and their report only; any other write is DENY, and so is removing,
+  renaming or truncating a test that is already on the base branch.
 * :func:`workflows_guard` -- ASK before a write to ``.github/workflows/**``.
 * :func:`push_guard` -- the orchestrator may push only task branches named
   ``shipcrew/<8 hex>-<slug>``, every push segment explicitly.
@@ -34,6 +38,7 @@ import fnmatch
 import posixpath
 import re
 import shlex
+import subprocess
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from typing import Any, TypeAlias
@@ -68,7 +73,47 @@ DEFAULT_ENV_ALLOW: tuple[str, ...] = (
     "PWDEBUG",
     "NEXT_TELEMETRY_DISABLED",
     "PLAYWRIGHT_HTML_OPEN",
+    "PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD",
 )
+
+# Variables a read-only command may expand besides the env-allow names and the
+# names assigned earlier in the same command (``S=/x; cat $S/a``). Secrets
+# (``$DATABASE_URL``, ``$API_KEY``) are not here: printing one would put its
+# value in the model context.
+DEFAULT_EXPAND_ALLOW: tuple[str, ...] = (
+    "HOME",
+    "PWD",
+    "OLDPWD",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "PATH",
+    "TMPDIR",
+    "RUNNER_TEMP",
+)
+
+# The read-only commands a variable expansion may appear in when a bundle does
+# not pass its own ``read_only`` list (the shipcrew bundles pass their
+# read_only + git_read groups).
+DEFAULT_READ_ONLY: tuple[str, ...] = (
+    "echo", "cat", "ls", "head", "tail", "wc", "test", "[", "pwd", "basename", "dirname",
+    "stat", "file",
+)  # fmt: skip
+
+# Names a bare assignment (``NAME=value;``) may never set: they change what
+# the shell or the next command runs (``PATH=/tmp/x; cat f`` runs /tmp/x/cat).
+_DANGEROUS_VAR = re.compile(
+    r"^(PATH|IFS|CDPATH|BASH_ENV|ENV|HOME|SHELL|SHELLOPTS|BASHOPTS|PS4|PROMPT_COMMAND|"
+    r"GLOBIGNORE|EDITOR|VISUAL|BROWSER|PAGER|TMPDIR|LD_\w*|DYLD_\w*|GIT_\w*|\w*_PAGER|"
+    r"LESS\w*|GREP_\w*|NODE_\w*|NPM_\w*|npm_\w*|PNPM_\w*|YARN_\w*|COREPACK_\w*|PYTHON\w*|"
+    r"PERL\w*|RUBY\w*|SSH_\w*|BASH_FUNC_\w*)$"
+)
+# Programs whose arguments can turn an expanded word into code or a state
+# change even when they read only (``printf -v PATH``, ``cd $X``, ``find -exec``).
+_EXPANSION_UNSAFE_PROGRAMS = frozenset(
+    {"cd", "printf", "find", "xargs", "env", "command", "exec", "eval", "source", ".",
+     "sed", "awk", "perl", "python", "python3", "node", "sh", "bash", "jq", "yq"}
+)  # fmt: skip
 
 # Shared contract files: a task changes them only when it owns them by name.
 DEFAULT_SHARED_PATHS: tuple[str, ...] = (
@@ -128,7 +173,19 @@ DEFAULT_BRANCH_PATTERN = r"shipcrew/[0-9a-f]{8}-[a-z0-9]+(?:-[a-z0-9]+)*"
 _SEPARATORS = frozenset({";", "&&", "||", "|", "&", "|&", "\n", "(", ")", ";;"})
 _WRITE_REDIRECTS = frozenset({">", ">>", ">|", "&>", "&>>", "<>", ">&"})
 _READ_REDIRECTS = frozenset({"<", "<<<"})
+_TRUNCATING_REDIRECTS = frozenset({">", ">|", "&>", ">&"})
 _ENV_ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+# Marks a real parameter expansion (``$X``, ``${X}``) in the parsed words, so a
+# single-quoted ``'$X'`` (a literal) is told apart after shlex.
+EXPANSION_MARK = "\x00"
+_MARKED_NAME = re.compile(EXPANSION_MARK + r"\{?([A-Za-z_][A-Za-z0-9_]*)")
+# ``$?``, ``$#``, ``$$``, ``$!``: always a number, harmless anywhere.
+_SPECIAL_PARAMS = frozenset("?#$!")
+_PARAM_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+# ``${NAME}``, ``${NAME:-literal}``, ``${NAME-literal}``, ``${?}``.
+_BRACED_PARAM = re.compile(
+    r"\{(?P<name>[A-Za-z_][A-Za-z0-9_]*|[?#$!])(?::?-(?P<default>[\w./:@%+,=-]*))?\}"
+)
 # ``git commit -m "$(cat <<'EOF' ... EOF)"`` is how Claude Code writes commit
 # messages: the substitution only produces a literal string, so it is replaced
 # by a placeholder before the unanalyzable-construct check. The delimiter must
@@ -162,12 +219,19 @@ class Segment:
     :param env: Names of the leading ``NAME=value`` assignments.
     :param writes: Targets of file-writing redirections (``>``, ``>>``, ``&>``).
     :param raw: The segment words as written, for messages.
+    :param truncates: The :attr:`writes` targets opened for truncation
+        (``>``, ``>|``, ``&>``, ``>&``; not ``>>``).
+    :param expanded: Names of the parameters the shell expands in this
+        segment (only with ``parse_command(..., params=True)``; the words
+        then carry :data:`EXPANSION_MARK` where each ``$`` was).
     """
 
     argv: list[str] = field(default_factory=list)
     env: list[str] = field(default_factory=list)
     writes: list[str] = field(default_factory=list)
     raw: list[str] = field(default_factory=list)
+    expanded: list[str] = field(default_factory=list)
+    truncates: list[str] = field(default_factory=list)
 
     @property
     def text(self) -> str:
@@ -238,14 +302,20 @@ def _normalize_program(argv: list[str]) -> list[str]:
 _GLOB_CHARS = frozenset("*?[")
 
 
-def _has_expansion(text: str) -> bool:
-    """Whether the shell would rewrite a word of *text* before running it.
+def _scan_expansions(text: str) -> tuple[str, str]:
+    """Classify the expansions of *text* and mark the parameter ones.
 
-    Parameter / ANSI-C expansion (``$X``, ``${X}``, ``$'..'``) outside single
-    quotes, unquoted brace expansion (``--{ha,}rd``) and an unquoted glob in an
-    option word (``--ha?d``) all turn a word the allowlist saw into another
-    one (``CI=--output=f; git diff $CI``), so such a command is unanalyzable.
+    :returns: ``(marked, kind)``. *kind* is ``""`` (no expansion), ``"param"``
+        (only ``$NAME`` / ``${NAME}`` / ``${NAME:-literal}`` outside single
+        quotes; in *marked* each such ``$`` is :data:`EXPANSION_MARK`) or
+        ``"other"``: ANSI-C quoting (``$'..'``), a complex ``${..}``, a
+        positional parameter, unquoted brace expansion (``--{ha,}rd``) or an
+        unquoted glob in an option word (``--ha?d``), which turn a word the
+        allowlist saw into another one. The special parameters ``$?``,
+        ``$#``, ``$$`` and ``$!`` are numbers: not an expansion here.
     """
+    out: list[str] = []
+    kind = ""
     quote: str | None = None
     word_start = True
     option_word = False  # in the name part of a word starting with "-"
@@ -257,14 +327,33 @@ def _has_expansion(text: str) -> bool:
         if quote == "'":
             if c == "'":
                 quote = None
+            out.append(c)
             i += 1
             continue
         if c == "\\":
+            out.append(text[i : i + 2])
             i += 2
             word_start = False
             continue
         if c == "$" and i + 1 < len(text) and not text[i + 1].isspace() and text[i + 1] != '"':
-            return True
+            nxt = text[i + 1]
+            if nxt in _SPECIAL_PARAMS:
+                out.append(text[i : i + 2])
+                i += 2
+                word_start = False
+                continue
+            name = _PARAM_NAME.match(text, i + 1)
+            braced = _BRACED_PARAM.match(text, i + 1) if nxt == "{" else None
+            if name is None and braced is None:
+                return text, "other"
+            end = name.end() if name is not None else braced.end()  # type: ignore[union-attr]
+            special = braced is not None and braced.group("name") in _SPECIAL_PARAMS
+            out.append(("$" if special else EXPANSION_MARK) + text[i + 1 : end])
+            kind = kind or ("" if special else "param")
+            i = end
+            word_start = False
+            continue
+        out.append(c)
         if quote == '"':
             if c == '"':
                 quote = None
@@ -285,34 +374,57 @@ def _has_expansion(text: str) -> bool:
                 brace += 1
             elif c == "}" and brace:
                 if brace_list:
-                    return True
+                    return text, "other"
                 brace -= 1
             elif brace and (c == "," or text.startswith("..", i)):
                 brace_list = True
             elif option_word and c in _GLOB_CHARS:
-                return True
+                return text, "other"
         i += 1
-    return False
+    return "".join(out), kind
 
 
-def parse_command(command: str, *, strict: bool = True) -> list[Segment] | None:
+def _has_expansion(text: str) -> bool:
+    """Whether the shell would rewrite a word of *text* before running it.
+
+    Parameter / ANSI-C expansion (``$X``, ``${X}``, ``$'..'``) outside single
+    quotes, unquoted brace expansion (``--{ha,}rd``) and an unquoted glob in an
+    option word (``--ha?d``) all turn a word the allowlist saw into another
+    one (``CI=--output=f; git diff $CI``). ``$?``/``$#``/``$$``/``$!`` do not.
+    """
+    return _scan_expansions(text)[1] != ""
+
+
+def parse_command(
+    command: str, *, strict: bool = True, params: bool = False
+) -> list[Segment] | None:
     """Split *command* into simple commands, or ``None`` when it cannot be analyzed.
 
     Command substitution, process substitution, backticks and heredocs make a
     command unanalyzable (their inner commands would run unseen), except the
     ``$(cat <<'EOF' ... EOF)`` literal-string idiom; so do parameter, brace
-    and option-glob expansions (see :func:`_has_expansion`) unless
+    and option-glob expansions (see :func:`_scan_expansions`) unless
     ``strict=False`` (the owned-paths check, which refuses any target holding
-    a ``$`` itself).
+    a ``$`` itself). With ``params=True`` plain parameter expansions are
+    parsed: each segment lists them in :attr:`Segment.expanded` and its
+    ``argv`` / ``writes`` words carry :data:`EXPANSION_MARK` for their ``$``
+    (the shell allowlist then only accepts them in read-only commands).
+    Newlines separate commands like ``;``.
     """
     text = command.replace("\\\n", " ")
     text = _HEREDOC_STRING.sub("HEREDOC", text)
     if any(marker in text for marker in ("$(", "`", "<(", ">(")):
         return None
-    if strict and _has_expansion(text):
-        return None
+    if strict:
+        marked, kind = _scan_expansions(text)
+        if kind == "other" or (kind == "param" and not params):
+            return None
+        text = marked
     text = _FD_DUP.sub(r"\1", text)
     text = _FD_NUMBER.sub(r"\1", text)
+    # ``cmd &`` / ``a |`` at a line end: shlex would glue the operator and the
+    # newline into one ``&\n`` token.
+    text = text.replace("\n", " \n ")
     tokens = _tokens(text)
     if tokens is None:
         return None
@@ -340,6 +452,8 @@ def parse_command(command: str, *, strict: bool = True) -> list[Segment] | None:
             current.raw += [token, target]
             if token in _WRITE_REDIRECTS:
                 current.writes.append(target)
+                if token in _TRUNCATING_REDIRECTS:
+                    current.truncates.append(target)
             elif token not in _READ_REDIRECTS:
                 return None  # heredoc (<<, <<-) or an operator we do not model
             i += 2
@@ -361,6 +475,9 @@ def parse_command(command: str, *, strict: bool = True) -> list[Segment] | None:
         segments.append(current)
     for seg in segments:
         seg.argv = _normalize_program(seg.argv)
+        if any(EXPANSION_MARK in t for t in seg.raw):
+            seg.expanded = [m for t in seg.raw for m in _MARKED_NAME.findall(t)]
+            seg.raw = [t.replace(EXPANSION_MARK, "$") for t in seg.raw]
     return segments
 
 
@@ -373,6 +490,16 @@ def _shell_command(event: _Json) -> str | None:
     args = data.get("arguments")
     command = args.get("command") if isinstance(args, dict) else None
     return command if isinstance(command, str) else None
+
+
+# Write tools that replace a whole file (Edit / MultiEdit change part of it).
+_OVERWRITE_TOOLS = frozenset({"Write", "write", "sys_os_write"})
+
+
+def _tool_name(event: _Json) -> str | None:
+    data = event.get("data")
+    name = data.get("name") if isinstance(data, dict) else None
+    return name if isinstance(name, str) else None
 
 
 def _write_tool_paths(event: _Json) -> list[str] | None:
@@ -433,7 +560,162 @@ def _curl_localhost(args: list[str]) -> bool:
     return urls > 0
 
 
-_BUILTIN_MATCHERS: dict[str, Callable[[list[str]], bool]] = {"curl_localhost": _curl_localhost}
+_SED_ADDRESS = re.compile(r"(\d+|\$)(,(\d+|\$))?")
+_SED_FLAGS = frozenset("gIiMm0123456789")
+
+
+def _delimited(script: str, i: int, delim: str) -> int | None:
+    """Index just past the next unescaped *delim* from *i*, or ``None``."""
+    while i < len(script):
+        if script[i] == "\\":
+            i += 2
+            continue
+        if script[i] == delim:
+            return i + 1
+        i += 1
+    return None
+
+
+def _safe_sed_script(script: str) -> bool:
+    """Only ``s`` commands (``[N[,M]]s<d>re<d>repl<d>[gIiMm0-9]``), ``;``/newline separated.
+
+    No ``w``/``e``/``r`` commands or flags: those write files or run commands.
+    """
+    i, count = 0, 0
+    while True:
+        while i < len(script) and script[i] in " \t\n;":
+            i += 1
+        if i >= len(script):
+            return count > 0
+        address = _SED_ADDRESS.match(script, i)
+        if address:
+            i = address.end()
+        if not script.startswith("s", i) or i + 1 >= len(script):
+            return False
+        delim = script[i + 1]
+        if delim in "\\\n" or delim.isspace():
+            return False
+        end = _delimited(script, i + 2, delim)
+        end = _delimited(script, end, delim) if end is not None else None
+        if end is None:
+            return False
+        i = end
+        while i < len(script) and script[i] in _SED_FLAGS:
+            i += 1
+        count += 1
+        if i < len(script) and script[i] not in " \t\n;":
+            return False
+
+
+def _sed_in_place(args: list[str]) -> bool:
+    """``sed -i [-E] [-e SCRIPT]... SCRIPT FILE...`` with substitution scripts only.
+
+    Exact flags only (``-i.bak``, ``-ni``, ``-f file``, ``--expression=`` ask),
+    at least one file. :func:`shell_write_targets` reports the files as writes.
+    """
+    scripts: list[str] = []
+    files: list[str] = []
+    in_place = False
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg in ("-i", "--in-place"):
+            in_place = True
+        elif arg in ("-E", "-r", "--regexp-extended"):
+            pass
+        elif arg in ("-e", "--expression"):
+            if i + 1 >= len(args):
+                return False
+            scripts.append(args[i + 1])
+            i += 2
+            continue
+        elif arg == "--":
+            files.extend(args[i + 1 :])
+            break
+        elif arg.startswith("-"):
+            return False
+        else:
+            files.append(arg)
+        i += 1
+    if not scripts and files:
+        scripts.append(files.pop(0))
+    return in_place and bool(scripts) and bool(files) and all(map(_safe_sed_script, scripts))
+
+
+_PERL_DELIMS = frozenset("/|#!,:~%")
+_PERL_FLAGS = frozenset("gimsx")
+_PERL_CODE = re.compile(r"\(\?\??\{|\(\*\{")
+# ``$`` in a Perl pattern: an anchor before a delimiter, ``)``, ``|`` or the end.
+_PERL_VAR_IN_PATTERN = re.compile(r"\$(?![)|]|$)")
+# ``$`` in a replacement: only ``$1`` / ``${1}`` / ``$&``.
+_PERL_VAR_IN_REPLACEMENT = re.compile(r"\$(?!\d|\{\d+\}|&)")
+
+
+def _safe_perl_substitution(script: str) -> bool:
+    """One ``s<d>re<d>repl<d>[gimsx]`` with no code in it.
+
+    Refused: the ``e`` flag, ``(?{..})`` / ``(??{..})`` code blocks, ``@``
+    (``@{[ system .. ]}`` runs code in either part) and ``$`` interpolation
+    other than a pattern anchor or a ``$1`` / ``$&`` back-reference.
+    """
+    text = script.strip()
+    if len(text) < 4 or text[0] != "s" or text[1] not in _PERL_DELIMS:
+        return False
+    delim = text[1]
+    mid = _delimited(text, 2, delim)
+    end = _delimited(text, mid, delim) if mid is not None else None
+    if mid is None or end is None:
+        return False
+    pattern, replacement = text[2 : mid - 1], text[mid : end - 1]
+    flags = text[end:].rstrip().removesuffix(";").rstrip()
+    if not set(flags) <= _PERL_FLAGS:
+        return False
+    if "@" in pattern or "@" in replacement or _PERL_CODE.search(pattern):
+        return False
+    stripped = pattern.replace("\\\\", "").replace("\\$", "")
+    if _PERL_VAR_IN_PATTERN.search(stripped):
+        return False
+    return not _PERL_VAR_IN_REPLACEMENT.search(replacement.replace("\\\\", "").replace("\\$", ""))
+
+
+def _perl_in_place_parts(args: list[str]) -> tuple[str, list[str]] | None:
+    """``(script, files)`` of ``perl -pi -e SCRIPT FILE...`` (or ``-p -i -e``, ``-i -pe``)."""
+    flags: set[str] = set()
+    script: str | None = None
+    files: list[str] = []
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg in ("-p", "-i", "-pi", "-ip"):
+            flags |= set(arg[1:])
+        elif arg in ("-e", "-pe"):
+            if script is not None or i + 1 >= len(args):
+                return None
+            flags |= set(arg[1:])
+            script = args[i + 1]
+            i += 2
+            continue
+        elif arg.startswith("-"):
+            return None  # -pie (backup suffix "e"), -n, -M, -0 ...: not modelled
+        else:
+            files.append(arg)
+        i += 1
+    if script is None or not {"p", "i"} <= flags:
+        return None
+    return script, files
+
+
+def _perl_in_place(args: list[str]) -> bool:
+    """``perl -pi -e 's/a/b/g' FILE...``: one code-free substitution, in place."""
+    parts = _perl_in_place_parts(args)
+    return parts is not None and bool(parts[1]) and _safe_perl_substitution(parts[0])
+
+
+_BUILTIN_MATCHERS: dict[str, Callable[[list[str]], bool]] = {
+    "curl_localhost": _curl_localhost,
+    "sed_in_place": _sed_in_place,
+    "perl_in_place": _perl_in_place,
+}
 
 
 def _banned_hit(arg: str, banned: str) -> bool:
@@ -484,6 +766,23 @@ class _Pattern:
             return False
         return not any(_banned_hit(a, b) for a in rest for b in self.banned)
 
+    @property
+    def expansion_safe(self) -> bool:
+        """Whether an expanded word in its free arguments cannot make it write or run code.
+
+        Only plain word entries: no regex, no built-in matcher, no ``!banned``
+        option (an expanded word could become that option, ``git diff $X``
+        with ``X=--output=f``), no glob word, and not a program in
+        :data:`_EXPANSION_UNSAFE_PROGRAMS`.
+        """
+        return (
+            self.regex is None
+            and self.builtin is None
+            and not self.banned
+            and not any(_GLOB_CHARS.intersection(w) for w in self.words)
+            and self.words[0] not in _EXPANSION_UNSAFE_PROGRAMS
+        )
+
 
 def compile_pattern(source: str) -> _Pattern:
     """Compile one allowlist entry.
@@ -533,8 +832,24 @@ def shell_allowlist(
     env_allow: Sequence[str] | None = None,
     shell_writes: bool = True,
     reason: str | None = None,
+    read_only: Sequence[str] | None = None,
+    expand_allow: Sequence[str] | None = None,
 ) -> _Evaluator:
     """Factory: ALLOW a shell command only when every part is allowlisted, else ASK.
+
+    Chains (``;``, ``&&``, ``||``, newlines, a background ``&``) and pipes pass
+    when every simple command does. Variables:
+
+    * ``$?`` / ``$#`` / ``$$`` / ``$!`` are numbers: always fine.
+    * ``$NAME`` / ``${NAME}`` / ``${NAME:-literal}`` in a command word: the
+      command must match an expansion-safe *read_only* entry (see
+      :attr:`_Pattern.expansion_safe`), and ``NAME`` must be an *env_allow* /
+      *expand_allow* name or assigned earlier in the command. In the value
+      of a vetted env prefix (``PORT=${PORT:-3000} npx playwright test``)
+      only the name rule applies. A write target with an expansion asks.
+    * A bare assignment (``S=/tmp/x;``) of a name that is not vetted makes
+      every later command of the chain read-only-only; names that change
+      what runs (``PATH``, ``LD_*``, ``GIT_*``, ``NODE_*`` ...) ask.
 
     :param allow: Allowlist entries, see :func:`compile_pattern`.
     :param role: Role name used in the approval-card text.
@@ -547,10 +862,23 @@ def shell_allowlist(
         ``/dev/null`` or ``/tmp/**`` is ASK. ``True`` leaves write targets to
         :func:`owned_paths`.
     :param reason: Optional text appended to the approval-card reason.
+    :param read_only: Entries of commands that only read (default
+        :data:`DEFAULT_READ_ONLY`); the expansion-safe ones may carry a
+        variable expansion. A command must match *allow* too.
+    :param expand_allow: Extra names a command may expand (default
+        :data:`DEFAULT_EXPAND_ALLOW`), on top of *env_allow*.
     :returns: An evaluator ``fn(event, config)``; non-shell tool calls ALLOW.
     """
     patterns = [compile_pattern(entry) for entry in allow]
+    safe = [
+        p
+        for p in (
+            compile_pattern(e) for e in (DEFAULT_READ_ONLY if read_only is None else read_only)
+        )
+        if p.expansion_safe
+    ]
     envs = frozenset(DEFAULT_ENV_ALLOW if env_allow is None else env_allow)
+    expandable = envs | frozenset(DEFAULT_EXPAND_ALLOW if expand_allow is None else expand_allow)
     suffix = f" {reason}" if reason else ""
 
     def _ask(what: str) -> _Json:
@@ -563,13 +891,28 @@ def shell_allowlist(
         command = _shell_command(event)
         if command is None:
             return _ALLOW
-        segments = parse_command(command)
+        segments = parse_command(command, params=True)
         if segments is None:
-            return _ask("A command with substitutions, heredocs or unbalanced quotes")
+            return _ask(
+                "A command with substitutions, heredocs, complex expansions or unbalanced quotes"
+            )
+        assigned = {n for s in segments if not s.argv and not s.writes for n in s.env}
+        read_only_after = False  # a bare assignment of an unvetted name happened
         for seg in segments:
+            unknown = sorted({n for n in seg.expanded if n not in expandable | assigned})
+            if unknown:
+                return _ask(f"`{seg.text}` (expands {', '.join('$' + n for n in unknown)})")
+            if not seg.argv and seg.env and not seg.writes:
+                danger = [n for n in seg.env if _DANGEROUS_VAR.match(n)]
+                if danger:
+                    return _ask(f"`{seg.text}` (sets {', '.join(danger)})")
+                read_only_after = read_only_after or any(n not in envs for n in seg.env)
+                continue
             bad_env = [name for name in seg.env if name not in envs]
             if bad_env:
                 return _ask(f"`{seg.text}` (env {', '.join(bad_env)})")
+            if any(EXPANSION_MARK in t for t in seg.writes):
+                return _ask(f"`{seg.text}` (writes to an expanded path)")
             if not shell_writes and not all(
                 _scratch_target(t) for t in [*seg.writes, *shell_write_targets(seg.argv)]
             ):
@@ -580,6 +923,10 @@ def shell_allowlist(
                 continue
             if not any(p.matches(seg.argv) for p in patterns):
                 return _ask(f"`{seg.text}`")
+            argv_expanded = any(EXPANSION_MARK in a for a in seg.argv)
+            if (argv_expanded or read_only_after) and not any(p.matches(seg.argv) for p in safe):
+                why = "expands a variable" if argv_expanded else "runs after a shell variable"
+                return _ask(f"`{seg.text}` ({why}; only read-only commands may)")
         return _ALLOW
 
     return _evaluate
@@ -761,10 +1108,31 @@ def shell_write_targets(argv: list[str]) -> list[str]:
         target_dir = _flag_value(args, ("-t", "--target-directory"))
         pos = _positionals(args, _VALUE_FLAGS["mv"])
         return [*pos, target_dir] if target_dir is not None else pos
-    if prog == "sed" and any(a == "-i" or a.startswith(("-i", "--in-place")) for a in args):
+    if prog == "sed" and any(
+        a.startswith("--in-place") or (a.startswith("-") and not a.startswith("--") and "i" in a)
+        for a in args
+    ):
+        # -i, -i.bak, -ni (clustered), --in-place[=SUF].
         pos = _positionals(args, _VALUE_FLAGS["sed"])
-        has_script_flag = any(a in ("-e", "--expression", "-f", "--file") for a in args)
+        has_script_flag = any(
+            a in ("-e", "--expression", "-f", "--file")
+            or a.startswith(("--expression=", "--file="))
+            or (a.startswith(("-e", "-f")) and len(a) > 2)
+            for a in args
+        )
         return pos if has_script_flag else pos[1:]
+    if prog == "perl" and any(
+        a.startswith("-") and not a.startswith("--") and "i" in a for a in args
+    ):
+        parts = _perl_in_place_parts(args)
+        if parts is not None:
+            return parts[1]
+        # Not the modelled form: every positional may be a file it rewrites.
+        return _positionals(args, frozenset({"-e", "-E", "-M", "-I"}))
+    if prog == "uniq":
+        pos = _positionals(args, frozenset({"-f", "--skip-fields", "-s", "--skip-chars", "-w",
+                                            "--check-chars"}))  # fmt: skip
+        return pos[1:2]  # ``uniq IN OUT`` writes OUT
     if prog == "git" and args:
         sub, rest = args[0], args[1:]
         if sub in ("mv", "rm"):
@@ -802,6 +1170,50 @@ def shell_write_targets(argv: list[str]) -> list[str]:
     return []
 
 
+def shell_removal_targets(argv: list[str]) -> list[str]:
+    """Paths a simple command deletes, renames away or truncates.
+
+    ``rm`` / ``rmdir`` / ``unlink`` / ``truncate`` targets, ``git rm`` paths,
+    and the sources of ``mv`` / ``git mv`` (a subset of
+    :func:`shell_write_targets`, for the verify roles' add-only rule).
+    """
+    if not argv:
+        return []
+    prog, args = argv[0], argv[1:]
+    if prog in ("rm", "rmdir", "unlink", "truncate"):
+        return _positionals(args, _VALUE_FLAGS.get(prog, frozenset()))
+    if prog == "mv":
+        pos = _positionals(args, _VALUE_FLAGS["mv"])
+        return pos if _flag_value(args, ("-t", "--target-directory")) else pos[:-1]
+    if prog == "git" and len(args) > 1 and args[0] in ("rm", "mv"):
+        pos = _positionals(args[1:])
+        return pos if args[0] == "rm" else pos[:-1]
+    return []
+
+
+# Owning a manifest by name owns its lockfiles: a dependency change rewrites both.
+_LOCKFILES_OF: dict[str, tuple[str, ...]] = {
+    "package.json": ("package-lock.json", "npm-shrinkwrap.json", "pnpm-lock.yaml", "yarn.lock",
+                     "bun.lock", "bun.lockb"),
+    "pyproject.toml": ("uv.lock", "poetry.lock"),
+}  # fmt: skip
+
+
+def _with_lockfiles(owned_list: Sequence[str]) -> list[str]:
+    """*owned_list* plus the lockfiles next to every manifest it owns by exact name."""
+    out = list(owned_list)
+    for entry in owned_list:
+        norm = _norm_glob(entry)
+        if _WILDCARD.search(norm):
+            continue
+        directory, _, name = norm.rpartition("/")
+        for lock in _LOCKFILES_OF.get(name, ()):
+            path = f"{directory}/{lock}" if directory else lock
+            if path not in out:
+                out.append(path)
+    return out
+
+
 def owned_paths(
     *,
     owned_paths: Sequence[str] | None = None,
@@ -835,6 +1247,8 @@ def owned_paths(
 
         return _abstain
 
+    shown_list = owned_list
+    owned_list = _with_lockfiles(owned_list)
     owned = _GlobSet(owned_list)
     exact_owned = {_norm_glob(p) for p in owned_list if not _WILDCARD.search(_norm_glob(p))}
     shared = _GlobSet(DEFAULT_SHARED_PATHS if shared_paths is None else shared_paths)
@@ -845,7 +1259,7 @@ def owned_paths(
     free_rel = _GlobSet(p for p in free_all if not p.startswith("/"))
     free_abs = _GlobSet(p for p in free_all if p.startswith("/"))
     root_abs = posixpath.normpath(root) if root else None
-    owned_text = ", ".join(owned_list)
+    owned_text = ", ".join(shown_list)
     suffix = f" {reason}" if reason else ""
     shared_names = [
         p.rsplit("/", 1)[-1] for p in shared.patterns if not _WILDCARD.search(p.rsplit("/", 1)[-1])
@@ -922,9 +1336,13 @@ def owned_paths(
     return _evaluate
 
 
-def _shell_targets(command: str, root: str | None) -> list[tuple[str, str | None]] | None:
+def _shell_targets(
+    command: str, root: str | None, *, removals: bool = False
+) -> list[tuple[str, str | None]] | None:
     """``(target, cwd)`` for every file a shell command writes; ``None`` if unanalyzable.
 
+    With ``removals=True`` only the files it deletes, renames away or
+    truncates (:func:`shell_removal_targets` and ``>`` redirections).
     ``cd`` and ``git -C`` are tracked; *cwd* is ``None`` once it is unknown.
     """
     segments = parse_command(command, strict=False)
@@ -952,7 +1370,12 @@ def _shell_targets(command: str, root: str | None) -> list[tuple[str, str | None
                 else (posixpath.normpath(posixpath.join(cwd, base)) if cwd else None)
             )
             argv = ["git", *argv[3:]]
-        out += [(t, seg_cwd) for t in [*seg.writes, *shell_write_targets(argv)]]
+        found = (
+            [*seg.truncates, *shell_removal_targets(argv)]
+            if removals
+            else [*seg.writes, *shell_write_targets(argv)]
+        )
+        out += [(t, seg_cwd) for t in found]
     return out
 
 
@@ -970,8 +1393,16 @@ def test_writes_only(
     root: str | None = None,
     free_paths: Sequence[str] | None = None,
     reason: str | None = None,
+    base_ref: str = "origin/main",
 ) -> _Evaluator:
     """Factory: DENY every write that is not a test file (verify roles: qa, security).
+
+    Add-only for tests other tasks wrote: deleting, renaming away or
+    truncating a test file that exists at *base_ref* (``rm``, ``git rm``,
+    ``mv`` / ``git mv`` source, ``truncate``, a ``>`` redirection, a full
+    ``Write`` over it) is DENY; ``Edit`` and appends stay allowed. A removal
+    whose target cannot be checked (no git answer, a glob) is DENY too; a
+    test file this task added itself may be removed.
 
     Judged on the write tools and on shell write targets (redirections, ``cp``
     / ``mv`` / ``rm``, ``git checkout <path>``, formatters, dependency
@@ -988,6 +1419,7 @@ def test_writes_only(
         components (``/any/where/e2e/a.spec.ts`` is a test file).
     :param free_paths: Always-writable build output and scratch (default
         :data:`DEFAULT_FREE_PATHS`, which includes ``/tmp``).
+    :param base_ref: The ref whose test files are protected (``origin/main``).
     :returns: An evaluator ``fn(event, config)``; reads always ALLOW.
     """
     writable = _GlobSet([*(DEFAULT_TEST_GLOBS if test_globs is None else test_globs),
@@ -1031,6 +1463,79 @@ def test_writes_only(
         parts = absolute.strip("/").split("/")
         return any(_rel_ok("/".join(parts[i:])) for i in range(1, len(parts)))
 
+    def _repo_rel(target: str, cwd: str | None) -> str | None:
+        if root_abs is None or "$" in target or target.startswith("~"):
+            return None
+        absolute = posixpath.normpath(
+            target if posixpath.isabs(target) else posixpath.join(cwd or root_abs, target)
+        )
+        if absolute != root_abs and not absolute.startswith(root_abs.rstrip("/") + "/"):
+            return None
+        return posixpath.relpath(absolute, root_abs)
+
+    def _at_base(rel: str) -> bool | None:
+        """Whether *rel* exists at *base_ref*; ``None`` when git cannot tell."""
+        try:
+            r = subprocess.run(
+                ["git", "-C", root_abs or ".", "cat-file", "-e", f"{base_ref}:{rel}"],
+                capture_output=True,
+                timeout=5,
+                check=False,
+            )
+            known = subprocess.run(
+                ["git", "-C", root_abs or ".", "rev-parse", "--verify", "--quiet", base_ref],
+                capture_output=True,
+                timeout=5,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        if known.returncode:
+            return None
+        return r.returncode == 0
+
+    def _base_files(directory: str) -> list[str] | None:
+        """Files under *directory* at *base_ref*; ``None`` when git cannot tell."""
+        if _at_base(".") is None:
+            return None
+        try:
+            r = subprocess.run(
+                ["git", "-C", root_abs or ".", "ls-tree", "-r", "--name-only", base_ref,
+                 "--", directory or "."],
+                capture_output=True, text=True, timeout=5, check=False,
+            )  # fmt: skip
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        return r.stdout.splitlines() if r.returncode == 0 else None
+
+    def _protected(target: str, cwd: str | None, *, removal: bool) -> bool:
+        """A test file another task wrote (at the base); for a removal, also "cannot tell"."""
+        rel = _repo_rel(target, cwd)
+        if rel is None:
+            return False  # outside the worktree: the write check judges it
+        if _WILDCARD.search(rel):
+            literal = rel[: _WILDCARD.search(rel).start()]  # type: ignore[union-attr]
+            directory = literal.rsplit("/", 1)[0] if "/" in literal else ""
+            if not removal or free_rel.covers_tree(directory):
+                return False
+            listed = _base_files(directory)
+            if listed is None:
+                return True  # cannot tell what the glob removes
+            glob = _glob_regex(rel)
+            return any(glob.match(f) and writable.match(f) for f in listed)
+        if not writable.match(rel) or free_rel.match(rel):
+            return False
+        existing = _at_base(rel)
+        return removal if existing is None else existing
+
+    def _deny_removal(target: str) -> _Json:
+        return {
+            "result": "DENY",
+            "reason": f"The {role} only adds tests: `{target}` is an existing test (another "
+            "task's, on the base branch) and may not be deleted, renamed or overwritten. "
+            f"Report a wrong or redundant test as a finding instead.{suffix}",
+        }
+
     def _deny(target: str) -> _Json:
         return {
             "result": "DENY",
@@ -1045,6 +1550,10 @@ def test_writes_only(
             for path in paths:
                 if not _ok(path, root_abs):
                     return _deny(path)
+            if _tool_name(event) in _OVERWRITE_TOOLS:
+                for path in paths:
+                    if _protected(path, root_abs, removal=False):
+                        return _deny_removal(path)
             return _ALLOW
         command = _shell_command(event)
         if command is None:
@@ -1053,6 +1562,11 @@ def test_writes_only(
         for target, cwd in targets or []:
             if not _ok(target, cwd):
                 return _deny(target)
+        for target, cwd in _shell_targets(command, root_abs, removals=True) or []:
+            truncating = target in {t for s in (parse_command(command, strict=False) or [])
+                                    for t in s.truncates}  # fmt: skip
+            if _protected(target, cwd, removal=not truncating):
+                return _deny_removal(target)
         return _ALLOW
 
     return _evaluate
@@ -1072,6 +1586,7 @@ def paths_outside_owned(
     owned_list = [p for p in owned_paths if isinstance(p, str) and p.strip()]
     if not owned_list:
         return []
+    owned_list = _with_lockfiles(owned_list)
     owned = _GlobSet(owned_list)
     exact_owned = {_norm_glob(p) for p in owned_list if not _WILDCARD.search(_norm_glob(p))}
     shared = _GlobSet(DEFAULT_SHARED_PATHS if shared_paths is None else shared_paths)
@@ -1266,6 +1781,11 @@ POLICY_REGISTRY: list[dict[str, object]] = [
                 "env_allow": {**_STRING_LIST, "description": "Allowed env-assignment names."},
                 "shell_writes": {"type": "boolean", "default": True},
                 "reason": {"type": "string"},
+                "read_only": {
+                    **_STRING_LIST,
+                    "description": "Read-only entries that may carry a variable expansion.",
+                },
+                "expand_allow": {**_STRING_LIST, "description": "Extra expandable names."},
             },
             "required": ["allow"],
         },

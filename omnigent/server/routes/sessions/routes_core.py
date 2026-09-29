@@ -959,6 +959,11 @@ def register_core_routes(
                 conversation_store=conversation_store,
                 runner_router=runner_router,
             )
+            # shipcrew fork: an explicit host_id asks for the child's own host
+            # runner. Co-located, a stop_session on the child tears down the
+            # PARENT's runner (the stop reads runner_id from the child row).
+            if parsed_metadata.host_id is not None:
+                inherited_runner_id = None
 
         bundle_bytes = await bundle.read()
         # Validate the bundle BEFORE any row exists: the external-host

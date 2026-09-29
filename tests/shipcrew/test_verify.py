@@ -253,7 +253,8 @@ class TestVerifyLoop:
             fix_key(task.id, 1),
         )
         assert fix.status in ("ready", "running")  # the same tick may start it
-        assert fix.owned_paths == ["src/cart.js"]
+        assert fix.owned_paths[:1] == ["src/cart.js"]
+        assert "src/cart.test.*" in fix.owned_paths  # its regression test is owned
         assert "`src/cart.js:12`" in fix.body and "npm test -- cart" in fix.body
         assert any("regression test" in a for a in fix.acceptance)
         # The verify card waits for the fix, with a fresh worktree next time.
@@ -278,7 +279,7 @@ class TestVerifyLoop:
         (fix,) = [t for t in await _tasks(service, task.mission_id) if t.id != task.id]
         branch = f"shipcrew-tests/{task.id[:8]}-1"
         assert f"git checkout {branch} -- tests/cart.test.js" in fix.body
-        assert fix.owned_paths == ["src/cart.js", "tests/cart.test.js"]
+        assert fix.owned_paths[:2] == ["src/cart.js", "tests/cart.test.js"]
         # Kept locally (the fix reads it), never pushed, and no PR for the failing tests.
         assert git(repo, "branch", "--list", branch).strip() == branch
         assert git(repo, "ls-remote", "origin", f"refs/heads/{branch}") == ""
@@ -299,7 +300,7 @@ class TestVerifyLoop:
         task = await _verify_task(service, repo, role="security")
         await run_until(scheduler, service, task.id, lambda t: len(t.depends_on) == 1)
         (fix,) = [t for t in await _tasks(service, task.mission_id) if t.id != task.id]
-        assert fix.owned_paths == ["app/api/cart/route.ts"]
+        assert fix.owned_paths[:1] == ["app/api/cart/route.ts"]
         assert "1 blocker/major finding(s)" in fix.body
 
     async def test_fix_merges_then_the_card_reverifies_and_passes(
@@ -396,3 +397,38 @@ class TestVerifyLoop:
         task = await _verify_task(service, repo)
         done = await run_until(scheduler, service, task.id, status_is("merged"))
         assert (done.needs_human_approval, done.approval_reasons) == (False, [])
+
+
+class TestVerifyNudge:
+    async def test_verify_turn_without_verdict_is_nudged_once(
+        self,
+        service: ShipcrewService,
+        sessions: RoleSessions,
+        repo: Path,
+        scheduler: ShipcrewScheduler,
+    ) -> None:
+        from omnigent.shipcrew import pr_loop
+
+        # The first turn ends without a verdict; after the nudge it passes.
+        sessions.agents["qa"] = [_says("The ask was declined.")]
+        sessions.developer = lambda wt, message: "Walked the demo.\nPASS"
+        task = await _verify_task(service, repo)
+        done = await run_until(scheduler, service, task.id, status_is("merged"))
+        assert [m[1] for m in sessions.messages] == [pr_loop.VERDICT_NUDGE]
+        assert done.pr_number is None and done.verdict_nudges == 0
+
+    async def test_verify_second_missing_verdict_blocks(
+        self,
+        service: ShipcrewService,
+        sessions: RoleSessions,
+        repo: Path,
+        scheduler: ShipcrewScheduler,
+    ) -> None:
+        from omnigent.shipcrew import pr_loop
+
+        sessions.agents["qa"] = [_says("The ask was declined.")]
+        sessions.developer = lambda wt, message: "Still no verdict."
+        task = await _verify_task(service, repo)
+        done = await run_until(scheduler, service, task.id, status_is("blocked"))
+        assert "without a PASS/FAIL line" in (done.blocked_reason or "")
+        assert [m[1] for m in sessions.messages] == [pr_loop.VERDICT_NUDGE]

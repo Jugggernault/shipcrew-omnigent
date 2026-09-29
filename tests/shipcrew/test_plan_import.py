@@ -212,7 +212,11 @@ class TestPlanImport:
         assert by_key["T01"]["role"] == "scaffolder"
         assert by_key["T02"]["role"] == "developer"
         assert by_key["T01"]["acceptance"] == ["the home page renders", "CI is green"]
-        assert by_key["T01"]["owned_paths"] == ["app/layout.tsx", "lib/**"]
+        assert by_key["T01"]["owned_paths"][:2] == ["app/layout.tsx", "lib/**"]
+        # The task's own tests are owned too (e2e spec by title slug, colocated).
+        assert by_key["T02"]["owned_paths"] == [
+            "app/cart/**", "e2e/cart*.spec.*", "test/cart*", "tests/cart*",
+        ]  # fmt: skip
         assert by_key["T02"]["depends_on"] == [by_key["T01"]["id"]]
         assert by_key["T03"]["depends_on"] == [by_key["T01"]["id"], by_key["T02"]["id"]]
         plan = (await _mission_state(client, mission["id"]))["plan"]

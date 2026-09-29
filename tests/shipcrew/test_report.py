@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import dataclasses
+
 from omnigent.shipcrew.report import build_report, format_duration, wall_time_s
 from omnigent.shipcrew.store import Assignee, Mission, Task
 
@@ -130,3 +132,26 @@ def test_protected_note_and_wall_time() -> None:
     assert wall_time_s(mission, []) is None
     assert format_duration(65) == "1m 05s"
     assert format_duration(7) == "7s"
+
+
+def test_interventions_say_what_was_asked() -> None:
+    tasks = _tasks()
+    tasks[0] = dataclasses.replace(tasks[0], interventions=[
+        {"at": T0 + 60, "reason": "x", "policy": "shipcrew_shell_allowlist",
+         "preview": "npm install -D vitest"},
+        {"at": T0 + 70, "reason": "x", "policy": "shipcrew_shell_allowlist", "preview": "sed -i"},
+        {"at": T0 + 80, "reason": "x", "policy": "shipcrew_workflows_approval",
+         "preview": ".github/workflows/ci.yml"},
+    ])  # fmt: skip
+    report = build_report(_mission(), tasks)
+    assert (
+        "- **Human interventions:** 3 (shipcrew_shell_allowlist 2, "
+        "shipcrew_workflows_approval 1)" in report
+    )
+    assert "shipcrew_shell_allowlist: npm install -D vitest" in report
+
+
+def test_no_intervention_summary() -> None:
+    tasks = _tasks()
+    tasks[0] = dataclasses.replace(tasks[0], interventions=[])
+    assert "- **Human interventions:** 0" in build_report(_mission(), tasks)

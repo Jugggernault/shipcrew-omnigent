@@ -117,6 +117,8 @@ _ENV_BUNDLE_DIR = "HARNESS_CLAUDE_SDK_BUNDLE_DIR"
 _ENV_AGENT_NAME = "HARNESS_CLAUDE_SDK_AGENT_NAME"
 # shipcrew fork: "1" -> --strict-mcp-config (executor.config.strict_mcp_config).
 _ENV_STRICT_MCP_CONFIG = "HARNESS_CLAUDE_SDK_STRICT_MCP_CONFIG"
+# shipcrew fork: "project,local" -> setting_sources (executor.config.setting_sources).
+_ENV_SETTING_SOURCES = "HARNESS_CLAUDE_SDK_SETTING_SOURCES"
 _ENV_GATEWAY_BASE_URL = "HARNESS_CLAUDE_SDK_GATEWAY_BASE_URL"
 _ENV_GATEWAY_AUTH_COMMAND = "HARNESS_CLAUDE_SDK_GATEWAY_AUTH_COMMAND"
 _ENV_GATEWAY_AUTH_REFRESH_INTERVAL_MS = "HARNESS_CLAUDE_SDK_GATEWAY_AUTH_REFRESH_INTERVAL_MS"
@@ -300,6 +302,10 @@ def _build_claude_sdk_executor() -> Executor:
         skills_filter=_resolve_skills_filter(),
         api_key_helper=os.environ.get(_ENV_API_KEY_HELPER) or None,
         strict_mcp_config=os.environ.get(_ENV_STRICT_MCP_CONFIG, "").strip() == "1",
+        setting_sources=[
+            s for s in os.environ.get(_ENV_SETTING_SOURCES, "").split(",") if s.strip()
+        ]
+        or None,
     )
 
 

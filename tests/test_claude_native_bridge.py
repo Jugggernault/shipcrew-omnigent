@@ -11075,6 +11075,25 @@ async def test_hook_evaluate_endpoint_allows(
 
 
 @pytest.mark.asyncio
+async def test_hook_evaluate_endpoint_allows_a_human_approved_ask(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """shipcrew fork: an accepted ASK answers ``allow`` so Claude does not prompt twice."""
+    client = _ScriptedPolicyClient({"result": "POLICY_ACTION_ALLOW", "human_approved": True})
+    relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, client)
+    try:
+        body = await asyncio.to_thread(
+            _relay_request_raw,
+            bridge_dir,
+            "/hook/claude/evaluate-policy",
+            _PRE_TOOL_USE_PAYLOAD,
+        )
+        assert json.loads(body)["hookSpecificOutput"]["permissionDecision"] == "allow"
+    finally:
+        relay.close()
+
+
+@pytest.mark.asyncio
 async def test_hook_evaluate_endpoint_returns_deny_hook_output(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

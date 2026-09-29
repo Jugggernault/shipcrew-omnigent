@@ -393,7 +393,8 @@ class TestAllowlistBypasses:
             ("git diff $'\\x2d-output=x'", "ASK"),  # ANSI-C quoting
             ("git reset --{ha,}rd", "ASK"),  # brace expansion
             ("git reset --ha?d", "ASK"),  # glob in an option name
-            ('echo "$HOME"', "ASK"),
+            ('echo "$HOME"', "ALLOW"),  # a vetted name in a read-only command (round 5)
+            ('echo "$API_TOKEN"', "ASK"),  # not a vetted name: could print a secret
             # Still free: the everyday forms.
             ("git reset --soft HEAD~1", "ALLOW"),
             ("git fetch origin main", "ALLOW"),

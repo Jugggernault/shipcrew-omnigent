@@ -126,6 +126,7 @@ class Task:
     decisions: list[str] = field(default_factory=list)
     started_at: float | None = None
     interventions: list[dict[str, Any]] = field(default_factory=list)
+    verdict_nudges: int = 0
 
     @property
     def human_assigned(self) -> bool:
@@ -254,6 +255,7 @@ def _task(row: SqlTask) -> Task:
         decisions=[str(d) for d in row.decisions or []],
         started_at=row.started_at,
         interventions=[dict(i) for i in row.interventions or [] if isinstance(i, dict)],
+        verdict_nudges=int(row.verdict_nudges or 0),
     )
 
 
@@ -289,6 +291,7 @@ _TASK_FIELDS = frozenset(
         "human_approved",
         "decisions",
         "started_at",
+        "verdict_nudges",
     }
 )
 _MISSION_FIELDS = frozenset(
@@ -531,6 +534,7 @@ class ShipcrewStore:
                 ci="none",
                 ci_attempts=0,
                 review_rounds=0,
+                verdict_nudges=0,
                 needs_human_approval=False,
                 human_approved=False,
                 cost_usd=0.0,
@@ -569,9 +573,14 @@ class ShipcrewStore:
         task_id: str,
         *,
         assignee: Assignee | None = _UNSET,
+        intervention: dict[str, str] | None = None,
         **fields: Any,
     ) -> Task | None:
         """Apply ``fields`` (column names) and optionally ``assignee``.
+
+        :param intervention: What the human is asked (``policy`` + redacted
+            ``preview``), stored with the intervention entry when this update
+            moves the card into intervention.
 
         :returns: The updated task, or ``None`` when it does not exist.
         :raises ValueError: On an unknown field name.
@@ -588,10 +597,15 @@ class ShipcrewStore:
                 setattr(row, name, list(value) if isinstance(value, list | tuple) else value)
             if entering:
                 # The report lists every time a human had to step in.
-                reason = row.blocked_reason or "the agent asked a human (approval or input)"
+                asked = {k: str(v) for k, v in (intervention or {}).items() if v}
+                reason = (
+                    f"{asked['policy']}: {asked.get('preview') or '(no preview)'}"
+                    if asked.get("policy")
+                    else row.blocked_reason or "the agent asked a human (approval or input)"
+                )
                 row.interventions = [
                     *(row.interventions or []),
-                    {"at": time.time(), "reason": str(reason)[:500]},
+                    {"at": time.time(), "reason": str(reason)[:500], **asked},
                 ][-_MAX_INTERVENTIONS:]
             if assignee is not _UNSET:
                 row.assignee_kind = assignee.kind if assignee is not None else None
