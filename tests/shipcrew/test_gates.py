@@ -105,7 +105,7 @@ class TestOverlapGate:
         running = _t("r", status="running", owned_paths=["src/**"])
         task = _t("a", owned_paths=["src/app.py"])
         reason = overlap_gate(task, [running], {"m1": "/repo"})
-        assert reason == "owned paths overlap with running task: r"
+        assert reason == "owned paths overlap with unmerged task: r"
 
     def test_other_repository_never_collides(self) -> None:
         running = _t("r", mission_id="m2", status="running", owned_paths=["src/**"])
@@ -153,6 +153,14 @@ class TestEvaluateGates:
         clash = _t("b", status="ready", owned_paths=["p1/x.py"])
         reason = evaluate_gates(clash, self._ctx(taken, clash, max_parallel=1))
         assert reason is not None and reason.startswith("owned paths overlap")
+
+    def test_task_in_review_still_owns_its_paths(self) -> None:
+        rev = _t("rev", status="review", owned_paths=["src/**"])
+        clash = _t("b", status="ready", owned_paths=["src/calc.py"])
+        reason = evaluate_gates(clash, self._ctx(rev, clash))
+        assert reason == "owned paths overlap with unmerged task: rev"
+        free = _t("c", status="ready", owned_paths=["docs/**"])
+        assert evaluate_gates(free, self._ctx(rev, free)) is None
 
     def test_budget_sums_every_task(self) -> None:
         done = _t("done", status="merged", cost_usd=7.5, owned_paths=["p1/**"])

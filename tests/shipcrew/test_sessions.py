@@ -232,6 +232,7 @@ async def test_snapshot_reads_session() -> None:
         ([{"type": "message", "role": "user"}], False),
         ([{"type": "message", "role": "assistant"}], True),
         ([{"type": "function_call_output"}], True),
+        ([{"type": "resource_event", "status": "completed"}], False),
     ],
 )
 async def test_idle_snapshot_reads_latest_item(

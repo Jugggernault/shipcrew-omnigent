@@ -106,7 +106,7 @@ def overlap_gate(
         if other.id == task.id or repo_of.get(other.mission_id) != repo:
             continue
         if paths_overlap(task.owned_paths, other.owned_paths):
-            return f"owned paths overlap with running task: {other.title or other.id}"
+            return f"owned paths overlap with unmerged task: {other.title or other.id}"
     return None
 
 
@@ -125,6 +125,11 @@ class GateContext:
         return [t for t in self.tasks_by_id.values() if t.status in ACTIVE_STATUSES]
 
     @property
+    def path_holders(self) -> list[Task]:
+        """Tasks whose unmerged changes own their paths: in flight or in review."""
+        return [t for t in self.tasks_by_id.values() if t.status in ACTIVE_STATUSES | {"review"}]
+
+    @property
     def agent_active(self) -> list[Task]:
         """In-flight tasks that hold an agent slot (a human took the others)."""
         return [t for t in self.active if not t.human_assigned]
@@ -136,11 +141,10 @@ class GateContext:
 
 def evaluate_gates(task: Task, ctx: GateContext) -> str | None:
     """First failing gate's reason, or ``None`` when the task may start."""
-    active = ctx.active
     return (
         deps_gate(task, ctx.tasks_by_id)
         or capacity_gate(len(ctx.agent_active), ctx.max_parallel)
-        or overlap_gate(task, active, ctx.repo_of)
+        or overlap_gate(task, ctx.path_holders, ctx.repo_of)
         or budget_gate(ctx.spent_usd, ctx.max_usd)
     )
 

@@ -370,10 +370,20 @@ def _pretrust_claude_workspace(workspace: str) -> None:
             _logger.warning("shipcrew: could not pre-trust %s: %s", workspace, exc)
 
 
+_AGENT_ITEM_TYPES = {"function_call", "function_call_output", "reasoning"}
+
+
 def _is_agent_item(item: Any) -> bool:
+    """Whether a transcript item was produced by the agent's turn.
+
+    Bookkeeping items (e.g. ``resource_event``) are written before the prompt
+    item lands, so they must not count as a reply.
+    """
     if not isinstance(item, dict):
         return False
-    return not (item.get("type") == "message" and item.get("role") == "user")
+    if item.get("type") == "message":
+        return item.get("role") == "assistant"
+    return item.get("type") in _AGENT_ITEM_TYPES
 
 
 def snapshot_from_payload(payload: dict[str, Any]) -> SessionSnapshot:
