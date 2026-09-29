@@ -67,8 +67,10 @@ function Section({ title, children }: { title: string; children: React.ReactNode
   );
 }
 
+/** The server refuses (409) or ignores a start on these cards. */
 export function canStartTask(task: Task): boolean {
-  return task.status !== "running" && task.status !== "merged";
+  if (task.assignee?.kind === "human") return false;
+  return task.status !== "running" && task.status !== "intervention" && task.status !== "merged";
 }
 
 export function TaskDrawer({ task, tasks, onClose, onStart, onStop, pending }: TaskDrawerProps) {

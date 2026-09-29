@@ -59,6 +59,31 @@ class TestAuth:
         assert mission.owner_user_id == "alice@example.com"
 
 
+class TestOwnership:
+    """A mission and its tasks are visible to, and driven by, their creator only."""
+
+    async def test_other_users_missions_are_hidden(self, client: httpx.AsyncClient) -> None:
+        mission = await _mission(client)
+        task = await _task(client, mission["id"])
+        bob = {USER_HEADER: "bob@example.com"}
+        listed = await client.get(f"{P}/missions", headers=bob)
+        assert listed.json() == {"missions": []}
+        for method, path in [
+            ("GET", f"/missions/{mission['id']}/tasks"),
+            ("POST", f"/missions/{mission['id']}/tasks"),
+            ("GET", f"/missions/{mission['id']}/stream"),
+            ("PATCH", f"/tasks/{task['id']}"),
+            ("POST", f"/tasks/{task['id']}/start"),
+            ("POST", f"/tasks/{task['id']}/stop"),
+        ]:
+            body = {"title": "t"} if method != "GET" else None
+            r = await client.request(method, P + path, json=body, headers=bob)
+            assert r.status_code == 404, (method, path, r.text)
+        # Nothing bob sent reached alice's card.
+        (alice_task,) = (await client.get(f"{P}/missions/{mission['id']}/tasks")).json()["tasks"]
+        assert (alice_task["title"], alice_task["status"]) == ("T", "backlog")
+
+
 class TestMissions:
     async def test_create_and_list(self, client: httpx.AsyncClient) -> None:
         created = await _mission(client, repo_url="https://github.com/o/r")

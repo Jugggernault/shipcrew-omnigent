@@ -10,6 +10,7 @@ launch and permission logic applies unchanged.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import dataclasses
 import io
 import json
@@ -83,27 +84,12 @@ class SessionService(Protocol):
         """Create the worktree + root session, send the prompt, return the id."""
         ...
 
-    async def _wait_runner_online(
-        self, client: httpx.AsyncClient, session_id: str, headers: dict[str, str]
-    ) -> None:
-        """Wait for the host-launched runner before the first prompt.
-
-        A prompt posted earlier costs the server's fixed connect grace plus a
-        runner relaunch. Best effort: on timeout the prompt is sent anyway.
-        """
-        deadline = asyncio.get_running_loop().time() + _RUNNER_ONLINE_TIMEOUT_S
-        while asyncio.get_running_loop().time() < deadline:
-            snap = await client.get(f"/v1/sessions/{session_id}", headers=headers)
-            runner_id = snap.json().get("runner_id") if snap.status_code < 400 else None
-            if runner_id:
-                status = await client.get(f"/v1/runners/{runner_id}/status", headers=headers)
-                if status.status_code < 400 and status.json().get("online"):
-                    return
-            await asyncio.sleep(_RUNNER_POLL_S)
-        _logger.warning("shipcrew: runner of session %s not online; prompting anyway", session_id)
-
     async def cancel(self, session_id: str, *, acting_user: str | None) -> None:
-        """Interrupt the session's running work."""
+        """Interrupt the session's running work (the process stays, e.g. for a human)."""
+        ...
+
+    async def stop(self, session_id: str, *, acting_user: str | None) -> None:
+        """Terminate the session's agent process and runner; the transcript stays."""
         ...
 
     async def snapshot(
@@ -192,19 +178,26 @@ class OmnigentSessionService:
         registry = getattr(self._app.state, "host_registry", None)
         if registry is None:
             raise SessionServiceError("no host registry on this server")
+        # The worktree call below goes straight to the host tunnel, past the
+        # owner check of /v1/hosts: with real users, only the acting user's
+        # own hosts are candidates (single-user mode may use any online host).
+        multi_user = acting_user is not None and acting_user != RESERVED_USER_LOCAL
+        host_store = getattr(self._app.state, "host_store", None)
+        owned: list[str] = []
+        if host_store is not None:
+            hosts = await asyncio.to_thread(
+                host_store.list_hosts, acting_user or RESERVED_USER_LOCAL
+            )
+            owned = [str(h.host_id) for h in hosts if getattr(h, "sandbox_provider", None) is None]
         candidates: list[str] = []
         if self._host_id is not None:
             candidates.append(self._host_id)
         else:
-            host_store = getattr(self._app.state, "host_store", None)
-            if host_store is not None:
-                hosts = await asyncio.to_thread(
-                    host_store.list_hosts, acting_user or RESERVED_USER_LOCAL
-                )
-                candidates.extend(
-                    str(h.host_id) for h in hosts if getattr(h, "sandbox_provider", None) is None
-                )
-            candidates.extend(registry.online_host_ids())
+            candidates.extend(owned)
+            if not multi_user:
+                candidates.extend(registry.online_host_ids())
+        if multi_user:
+            candidates = [h for h in candidates if h in owned]
         for host_id in candidates:
             conn = registry.get(host_id)
             if conn is not None:
@@ -279,20 +272,27 @@ class OmnigentSessionService:
             if created.status_code >= 400:
                 raise SessionServiceError(f"session create failed: {_error_detail(created)}")
             session_id = str(created.json()["session_id"])
-            await self._wait_runner_online(client, session_id, headers)
-            sent = await client.post(
-                f"/v1/sessions/{session_id}/events",
-                json={
-                    "type": "message",
-                    "data": {
-                        "role": "user",
-                        "content": [{"type": "input_text", "text": request.prompt}],
+            try:
+                await self._wait_runner_online(client, session_id, headers)
+                sent = await client.post(
+                    f"/v1/sessions/{session_id}/events",
+                    json={
+                        "type": "message",
+                        "data": {
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": request.prompt}],
+                        },
                     },
-                },
-                headers=headers,
-            )
-            if sent.status_code >= 400:
-                raise SessionServiceError(f"prompt dispatch failed: {_error_detail(sent)}")
+                    headers=headers,
+                )
+                if sent.status_code >= 400:
+                    raise SessionServiceError(f"prompt dispatch failed: {_error_detail(sent)}")
+            except BaseException:
+                # The caller never learns this id: end the session, or its
+                # runner lingers unowned by any card.
+                with contextlib.suppress(Exception):
+                    await self.stop(session_id, acting_user=request.acting_user)
+                raise
         return session_id
 
     async def _wait_runner_online(
@@ -323,6 +323,18 @@ class OmnigentSessionService:
             )
         if response.status_code >= 400 and response.status_code != 404:
             raise SessionServiceError(f"interrupt failed: {_error_detail(response)}")
+
+    async def stop(self, session_id: str, *, acting_user: str | None) -> None:
+        # stop_session kills the harness process (claude's tmux pane) and the
+        # host runner launched for it; an interrupt alone leaves both alive.
+        async with self._client() as client:
+            response = await client.post(
+                f"/v1/sessions/{session_id}/events",
+                json={"type": "stop_session", "data": {}},
+                headers=self._auth_headers(acting_user),
+            )
+        if response.status_code >= 400 and response.status_code != 404:
+            raise SessionServiceError(f"stop failed: {_error_detail(response)}")
 
     async def snapshot(
         self, session_id: str, *, acting_user: str | None

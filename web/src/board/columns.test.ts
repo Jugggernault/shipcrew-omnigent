@@ -25,9 +25,9 @@ describe("projectColumns", () => {
 
   it("orders a column by position, then creation time", () => {
     const tasks = [
-      makeTask({ id: "late", position: 2, created_at: "2026-01-01T00:00:00Z" }),
-      makeTask({ id: "second", position: 1, created_at: "2026-01-02T00:00:00Z" }),
-      makeTask({ id: "first", position: 1, created_at: "2026-01-01T00:00:00Z" }),
+      makeTask({ id: "late", position: 2, created_at: 1_767_225_600 }),
+      makeTask({ id: "second", position: 1, created_at: 1_767_312_000 }),
+      makeTask({ id: "first", position: 1, created_at: 1_767_225_600 }),
     ];
     expect(projectColumns(tasks).backlog.map((task) => task.id)).toEqual([
       "first",

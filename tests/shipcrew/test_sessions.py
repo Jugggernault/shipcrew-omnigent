@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import io
 import json
 import tarfile
@@ -272,3 +273,62 @@ def test_snapshot_from_payload_failed() -> None:
         {"status": "failed", "last_task_error": {"message": "rate limited"}}
     )
     assert (snap.status, snap.error, snap.cost_usd) == ("failed", "rate limited", None)
+
+
+async def test_stop_sends_stop_session() -> None:
+    stub = _StubApp(host_ids=[])
+    await OmnigentSessionService(stub.app, None).stop("conv_9", acting_user=None)
+    assert stub.events == [("conv_9", {"type": "stop_session", "data": {}})]
+
+
+async def test_failed_prompt_ends_the_created_session(
+    monkeypatch: pytest.MonkeyPatch, bundle: Path
+) -> None:
+    stub = _StubApp(host_ids=["host_a"])
+    _patch_worktrees(monkeypatch, _Worktrees(listed=[]))
+
+    @stub.app.middleware("http")
+    async def _reject_prompt(request: Request, call_next: Any) -> Any:
+        if request.url.path.endswith("/events"):
+            body = await request.body()
+            if b'"message"' in body:
+                return JSONResponse(status_code=500, content={"detail": "boom"})
+        return await call_next(request)
+
+    with pytest.raises(SessionServiceError, match="prompt dispatch failed"):
+        await OmnigentSessionService(stub.app, None).create_root_session(_request(bundle))
+    assert stub.events == [("conv_1", {"type": "stop_session", "data": {}})]
+
+
+class _Host:
+    def __init__(self, host_id: str) -> None:
+        self.host_id = host_id
+        self.sandbox_provider = None
+
+
+class _HostStore:
+    def __init__(self, owned: dict[str, list[str]]) -> None:
+        self._owned = owned
+
+    def list_hosts(self, user_id: str) -> list[_Host]:
+        return [_Host(h) for h in self._owned.get(user_id, [])]
+
+
+async def test_real_users_only_launch_on_their_own_hosts(
+    monkeypatch: pytest.MonkeyPatch, bundle: Path
+) -> None:
+    # alice's host is online, bob owns none: bob's task must not borrow it.
+    stub = _StubApp(host_ids=["host_alice"])
+    stub.app.state.host_store = _HostStore({"alice@example.com": ["host_alice"]})
+    worktrees = _Worktrees(listed=[])
+    _patch_worktrees(monkeypatch, worktrees)
+    request = dataclasses.replace(_request(bundle), acting_user="bob@example.com")
+    with pytest.raises(SessionServiceError, match="no online host"):
+        await OmnigentSessionService(stub.app, None).create_root_session(request)
+    pinned = OmnigentSessionService(stub.app, None, host_id="host_alice")
+    with pytest.raises(SessionServiceError, match="no online host"):
+        await pinned.create_root_session(request)
+    assert worktrees.created == []
+    owner_request = dataclasses.replace(request, acting_user="alice@example.com")
+    await OmnigentSessionService(stub.app, None).create_root_session(owner_request)
+    assert stub.creates[0]["metadata"]["host_id"] == "host_alice"

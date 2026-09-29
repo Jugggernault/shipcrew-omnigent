@@ -111,8 +111,8 @@ def create_shipcrew_router(
 
     @router.get("/missions")
     async def list_missions(request: Request) -> dict[str, Any]:
-        require_user(request, auth_provider)
-        missions = await (await _svc()).list_missions()
+        user_id = require_user(request, auth_provider)
+        missions = await (await _svc()).list_missions_for(user_id)
         return {"missions": [m.to_api() for m in missions]}
 
     @router.post("/missions")
@@ -125,22 +125,28 @@ def create_shipcrew_router(
 
     @router.get("/missions/{mission_id}/tasks")
     async def list_tasks(request: Request, mission_id: str) -> dict[str, Any]:
-        require_user(request, auth_provider)
-        tasks = await (await _svc()).list_tasks(mission_id)
+        user_id = require_user(request, auth_provider)
+        service = await _svc()
+        await service.authorize_mission(mission_id, user_id)
+        tasks = await service.list_tasks(mission_id)
         return {"tasks": [t.to_api() for t in tasks]}
 
     @router.post("/missions/{mission_id}/tasks")
     async def create_task(
         request: Request, mission_id: str, body: CreateTaskBody
     ) -> dict[str, Any]:
-        require_user(request, auth_provider)
-        task = await (await _svc()).create_task(mission_id, **body.model_dump())
+        user_id = require_user(request, auth_provider)
+        service = await _svc()
+        await service.authorize_mission(mission_id, user_id)
+        task = await service.create_task(mission_id, **body.model_dump())
         return task.to_api()
 
     @router.patch("/tasks/{task_id}")
     async def patch_task(request: Request, task_id: str, body: PatchTaskBody) -> dict[str, Any]:
         user_id = require_user(request, auth_provider)
-        task = await (await _svc()).patch_task(task_id, body.changes(), user_id)
+        service = await _svc()
+        await service.authorize_task(task_id, user_id)
+        task = await service.patch_task(task_id, body.changes(), user_id)
         if task.status == "ready" and on_ready is not None:
             on_ready()
         return task.to_api()
@@ -148,18 +154,22 @@ def create_shipcrew_router(
     @router.post("/tasks/{task_id}/start")
     async def start_task(request: Request, task_id: str) -> dict[str, Any]:
         user_id = require_user(request, auth_provider)
-        return (await (await _svc()).start_task(task_id, user_id)).to_api()
+        service = await _svc()
+        await service.authorize_task(task_id, user_id)
+        return (await service.start_task(task_id, user_id)).to_api()
 
     @router.post("/tasks/{task_id}/stop")
     async def stop_task(request: Request, task_id: str) -> dict[str, Any]:
         user_id = require_user(request, auth_provider)
-        return (await (await _svc()).stop_task(task_id, user_id)).to_api()
+        service = await _svc()
+        await service.authorize_task(task_id, user_id)
+        return (await service.stop_task(task_id, user_id)).to_api()
 
     @router.get("/missions/{mission_id}/stream")
     async def stream(request: Request, mission_id: str) -> StreamingResponse:
-        require_user(request, auth_provider)
+        user_id = require_user(request, auth_provider)
         service = await _svc()
-        await service.require_mission(mission_id)
+        await service.authorize_mission(mission_id, user_id)
 
         async def events() -> AsyncIterator[str]:
             async with service.bus.subscribe(mission_id) as queue:

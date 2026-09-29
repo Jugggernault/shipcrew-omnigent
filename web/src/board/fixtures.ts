@@ -22,8 +22,8 @@ export function makeTask(overrides: Partial<Task> = {}): Task {
     cost_usd: 0,
     position: 0,
     blocked_reason: null,
-    created_at: "2026-09-01T10:00:00Z",
-    updated_at: "2026-09-01T10:00:00Z",
+    created_at: 1_788_256_800,
+    updated_at: 1_788_256_800,
     ...overrides,
   };
 }
@@ -35,7 +35,7 @@ export function makeMission(overrides: Partial<Mission> = {}): Mission {
     repo_path: "/home/dev/code/app",
     repo_url: null,
     status: "active",
-    created_at: "2026-09-01T09:00:00Z",
+    created_at: 1_788_253_200,
     ...overrides,
   };
 }

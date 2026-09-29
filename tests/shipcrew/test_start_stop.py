@@ -124,7 +124,9 @@ class TestStop:
         _, task = await _setup(client)
         await client.post(f"{P}/tasks/{task['id']}/start")
         body = (await client.post(f"{P}/tasks/{task['id']}/stop")).json()
-        assert sessions.cancelled == ["sess1"]
+        # Terminated (process + runner), not just interrupted.
+        assert sessions.stopped == ["sess1"]
+        assert sessions.cancelled == []
         assert body["status"] == "blocked"
         assert body["blocked_reason"] == "stopped by user"
 
@@ -138,7 +140,9 @@ class TestStop:
                 f"{P}/tasks/{task['id']}", json={"assignee": {"kind": "human", "id": "bob"}}
             )
         ).json()
+        # Interrupted only: the human takes over the live terminal.
         assert sessions.cancelled == ["sess1"]
+        assert sessions.stopped == []
         assert body["assignee"] == {"kind": "human", "id": "bob"}
 
     async def test_dragging_out_of_running_stops_agent(
@@ -148,7 +152,69 @@ class TestStop:
         await client.post(f"{P}/tasks/{task['id']}/start")
         body = (await client.patch(f"{P}/tasks/{task['id']}", json={"status": "backlog"})).json()
         assert body["status"] == "backlog"
+        assert sessions.stopped == ["sess1"]
+
+    async def test_moving_a_review_card_ends_its_idle_session(
+        self, client: httpx.AsyncClient, sessions: FakeSessions, service: ShipcrewService
+    ) -> None:
+        _, task = await _setup(client)
+        await client.post(f"{P}/tasks/{task['id']}/start")
+        await asyncio.to_thread(service.store.update_task, task["id"], status="review")
+        await client.patch(f"{P}/tasks/{task['id']}", json={"status": "ready"})
+        assert sessions.stopped == ["sess1"]
+
+
+class TestStartRaces:
+    async def test_concurrent_starts_create_one_session(
+        self, client: httpx.AsyncClient, sessions: FakeSessions, service: ShipcrewService
+    ) -> None:
+        _, task = await _setup(client)
+        first, second = await asyncio.gather(
+            service.start_task(task["id"], None),
+            service.start_task(task["id"], None),
+            return_exceptions=True,
+        )
+        assert len(sessions.created) == 1
+        outcomes = sorted(type(r).__name__ for r in (first, second))
+        assert outcomes == ["OmnigentError", "Task"]
+
+    async def test_stop_during_start_ends_the_new_session(
+        self, client: httpx.AsyncClient, sessions: FakeSessions, service: ShipcrewService
+    ) -> None:
+        _, task = await _setup(client)
+        sessions.gate = asyncio.Event()
+        starting = asyncio.create_task(service.start_task(task["id"], None))
+        while not sessions.created:
+            await asyncio.sleep(0)
+        stopped = await service.stop_task(task["id"], None)
+        assert stopped.status == "blocked"
+        sessions.gate.set()
+        final = await starting
+        assert sessions.stopped == ["sess1"]
+        assert (final.status, final.root_session_id) == ("blocked", "sess1")
+
+    async def test_human_taking_card_during_start_interrupts_new_session(
+        self, client: httpx.AsyncClient, sessions: FakeSessions, service: ShipcrewService
+    ) -> None:
+        _, task = await _setup(client)
+        sessions.gate = asyncio.Event()
+        starting = asyncio.create_task(service.start_task(task["id"], None))
+        while not sessions.created:
+            await asyncio.sleep(0)
+        await service.patch_task(task["id"], {"assignee": {"kind": "human", "id": "bob"}}, None)
+        sessions.gate.set()
+        final = await starting
         assert sessions.cancelled == ["sess1"]
+        assert sessions.stopped == []
+        assert final.root_session_id == "sess1"
+
+    async def test_unexpected_start_error_frees_the_slot(
+        self, client: httpx.AsyncClient, sessions: FakeSessions
+    ) -> None:
+        sessions.crash_create = RuntimeError("tunnel closed")
+        _, task = await _setup(client)
+        body = (await client.post(f"{P}/tasks/{task['id']}/start")).json()
+        assert (body["status"], body["blocked_reason"]) == ("blocked", "tunnel closed")
 
 
 class TestSessionMapping:

@@ -9,7 +9,8 @@ export interface Mission {
   repo_path: string;
   repo_url: string | null;
   status: MissionStatus;
-  created_at: string;
+  /** Unix epoch seconds (server clock). */
+  created_at: number;
 }
 
 export const TASK_STATUSES = [
@@ -51,8 +52,9 @@ export interface Task {
   cost_usd: number;
   position: number;
   blocked_reason: string | null;
-  created_at: string;
-  updated_at: string;
+  /** Unix epoch seconds (server clock). */
+  created_at: number;
+  updated_at: number;
 }
 
 export interface CreateMissionInput {

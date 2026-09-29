@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -32,17 +33,29 @@ class FakeSessions:
 
     created: list[RootSessionRequest] = field(default_factory=list)
     cancelled: list[str] = field(default_factory=list)
+    stopped: list[str] = field(default_factory=list)
     snapshots: dict[str, SessionSnapshot | None] = field(default_factory=dict)
     fail_create: str | None = None
+    crash_create: Exception | None = None
+    # When set, create_root_session waits on it (to race other calls against it).
+    gate: asyncio.Event | None = None
 
     async def create_root_session(self, request: RootSessionRequest) -> str:
         if self.fail_create is not None:
             raise SessionServiceError(self.fail_create)
+        if self.crash_create is not None:
+            raise self.crash_create
         self.created.append(request)
-        return f"sess{len(self.created)}"
+        session_id = f"sess{len(self.created)}"
+        if self.gate is not None:
+            await self.gate.wait()
+        return session_id
 
     async def cancel(self, session_id: str, *, acting_user: str | None) -> None:
         self.cancelled.append(session_id)
+
+    async def stop(self, session_id: str, *, acting_user: str | None) -> None:
+        self.stopped.append(session_id)
 
     async def snapshot(
         self, session_id: str, *, acting_user: str | None

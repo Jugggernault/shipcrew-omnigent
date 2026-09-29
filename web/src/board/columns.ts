@@ -63,8 +63,7 @@ export function projectColumns(tasks: readonly Task[], options: ProjectOptions =
   }
   for (const list of Object.values(columns)) {
     list.sort(
-      (left, right) =>
-        left.position - right.position || left.created_at.localeCompare(right.created_at),
+      (left, right) => left.position - right.position || left.created_at - right.created_at,
     );
   }
   return columns;

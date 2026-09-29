@@ -61,6 +61,8 @@ def build_prompt(task: Task) -> str:
 # Review cards are still watched: Claude can end its turn while a background
 # sub-agent keeps working, and resume when that sub-agent reports.
 WATCHED_REVIEW_STATUSES = frozenset({"review"})
+# Cards whose root session is (or may still be) alive.
+SESSION_HOLDING_STATUSES = ACTIVE_STATUSES | WATCHED_REVIEW_STATUSES
 
 
 def map_session_state(task: Task, snap: SessionSnapshot | None) -> dict[str, Any]:
@@ -132,6 +134,35 @@ class ShipcrewService:
             raise _not_found("mission", mission_id)
         return mission
 
+    @staticmethod
+    def visible_to(mission: Mission, user_id: str | None) -> bool:
+        """Whether ``user_id`` may see and drive ``mission``.
+
+        ``None`` means auth is disabled (single user). Otherwise only the
+        mission's creator does: its tasks start agents on that user's host.
+        """
+        return user_id is None or mission.owner_user_id in (None, user_id)
+
+    async def list_missions_for(self, user_id: str | None) -> list[Mission]:
+        return [m for m in await self.list_missions() if self.visible_to(m, user_id)]
+
+    async def authorize_mission(self, mission_id: str, user_id: str | None) -> Mission:
+        """The mission, or 404 when it does not exist or belongs to someone else."""
+        mission = await self._call(self.store.get_mission, mission_id)
+        if mission is None or not self.visible_to(mission, user_id):
+            raise _not_found("mission", mission_id)
+        return mission
+
+    async def authorize_task(self, task_id: str, user_id: str | None) -> Task:
+        """The task, or 404 when it does not exist or its mission is someone else's."""
+        task = await self._call(self.store.get_task, task_id)
+        mission = (
+            await self._call(self.store.get_mission, task.mission_id) if task is not None else None
+        )
+        if task is None or mission is None or not self.visible_to(mission, user_id):
+            raise _not_found("task", task_id)
+        return task
+
     # ── Tasks ───────────────────────────────────────────────────
 
     async def require_task(self, task_id: str) -> Task:
@@ -170,13 +201,15 @@ class ShipcrewService:
             await self._validate_deps(task.mission_id, task.id, deps)
             fields["depends_on"] = deps
         update: dict[str, Any] = dict(fields)
-        stop_agent = False
+        interrupt_agent = False
+        terminate_agent = False
         if "assignee" in changes:
             raw = changes["assignee"]
             assignee = Assignee(kind=raw["kind"], id=raw["id"]) if raw else None
             update["assignee"] = assignee
-            # A human taking the card stops the agent working on it.
-            stop_agent = assignee is not None and assignee.kind == "human"
+            # A human taking the card stops the agent's turn; the process stays
+            # so the human can take over its terminal.
+            interrupt_agent = assignee is not None and assignee.kind == "human"
         status = changes.get("status")
         if status is not None and status != task.status:
             if status not in TASK_STATUSES:
@@ -187,43 +220,62 @@ class ShipcrewService:
                 if fields or "assignee" in update:
                     await self._update(task.id, **update)
                 return await self.start_task(task.id, acting_user)
-            if task.status in ACTIVE_STATUSES:
-                stop_agent = True
+            # Moving a card off its session ends that session: a restart
+            # opens a new one, so the old agent process must not linger.
+            terminate_agent = task.status in SESSION_HOLDING_STATUSES
             update["status"] = status
             if status in ("ready", "backlog", "merged"):
                 update["blocked_reason"] = None
-        if stop_agent and task.status in ACTIVE_STATUSES and task.root_session_id:
+        if terminate_agent:
+            await self._stop_quietly(task, acting_user)
+        elif interrupt_agent and task.status in ACTIVE_STATUSES:
             await self._cancel_quietly(task, acting_user)
         if not update:
             return task
         return await self._update(task.id, **update)
 
-    async def _cancel_quietly(self, task: Task, acting_user: str | None) -> None:
-        if task.root_session_id is None:
+    async def _cancel_quietly(
+        self, task: Task, acting_user: str | None, session_id: str | None = None
+    ) -> None:
+        session_id = session_id or task.root_session_id
+        if session_id is None:
             return
         try:
-            await self.sessions.cancel(task.root_session_id, acting_user=acting_user)
+            await self.sessions.cancel(session_id, acting_user=acting_user)
         except SessionServiceError:
             _logger.warning("shipcrew: could not interrupt session of task %s", task.id)
 
+    async def _stop_quietly(
+        self, task: Task, acting_user: str | None, session_id: str | None = None
+    ) -> None:
+        session_id = session_id or task.root_session_id
+        if session_id is None:
+            return
+        try:
+            await self.sessions.stop(session_id, acting_user=acting_user)
+        except SessionServiceError:
+            _logger.warning("shipcrew: could not stop session of task %s", task.id)
+
     async def start_task(self, task_id: str, acting_user: str | None) -> Task:
         """Create the task's worktree + root session and mark it running."""
-        task = await self.require_task(task_id)
-        if task.status in ACTIVE_STATUSES:
-            return task
-        if task.status == "merged":
-            raise _conflict("task is already merged")
-        if task.human_assigned:
-            raise _conflict("task is assigned to a human")
-        if task.id in self._starting:
+        # Claim before the first await: the API and the scheduler can both try
+        # to start the same card, and each check below yields to the loop.
+        if task_id in self._starting:
             raise _conflict("task is already starting")
-        mission = await self.require_mission(task.mission_id)
-        agent_dir = self.settings.agents_dir / task.role
-        if not (agent_dir / "config.yaml").is_file():
-            reason = f"no agent bundle for role {task.role!r} in {self.settings.agents_dir}"
-            return await self._update(task.id, status="blocked", blocked_reason=reason)
-        self._starting.add(task.id)
+        self._starting.add(task_id)
         try:
+            task = await self.require_task(task_id)
+            if task.status in ACTIVE_STATUSES:
+                return task
+            if task.status == "merged":
+                raise _conflict("task is already merged")
+            if task.human_assigned:
+                raise _conflict("task is assigned to a human")
+            mission = await self.require_mission(task.mission_id)
+            agent_dir = self.settings.agents_dir / task.role
+            if not (agent_dir / "config.yaml").is_file():
+                reason = f"no agent bundle for role {task.role!r} in {self.settings.agents_dir}"
+                return await self._update(task.id, status="blocked", blocked_reason=reason)
             # Claim a capacity slot before the slow worktree/session work.
             task = await self._update(
                 task.id, status="running", blocked_reason=None, session_seen_active=False
@@ -241,18 +293,30 @@ class ShipcrewService:
             )
             try:
                 session_id = await self.sessions.create_root_session(request)
-            except SessionServiceError as exc:
-                return await self._update(task.id, status="blocked", blocked_reason=str(exc))
+            except Exception as exc:
+                # Any failure (not only SessionServiceError) must release the
+                # slot claimed above, or the card stays "running" with no session.
+                if not isinstance(exc, SessionServiceError):
+                    _logger.exception("shipcrew: session start failed for task %s", task.id)
+                reason = str(exc) or type(exc).__name__
+                return await self._update(task.id, status="blocked", blocked_reason=reason)
             if mission.status == "planning":
                 await self._call(self.store.set_mission_status, mission.id, "active")
+            # The card may have been stopped, moved or taken by a human while
+            # the session was being created: never leave that agent running.
+            current = await self.require_task(task.id)
+            if current.status not in ACTIVE_STATUSES:
+                await self._stop_quietly(current, acting_user, session_id)
+            elif current.human_assigned:
+                await self._cancel_quietly(current, acting_user, session_id)
             return await self._update(task.id, root_session_id=session_id)
         finally:
-            self._starting.discard(task.id)
+            self._starting.discard(task_id)
 
     async def stop_task(self, task_id: str, acting_user: str | None) -> Task:
-        """Interrupt the agent and park the card as blocked."""
+        """Terminate the agent's session and park the card as blocked."""
         task = await self.require_task(task_id)
-        await self._cancel_quietly(task, acting_user)
+        await self._stop_quietly(task, acting_user)
         if task.status not in ACTIVE_STATUSES:
             return task
         return await self._update(task.id, status="blocked", blocked_reason="stopped by user")

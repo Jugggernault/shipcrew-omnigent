@@ -68,9 +68,15 @@ claude-native sessions on the Claude subscription login:
 - **Worktree cleanup:** worktrees stay after stop and merge. Nothing removes them
   yet.
 - **Idle sessions** are not stopped when a card reaches Review. The spike found
-  an idle `claude` still uses 5–25 % of a core.
-- **ACL:** any authenticated user sees every mission. There is no per-user
-  scoping.
+  an idle `claude` still uses 5–25 % of a core. They are stopped (process and
+  host runner, via `stop_session`) on `/stop` and when the card is moved out of
+  Running/Intervention/Review.
+- **ACL:** a mission and its tasks are visible to their creator only (404 for
+  other users; everything is visible with auth off). There is no sharing and no
+  admin override yet.
+- **Sequential starts:** the scheduler starts ready cards one after the other
+  (each waits for its runner, about 10 s), so N parallel starts take N times as
+  long.
 - **Remote hosts:** folder pre-trust only runs when the host shares the server's
   filesystem. It is skipped otherwise.
 
