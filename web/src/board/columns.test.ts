@@ -59,6 +59,10 @@ describe("dropAction", () => {
     expect(dropAction(makeTask(), "running")).toEqual({ kind: "start" });
   });
 
+  it("ignores drops on Intervention, which only the agent session sets", () => {
+    expect(dropAction(makeTask({ status: "running" }), "intervention")).toEqual({ kind: "none" });
+  });
+
   it("asks before a manual merge", () => {
     expect(dropAction(makeTask({ status: "review" }), "merged")).toEqual({ kind: "confirm-merge" });
   });

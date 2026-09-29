@@ -70,6 +70,11 @@ export function projectColumns(tasks: readonly Task[], options: ProjectOptions =
   return columns;
 }
 
+/** Intervention is set by the agent session (a pending approval), never by a move. */
+export function canMoveTo(column: ColumnId): boolean {
+  return column !== "intervention";
+}
+
 export type DropAction =
   | { kind: "none" }
   | { kind: "start" }
@@ -81,6 +86,7 @@ export type DropAction =
  * Merged normally comes from the PR loop, so a manual move asks first.
  */
 export function dropAction(task: Task, column: ColumnId): DropAction {
+  if (!canMoveTo(column)) return { kind: "none" };
   if (columnForStatus(task.status) === column && task.status !== "blocked") return { kind: "none" };
   if (task.status === "blocked" && column === "backlog")
     return { kind: "patch", status: "backlog" };

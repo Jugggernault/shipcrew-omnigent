@@ -15,6 +15,8 @@ import io
 import json
 import logging
 import tarfile
+import tempfile
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
@@ -27,6 +29,9 @@ _logger = logging.getLogger(__name__)
 _TOKEN_TTL_S = 300
 _INTERNAL_BASE_URL = "http://127.0.0.1"
 _BUNDLE_SKIP_DIRS = {".git", "__pycache__", "node_modules", ".venv"}
+_RUNNER_ONLINE_TIMEOUT_S = 60.0
+_RUNNER_POLL_S = 0.25
+_TRUST_LOCK = threading.Lock()
 
 
 class SessionServiceError(RuntimeError):
@@ -78,6 +83,25 @@ class SessionService(Protocol):
         """Create the worktree + root session, send the prompt, return the id."""
         ...
 
+    async def _wait_runner_online(
+        self, client: httpx.AsyncClient, session_id: str, headers: dict[str, str]
+    ) -> None:
+        """Wait for the host-launched runner before the first prompt.
+
+        A prompt posted earlier costs the server's fixed connect grace plus a
+        runner relaunch. Best effort: on timeout the prompt is sent anyway.
+        """
+        deadline = asyncio.get_running_loop().time() + _RUNNER_ONLINE_TIMEOUT_S
+        while asyncio.get_running_loop().time() < deadline:
+            snap = await client.get(f"/v1/sessions/{session_id}", headers=headers)
+            runner_id = snap.json().get("runner_id") if snap.status_code < 400 else None
+            if runner_id:
+                status = await client.get(f"/v1/runners/{runner_id}/status", headers=headers)
+                if status.status_code < 400 and status.json().get("online"):
+                    return
+            await asyncio.sleep(_RUNNER_POLL_S)
+        _logger.warning("shipcrew: runner of session %s not online; prompting anyway", session_id)
+
     async def cancel(self, session_id: str, *, acting_user: str | None) -> None:
         """Interrupt the session's running work."""
         ...
@@ -91,14 +115,19 @@ class SessionService(Protocol):
 
 def bundle_agent_dir(agent_dir: Path) -> bytes:
     """Pack an agent bundle directory as the ``tar.gz`` omnigent accepts."""
+    from omnigent.spec import materialize_bundle
+
     if not (agent_dir / "config.yaml").is_file():
         raise SessionServiceError(f"agent bundle {agent_dir} has no config.yaml")
     buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-        for path in sorted(agent_dir.rglob("*")):
-            rel = path.relative_to(agent_dir)
-            if path.is_file() and not _BUNDLE_SKIP_DIRS.intersection(rel.parts):
-                tar.add(str(path), arcname=rel.as_posix())
+    # materialize_bundle dereferences symlinks (the orchestrator's agents/<role>).
+    with tempfile.TemporaryDirectory() as tmp:
+        root = materialize_bundle(agent_dir, Path(tmp) / "bundle")
+        with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+            for path in sorted(root.rglob("*")):
+                rel = path.relative_to(root)
+                if path.is_file() and not _BUNDLE_SKIP_DIRS.intersection(rel.parts):
+                    tar.add(str(path), arcname=rel.as_posix())
     return buf.getvalue()
 
 
@@ -232,6 +261,7 @@ class OmnigentSessionService:
         bundle = await asyncio.to_thread(bundle_agent_dir, request.agent_dir)
         host_id, conn = await self._resolve_host(request.acting_user)
         workspace = await self._task_worktree(conn, request)
+        await asyncio.to_thread(_pretrust_claude_workspace, workspace)
         metadata = {
             "title": request.title[:200],
             "host_id": host_id,
@@ -249,6 +279,7 @@ class OmnigentSessionService:
             if created.status_code >= 400:
                 raise SessionServiceError(f"session create failed: {_error_detail(created)}")
             session_id = str(created.json()["session_id"])
+            await self._wait_runner_online(client, session_id, headers)
             sent = await client.post(
                 f"/v1/sessions/{session_id}/events",
                 json={
@@ -263,6 +294,25 @@ class OmnigentSessionService:
             if sent.status_code >= 400:
                 raise SessionServiceError(f"prompt dispatch failed: {_error_detail(sent)}")
         return session_id
+
+    async def _wait_runner_online(
+        self, client: httpx.AsyncClient, session_id: str, headers: dict[str, str]
+    ) -> None:
+        """Wait for the host-launched runner before the first prompt.
+
+        A prompt posted earlier costs the server's fixed connect grace plus a
+        runner relaunch. Best effort: on timeout the prompt is sent anyway.
+        """
+        deadline = asyncio.get_running_loop().time() + _RUNNER_ONLINE_TIMEOUT_S
+        while asyncio.get_running_loop().time() < deadline:
+            snap = await client.get(f"/v1/sessions/{session_id}", headers=headers)
+            runner_id = snap.json().get("runner_id") if snap.status_code < 400 else None
+            if runner_id:
+                status = await client.get(f"/v1/runners/{runner_id}/status", headers=headers)
+                if status.status_code < 400 and status.json().get("online"):
+                    return
+            await asyncio.sleep(_RUNNER_POLL_S)
+        _logger.warning("shipcrew: runner of session %s not online; prompting anyway", session_id)
 
     async def cancel(self, session_id: str, *, acting_user: str | None) -> None:
         async with self._client() as client:
@@ -299,6 +349,25 @@ class OmnigentSessionService:
             raise SessionServiceError(f"session items read failed: {_error_detail(items)}")
         latest = (items.json().get("data") or [None])[0]
         return dataclasses.replace(snap, agent_replied=_is_agent_item(latest))
+
+
+def _pretrust_claude_workspace(workspace: str) -> None:
+    """Seed Claude's folder trust for a local worktree before its session starts.
+
+    Concurrent ``claude`` launches race on ``~/.claude.json`` and can drop each
+    other's trust entry; pre-seeding makes the launch-time write a no-op. Only
+    applies when the host shares this machine's filesystem.
+    """
+    path = Path(workspace)
+    if not path.is_dir():
+        return
+    from omnigent.harnesses.claude_native.bridge import ensure_claude_workspace_trusted
+
+    with _TRUST_LOCK:
+        try:
+            ensure_claude_workspace_trusted(path)
+        except (OSError, ValueError) as exc:
+            _logger.warning("shipcrew: could not pre-trust %s: %s", workspace, exc)
 
 
 def _is_agent_item(item: Any) -> bool:

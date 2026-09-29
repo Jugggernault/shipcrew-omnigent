@@ -16,7 +16,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { formatSessionCostUsd } from "@/lib/formatCost";
 import { cn } from "@/lib/utils";
-import { BOARD_COLUMNS, columnForStatus, isBlocked, type ColumnId } from "./columns";
+import { BOARD_COLUMNS, canMoveTo, columnForStatus, isBlocked, type ColumnId } from "./columns";
 import { AssigneeAvatar, CiBadge, PullRequestLink, RoleBadge } from "./TaskBadges";
 import type { Task, TaskAssignee } from "./types";
 
@@ -139,7 +139,8 @@ function TaskCardView({
           <DropdownMenuContent align="end" onClick={stop}>
             <DropdownMenuLabel>Move to</DropdownMenuLabel>
             {BOARD_COLUMNS.filter(
-              (column) => column.id !== currentColumn || task.status === "blocked",
+              (column) =>
+                canMoveTo(column.id) && (column.id !== currentColumn || task.status === "blocked"),
             ).map((column) => (
               <DropdownMenuItem key={column.id} onSelect={() => onMove(task, column.id)}>
                 {column.label}

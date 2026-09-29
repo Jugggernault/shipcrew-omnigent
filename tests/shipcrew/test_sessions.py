@@ -39,7 +39,8 @@ class _StubApp:
     def __init__(self, *, host_ids: list[str]) -> None:
         self.creates: list[dict[str, Any]] = []
         self.events: list[tuple[str, dict[str, Any]]] = []
-        self.session_body: dict[str, Any] | None = {"status": "running"}
+        self.session_body: dict[str, Any] | None = {"status": "running", "runner_id": "run_1"}
+        self.runner_polls = 0
         self.latest_items: list[dict[str, Any]] = []
         self.app = FastAPI()
         self.app.state.host_registry = _Registry(host_ids)
@@ -63,6 +64,12 @@ class _StubApp:
         async def events(session_id: str, request: Request) -> dict[str, Any]:
             self.events.append((session_id, await request.json()))
             return {"ok": True}
+
+        @self.app.get("/v1/runners/{runner_id}/status")
+        async def runner_status(runner_id: str) -> dict[str, Any]:
+            # Offline on the first poll, online after: the prompt must wait.
+            self.runner_polls += 1
+            return {"online": self.runner_polls > 1}
 
         @self.app.get("/v1/sessions/{session_id}/items")
         async def items(session_id: str, limit: int, order: str) -> dict[str, Any]:
@@ -128,6 +135,15 @@ def test_bundle_skips_build_dirs(bundle: Path) -> None:
         assert sorted(tar.getnames()) == ["config.yaml", "skills/a.md"]
 
 
+def test_bundle_dereferences_symlinked_sub_agents(bundle: Path, tmp_path: Path) -> None:
+    parent = tmp_path / "orchestrator"
+    (parent / "agents").mkdir(parents=True)
+    (parent / "config.yaml").write_text("name: orchestrator\n")
+    (parent / "agents" / "worker").symlink_to(bundle, target_is_directory=True)
+    with tarfile.open(fileobj=io.BytesIO(bundle_agent_dir(parent)), mode="r:gz") as tar:
+        assert "agents/worker/config.yaml" in tar.getnames()
+
+
 def test_bundle_without_config_is_rejected(tmp_path: Path) -> None:
     with pytest.raises(SessionServiceError, match=r"config\.yaml"):
         bundle_agent_dir(tmp_path)
@@ -153,6 +169,7 @@ async def test_create_makes_worktree_session_and_sends_prompt(
         "labels": {"shipcrew.task_id": "t1"},
     }
     assert create["origin"] == "omnigent://internal"
+    assert stub.runner_polls == 2
     (sent,) = stub.events
     assert sent[0] == "conv_1"
     assert sent[1]["data"]["content"] == [{"type": "input_text", "text": "# Add login"}]
