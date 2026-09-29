@@ -82,6 +82,13 @@ live end-to-end run: 2026-09-29.
    merged 20:17:29. `npm test` on main: 5 pass, 0 fail. Total cost $1.04,
    3 min 40 s end to end.
 
+A second live run (port 16792, new code) checked the speed paths: three
+independent developer tasks queued with `start-all` got their three worktrees
+and root sessions in the same second (one scheduler tick, `git worktree add`
+serialized per repo), all three PRs went green, each reviewer session ran with
+`reasoning_effort: low` (diffs under 40 lines), and all merged by 20:21:11,
+91 s after the start. $1.52 in total, `npm test` on main 7 pass.
+
 Measured on this machine (ext4, so the hardlink path; Next 15 + React 19 +
 vitest + eslint + faker, 391 MB, ~13k files):
 
