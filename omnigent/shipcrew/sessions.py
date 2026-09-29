@@ -44,6 +44,18 @@ class SessionServiceError(RuntimeError):
     """A session operation failed; the message is shown as ``blocked_reason``."""
 
 
+class ProjectNameTaken(SessionServiceError):
+    """``POST``/``PATCH /v1/projects`` answered 409 (the owner has that name)."""
+
+
+@dataclass(frozen=True)
+class ProjectRef:
+    """An omnigent project as its owner sees it (``GET /v1/projects``)."""
+
+    id: str
+    name: str
+
+
 @dataclass(frozen=True)
 class RootSessionRequest:
     """Everything needed to start a task's root session.
@@ -52,6 +64,7 @@ class RootSessionRequest:
     :param acting_user: Identity the session is created for (its owner).
     :param workspace: Run in this directory as is (no worktree), e.g. the
         planner in the mission repo; ``branch`` is then ignored.
+    :param project_id: The mission's omnigent project the session is filed in.
     """
 
     task_id: str
@@ -65,6 +78,7 @@ class RootSessionRequest:
     labels: dict[str, str] = field(default_factory=dict)
     workspace: str | None = None
     owned_paths: tuple[str, ...] = ()
+    project_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -84,6 +98,8 @@ class ChildSessionRequest:
     labels: dict[str, str] = field(default_factory=dict)
     # Per-session effort (e.g. "low" for a small review diff); None = the agent default.
     reasoning_effort: str | None = None
+    # The mission's omnigent project (same folder as the parent).
+    project_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -374,11 +390,8 @@ class OmnigentSessionService:
         }
         headers = self._auth_headers(request.acting_user)
         async with self._client() as client:
-            created = await client.post(
-                "/v1/sessions",
-                data={"metadata": json.dumps(metadata)},
-                files={"bundle": ("bundle.tar.gz", bundle, "application/gzip")},
-                headers=headers,
+            created = await self._post_session(
+                client, metadata, bundle, headers, request.project_id
             )
             if created.status_code >= 400:
                 raise SessionServiceError(f"session create failed: {_error_detail(created)}")
@@ -393,6 +406,79 @@ class OmnigentSessionService:
                     await self.stop(session_id, acting_user=request.acting_user)
                 raise
         return session_id
+
+    async def _post_session(
+        self,
+        client: httpx.AsyncClient,
+        metadata: dict[str, Any],
+        bundle: bytes,
+        headers: dict[str, str],
+        project_id: str | None,
+    ) -> httpx.Response:
+        """``POST /v1/sessions`` (multipart), filed into ``project_id`` when set.
+
+        A project deleted in the meantime (404) must not block the session:
+        it is created unfiled instead.
+        """
+
+        async def post(meta: dict[str, Any]) -> httpx.Response:
+            return await client.post(
+                "/v1/sessions",
+                data={"metadata": json.dumps(meta)},
+                files={"bundle": ("bundle.tar.gz", bundle, "application/gzip")},
+                headers=headers,
+            )
+
+        if project_id is None:
+            return await post(metadata)
+        created = await post({**metadata, "project_id": project_id})
+        if created.status_code == 404 and "project" in _error_detail(created).lower():
+            _logger.warning("shipcrew: project %s is gone; session created unfiled", project_id)
+            return await post(metadata)
+        return created
+
+    # ── Projects (omnigent/shipcrew/projects.py) ──
+
+    async def list_projects(self, *, acting_user: str | None) -> list[ProjectRef]:
+        async with self._client() as client:
+            response = await client.get("/v1/projects", headers=self._auth_headers(acting_user))
+        if response.status_code >= 400:
+            raise SessionServiceError(f"project list failed: {_error_detail(response)}")
+        return [
+            ProjectRef(id=str(p["id"]), name=str(p.get("name") or ""))
+            for p in response.json().get("data") or []
+            if isinstance(p, dict) and p.get("id")
+        ]
+
+    async def create_project(self, name: str, *, acting_user: str | None) -> ProjectRef:
+        async with self._client() as client:
+            response = await client.post(
+                "/v1/projects", json={"name": name}, headers=self._auth_headers(acting_user)
+            )
+        if response.status_code == 409:
+            raise ProjectNameTaken(_error_detail(response))
+        if response.status_code >= 400:
+            raise SessionServiceError(f"project create failed: {_error_detail(response)}")
+        body = response.json()
+        return ProjectRef(id=str(body["id"]), name=str(body.get("name") or name))
+
+    async def rename_project(
+        self, project_id: str, name: str, *, acting_user: str | None
+    ) -> ProjectRef | None:
+        async with self._client() as client:
+            response = await client.patch(
+                f"/v1/projects/{project_id}",
+                json={"name": name},
+                headers=self._auth_headers(acting_user),
+            )
+        if response.status_code == 404:
+            return None
+        if response.status_code == 409:
+            raise ProjectNameTaken(_error_detail(response))
+        if response.status_code >= 400:
+            raise SessionServiceError(f"project rename failed: {_error_detail(response)}")
+        body = response.json()
+        return ProjectRef(id=str(body["id"]), name=str(body.get("name") or name))
 
     async def _post_message(
         self, client: httpx.AsyncClient, session_id: str, text: str, headers: dict[str, str]
@@ -459,11 +545,8 @@ class OmnigentSessionService:
             # tears down only its own runner; parent_session_id still puts it
             # in the parent's tree.
             metadata["host_id"], _conn = await self._resolve_host(request.acting_user)
-            created = await client.post(
-                "/v1/sessions",
-                data={"metadata": json.dumps(metadata)},
-                files={"bundle": ("bundle.tar.gz", bundle, "application/gzip")},
-                headers=headers,
+            created = await self._post_session(
+                client, metadata, bundle, headers, request.project_id
             )
             if created.status_code >= 400:
                 raise SessionServiceError(f"child session create failed: {_error_detail(created)}")

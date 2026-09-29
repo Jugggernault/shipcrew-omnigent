@@ -82,6 +82,9 @@ class SqlMission(ShipcrewBase):
     ship_verify_until: Mapped[float | None] = mapped_column(Float, nullable=True)
     ship_decisions: Mapped[list[Any] | None] = mapped_column(JSON, nullable=True)
     ship_cost_usd: Mapped[float] = mapped_column(Float, nullable=False, server_default="0")
+    # ── Project (sc0005pj, see omnigent/shipcrew/projects.py) ──
+    # The omnigent project (``projects.id``) that groups the mission's sessions.
+    project_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
     __table_args__ = (
         CheckConstraint(_in_check("status", MISSION_STATUSES), name="ck_shipcrew_missions_status"),

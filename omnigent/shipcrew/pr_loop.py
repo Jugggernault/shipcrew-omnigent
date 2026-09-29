@@ -717,6 +717,7 @@ class PrLoop:
                     LOOP_LABEL_KEY: role,
                 },
                 reasoning_effort=reasoning_effort,
+                project_id=await self._svc.mission_project_id(ctx.mission, ctx.owner),
             )
         )
 

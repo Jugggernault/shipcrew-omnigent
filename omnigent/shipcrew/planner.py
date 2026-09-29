@@ -309,6 +309,7 @@ class PlanRunner:
                 acting_user=acting_user or mission.owner_user_id,
                 labels={MISSION_LABEL_KEY: mission.id, "shipcrew.role": PLANNER_ROLE},
                 workspace=mission.repo_path,
+                project_id=await self._service.mission_project_id(mission, acting_user),
             )
             try:
                 session_id = await self._service.sessions.create_root_session(request)

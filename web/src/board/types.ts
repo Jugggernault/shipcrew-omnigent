@@ -57,6 +57,11 @@ export interface Mission {
   /** Deploy as soon as every agent task is merged (default on). */
   auto_ship?: boolean;
   ship?: MissionShip;
+  /**
+   * The omnigent project (sidebar folder) that groups the mission's sessions.
+   * Optional: older servers omit it; `null` until the first use created it.
+   */
+  project_id?: string | null;
   /** Unix epoch seconds (server clock). */
   created_at: number;
 }
@@ -84,6 +89,8 @@ export interface MissionCommandResponse {
 export interface MissionPatch {
   auto_run?: boolean;
   auto_ship?: boolean;
+  /** Renames the mission (and its project when that name is free). */
+  title?: string;
 }
 
 /**

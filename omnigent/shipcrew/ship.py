@@ -476,6 +476,7 @@ class ShipRunner:
                     "shipcrew.role": DEVOPS_ROLE,
                     SHIP_LABEL_KEY: "deploy",
                 },
+                project_id=await self._svc.mission_project_id(mission, acting_user),
             )
             try:
                 session_id = await self._svc.sessions.create_root_session(request)

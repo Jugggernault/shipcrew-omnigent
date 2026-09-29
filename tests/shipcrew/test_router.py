@@ -108,7 +108,7 @@ class TestMissions:
         assert created["status"] == "planning"
         assert set(created) == {
             "id", "title", "repo_path", "repo_url", "status", "created_at", "plan", "auto_run",
-            "plan_decisions", "auto_ship", "ship",
+            "plan_decisions", "auto_ship", "ship", "project_id",
         }  # fmt: skip
         assert created["auto_run"] is False
         assert created["auto_ship"] is True
