@@ -88,6 +88,25 @@ class SqlTask(ShipcrewBase):
     )
     created_at: Mapped[int] = mapped_column(Integer, nullable=False)
     updated_at: Mapped[int] = mapped_column(Integer, nullable=False)
+    # ── PR loop (sc0002pr) ──
+    # Git branch of the task, fixed at first start ("shipcrew/<id8>-<slug>").
+    branch: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    # CI fix turns sent to the developer so far.
+    ci_attempts: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    # Latest reviewer verdict: {verdict, summary, findings}; verdict null = in progress.
+    review: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    # Head SHA the review (or the in-flight reviewer session) is for.
+    review_sha: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # CHANGES verdicts received so far.
+    review_rounds: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    reviewer_session_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    integrator_session_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    needs_human_approval: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default=false()
+    )
+    approval_reasons: Mapped[list[Any] | None] = mapped_column(JSON, nullable=True)
+    # POST /approve was pressed for the current changes; reset by a developer push.
+    human_approved: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=false())
 
     __table_args__ = (
         CheckConstraint(_in_check("status", TASK_STATUSES), name="ck_shipcrew_tasks_status"),

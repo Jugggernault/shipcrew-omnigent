@@ -15,6 +15,7 @@ from fastapi.responses import JSONResponse
 
 from omnigent.server.routes import _host_worktree
 from omnigent.shipcrew.sessions import (
+    ChildSessionRequest,
     OmnigentSessionService,
     RootSessionRequest,
     SessionServiceError,
@@ -79,8 +80,8 @@ class _StubApp:
 
         @self.app.get("/v1/sessions/{session_id}/items")
         async def items(session_id: str, limit: int, order: str) -> dict[str, Any]:
-            assert (limit, order) == (1, "desc")
-            return {"data": self.latest_items}
+            assert order == "desc"
+            return {"data": self.latest_items[:limit]}
 
         @self.app.get("/v1/sessions/{session_id}", response_model=None)
         async def get(session_id: str) -> dict[str, Any] | JSONResponse:
@@ -332,3 +333,66 @@ async def test_real_users_only_launch_on_their_own_hosts(
     owner_request = dataclasses.replace(request, acting_user="alice@example.com")
     await OmnigentSessionService(stub.app, None).create_root_session(owner_request)
     assert stub.creates[0]["metadata"]["host_id"] == "host_alice"
+
+
+async def test_send_message_posts_a_user_turn() -> None:
+    stub = _StubApp(host_ids=[])
+    await OmnigentSessionService(stub.app, None).send_message("conv_3", "fix CI", acting_user=None)
+    (sent,) = stub.events
+    assert sent[0] == "conv_3"
+    assert sent[1]["type"] == "message"
+    assert sent[1]["data"]["content"] == [{"type": "input_text", "text": "fix CI"}]
+
+
+async def test_last_agent_text_is_the_latest_assistant_message() -> None:
+    stub = _StubApp(host_ids=[])
+    stub.latest_items = [
+        {"type": "function_call"},
+        {
+            "type": "message",
+            "role": "assistant",
+            "content": [
+                {"type": "output_text", "text": "done\n"},
+                {"type": "text", "text": "PASS"},
+            ],
+        },
+        {
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "x"}],
+        },
+    ]
+    service = OmnigentSessionService(stub.app, None)
+    assert await service.last_agent_text("c", acting_user=None) == "done\nPASS"
+    stub.latest_items = [{"type": "message", "role": "user", "content": "hi"}]
+    assert await service.last_agent_text("c", acting_user=None) is None
+
+
+@pytest.mark.parametrize(("parent_runner", "host_bound"), [("run_1", False), (None, True)])
+async def test_child_session_co_locates_on_a_live_parent(
+    bundle: Path, parent_runner: str | None, host_bound: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.shipcrew import sessions as sessions_mod
+
+    # The stub serves one body for every id, so a runner-less parent means a
+    # runner-less child too: do not wait the full runner timeout.
+    monkeypatch.setattr(sessions_mod, "_RUNNER_ONLINE_TIMEOUT_S", 0.05)
+    stub = _StubApp(host_ids=["host_a"])
+    stub.session_body = {"status": "idle", "runner_id": parent_runner}
+    request = ChildSessionRequest(
+        parent_session_id="conv_root",
+        title="Review: Add login",
+        prompt="review this",
+        workspace="/wt/task",
+        agent_dir=bundle,
+        labels={"shipcrew.role": "reviewer"},
+    )
+    assert await OmnigentSessionService(stub.app, None).create_child_session(request) == "conv_1"
+    (create,) = stub.creates
+    metadata = create["metadata"]
+    assert metadata["parent_session_id"] == "conv_root"
+    assert metadata["workspace"] == "/wt/task"
+    # A co-located child must not be host-bound: stopping it would tear down
+    # the parent's runner.
+    assert ("host_id" in metadata) is host_bound
+    assert stub.events[-1][1]["data"]["content"][0]["text"] == "review this"

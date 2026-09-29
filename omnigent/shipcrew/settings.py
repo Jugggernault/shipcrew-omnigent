@@ -35,6 +35,10 @@ class ShipcrewSettings:
     :param base_branch: Base ref task branches fork from; ``None`` uses HEAD.
     :param db_url: Dedicated database for the shipcrew tables; ``None`` shares
         omnigent's database.
+    :param pr_loop_enabled: Whether ticks drive review cards through push ->
+        PR -> CI -> review -> merge (``SHIPCREW_PR_LOOP``).
+    :param pr_base: Branch PRs target and diffs are taken against
+        (``SHIPCREW_PR_BASE``).
     """
 
     agents_dir: Path = Path(DEFAULT_AGENTS_DIR)
@@ -45,6 +49,8 @@ class ShipcrewSettings:
     host_id: str | None = None
     base_branch: str | None = None
     db_url: str | None = None
+    pr_loop_enabled: bool = True
+    pr_base: str = "main"
 
     @classmethod
     def from_env(cls) -> ShipcrewSettings:
@@ -59,4 +65,6 @@ class ShipcrewSettings:
             host_id=env.get("SHIPCREW_HOST_ID") or None,
             base_branch=env.get("SHIPCREW_BASE_BRANCH") or None,
             db_url=env.get("SHIPCREW_DB_URL") or None,
+            pr_loop_enabled=env.get("SHIPCREW_PR_LOOP", "1").strip().lower() not in _FALSEY,
+            pr_base=env.get("SHIPCREW_PR_BASE") or "main",
         )

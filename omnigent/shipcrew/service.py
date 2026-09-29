@@ -8,9 +8,11 @@ from collections.abc import Callable
 from typing import Any
 
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.shipcrew.branches import task_branch
 from omnigent.shipcrew.events import MissionEventBus
 from omnigent.shipcrew.gates import GateContext, evaluate_gates, find_cycle
 from omnigent.shipcrew.models import TASK_STATUSES
+from omnigent.shipcrew.pr_loop import PrLoop, default_base_ref, is_loop_hold
 from omnigent.shipcrew.sessions import (
     RootSessionRequest,
     SessionService,
@@ -39,21 +41,22 @@ def _conflict(message: str) -> OmnigentError:
     return OmnigentError(message, code=ErrorCode.CONFLICT)
 
 
-def build_prompt(task: Task) -> str:
+def build_prompt(task: Task, branch: str | None = None) -> str:
     """The first message the task's root agent receives."""
+    branch = branch or task.branch or task_branch(task.id, task.title)
     lines = [f"# {task.title}", ""]
     if task.body.strip():
         lines += [task.body.strip(), ""]
     if task.acceptance:
         lines += ["## Acceptance criteria", *(f"- {a}" for a in task.acceptance), ""]
-    lines.append(
-        f"You work on branch `task/{task.id}` in a dedicated git worktree of the repository."
-    )
+    lines.append(f"You work on branch `{branch}` in a dedicated git worktree of the repository.")
     if task.owned_paths:
         owned = ", ".join(f"`{p}`" for p in task.owned_paths)
         lines.append(f"Keep your changes inside the paths this task owns: {owned}.")
     lines.append(
-        "Commit your work with clear messages. Stop when the acceptance criteria are met."
+        "Commit your work with clear messages; never push (shipcrew pushes and opens the PR). "
+        "Stop when the acceptance criteria are met, and end with the final line `PASS` "
+        "or `FAIL: <reason>`."
     )
     return "\n".join(lines)
 
@@ -105,6 +108,7 @@ class ShipcrewService:
         self.sessions = sessions
         self.settings = settings
         self._starting: set[str] = set()
+        self.pr_loop = PrLoop(self)
 
     async def _call(self, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
         return await asyncio.to_thread(fn, *args, **kwargs)
@@ -280,18 +284,29 @@ class ShipcrewService:
                 # A restart from Review opens a new session: end the idle one.
                 await self._stop_quietly(task, acting_user)
             # Claim a capacity slot before the slow worktree/session work.
+            # The branch name is fixed at the first start (titles can change).
+            branch = task.branch or task_branch(task.id, task.title)
             task = await self._update(
-                task.id, status="running", blocked_reason=None, session_seen_active=False
+                task.id,
+                status="running",
+                blocked_reason=None,
+                session_seen_active=False,
+                branch=branch,
             )
+            base_branch = self.settings.base_branch
+            if base_branch is None and self.settings.pr_loop_enabled:
+                base_branch = await self._call(
+                    default_base_ref, mission.repo_path, self.settings.pr_base
+                )
             request = RootSessionRequest(
                 task_id=task.id,
                 title=task.title,
-                prompt=build_prompt(task),
+                prompt=build_prompt(task, branch),
                 repo_path=mission.repo_path,
-                branch=f"task/{task.id}",
+                branch=branch,
                 agent_dir=agent_dir,
                 acting_user=acting_user or mission.owner_user_id,
-                base_branch=self.settings.base_branch,
+                base_branch=base_branch,
                 labels={TASK_LABEL_KEY: task.id, ROLE_LABEL_KEY: task.role},
             )
             try:
@@ -346,8 +361,33 @@ class ShipcrewService:
                 _logger.warning("shipcrew: session read failed for task %s: %s", task.id, exc)
                 continue
             changes = map_session_state(task, snap)
+            if self._loop_owned(task, snap):
+                # The PR loop drives this card: its reviewer / integrator
+                # children make the root look busy, so only the cost syncs.
+                changes = {k: v for k, v in changes.items() if k == "cost_usd"}
             if changes:
                 await self._update(task.id, **changes)
+
+    def _loop_owned(self, task: Task, snap: SessionSnapshot | None) -> bool:
+        if not self.settings.pr_loop_enabled or task.pr_number is None:
+            return False
+        if task.status in WATCHED_REVIEW_STATUSES:
+            return True
+        # A loop hold only moves when a human talks to the agent in its session.
+        return is_loop_hold(task) and not (
+            snap is not None and (snap.awaiting_human or snap.status in ("running", "waiting"))
+        )
+
+    async def advance_reviews(self) -> None:
+        """PR loop step for every review card (no-op when the loop is off)."""
+        if self.settings.pr_loop_enabled:
+            await self.pr_loop.tick()
+
+    async def approve_task(self, task_id: str) -> Task:
+        return await self.pr_loop.approve(task_id)
+
+    async def request_changes(self, task_id: str, message: str) -> Task:
+        return await self.pr_loop.request_changes(task_id, message)
 
     async def schedule_ready(self) -> list[str]:
         """Start every ready task whose four gates pass; returns started ids."""

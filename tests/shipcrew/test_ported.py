@@ -1,4 +1,4 @@
-"""Ported v0.2 pieces (doctor, gh), shipped templates, settings and the PR-loop stub."""
+"""Ported v0.2 pieces (doctor, gh), shipped templates and settings."""
 
 from __future__ import annotations
 
@@ -10,7 +10,6 @@ import pytest
 
 from omnigent.shipcrew import gh, pr_loop, tools
 from omnigent.shipcrew.settings import DEFAULT_AGENTS_DIR, ShipcrewSettings
-from omnigent.shipcrew.store import Task
 
 
 @pytest.fixture
@@ -68,11 +67,6 @@ class TestGh:
 def test_templates_are_shipped() -> None:
     names = {p.name for p in pr_loop.TEMPLATES_DIR.iterdir()}
     assert {"ci.yml", "review.yml"} <= names
-
-
-async def test_pr_loop_is_a_stub() -> None:
-    with pytest.raises(NotImplementedError):
-        await pr_loop.advance(Task(id="t", mission_id="m", title="t"))
 
 
 class TestSettings:

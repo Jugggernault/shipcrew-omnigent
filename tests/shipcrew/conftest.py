@@ -18,6 +18,7 @@ from omnigent.errors import OmnigentError
 from omnigent.shipcrew.router import mount_shipcrew
 from omnigent.shipcrew.service import ShipcrewService
 from omnigent.shipcrew.sessions import (
+    ChildSessionRequest,
     RootSessionRequest,
     SessionServiceError,
     SessionSnapshot,
@@ -39,6 +40,9 @@ class FakeSessions:
     crash_create: Exception | None = None
     # When set, create_root_session waits on it (to race other calls against it).
     gate: asyncio.Event | None = None
+    messages: list[tuple[str, str]] = field(default_factory=list)
+    children: list[ChildSessionRequest] = field(default_factory=list)
+    agent_texts: dict[str, str | None] = field(default_factory=dict)
 
     async def create_root_session(self, request: RootSessionRequest) -> str:
         if self.fail_create is not None:
@@ -61,6 +65,16 @@ class FakeSessions:
         self, session_id: str, *, acting_user: str | None
     ) -> SessionSnapshot | None:
         return self.snapshots.get(session_id, SessionSnapshot(status="running"))
+
+    async def send_message(self, session_id: str, text: str, *, acting_user: str | None) -> None:
+        self.messages.append((session_id, text))
+
+    async def last_agent_text(self, session_id: str, *, acting_user: str | None) -> str | None:
+        return self.agent_texts.get(session_id)
+
+    async def create_child_session(self, request: ChildSessionRequest) -> str:
+        self.children.append(request)
+        return f"child{len(self.children)}"
 
 
 class HeaderAuth:
@@ -94,6 +108,8 @@ def settings(tmp_path: Path, agents_dir: Path) -> ShipcrewSettings:
         max_parallel=2,
         max_usd=10.0,
         scheduler_enabled=False,
+        # The PR loop has its own fixtures (tests/shipcrew/test_pr_loop.py).
+        pr_loop_enabled=False,
         db_url=f"sqlite:///{tmp_path / 'shipcrew.db'}",
     )
 

@@ -46,7 +46,8 @@ class TestStart:
         assert body["status"] == "running"
         assert body["root_session_id"] == "sess1"
         (req,) = sessions.created
-        assert req.branch == f"task/{task['id']}"
+        assert req.branch == f"shipcrew/{task['id'][:8]}-add-login"
+        assert body["branch"] == req.branch
         assert req.repo_path == "/repo"
         assert req.agent_dir == service.settings.agents_dir / "developer"
         assert req.acting_user == "alice@example.com"
@@ -91,7 +92,7 @@ class TestStart:
         await client.post(f"{P}/tasks/{task['id']}/start")
         await client.post(f"{P}/tasks/{task['id']}/stop")
         await client.post(f"{P}/tasks/{task['id']}/start")
-        assert [r.branch for r in sessions.created] == [f"task/{task['id']}"] * 2
+        assert [r.branch for r in sessions.created] == [f"shipcrew/{task['id'][:8]}-add-login"] * 2
 
     async def test_start_is_idempotent_while_running(
         self, client: httpx.AsyncClient, sessions: FakeSessions
@@ -361,10 +362,11 @@ class TestScheduler:
 
 
 def test_prompt_without_optional_sections() -> None:
-    prompt = build_prompt(Task(id="abc", mission_id="m", title="Fix"))
-    assert prompt.startswith("# Fix")
+    prompt = build_prompt(Task(id="abc12345xyz", mission_id="m", title="Fix it!"))
+    assert prompt.startswith("# Fix it!")
     assert "Acceptance" not in prompt
-    assert "task/abc" in prompt
+    assert "shipcrew/abc12345-fix-it" in prompt
+    assert prompt.rstrip().endswith("or `FAIL: <reason>`.")
 
 
 class TestSchedulerLoop:
