@@ -12,7 +12,7 @@ from omnigent.shipcrew.branches import task_branch
 from omnigent.shipcrew.events import MissionEventBus
 from omnigent.shipcrew.gates import GateContext, evaluate_gates, find_cycle
 from omnigent.shipcrew.models import TASK_STATUSES
-from omnigent.shipcrew.pr_loop import PrLoop, is_loop_hold
+from omnigent.shipcrew.pr_loop import PrLoop, default_base_ref, is_loop_hold
 from omnigent.shipcrew.sessions import (
     RootSessionRequest,
     SessionService,
@@ -293,6 +293,11 @@ class ShipcrewService:
                 session_seen_active=False,
                 branch=branch,
             )
+            base_branch = self.settings.base_branch
+            if base_branch is None and self.settings.pr_loop_enabled:
+                base_branch = await self._call(
+                    default_base_ref, mission.repo_path, self.settings.pr_base
+                )
             request = RootSessionRequest(
                 task_id=task.id,
                 title=task.title,
@@ -301,7 +306,7 @@ class ShipcrewService:
                 branch=branch,
                 agent_dir=agent_dir,
                 acting_user=acting_user or mission.owner_user_id,
-                base_branch=self.settings.base_branch,
+                base_branch=base_branch,
                 labels={TASK_LABEL_KEY: task.id, ROLE_LABEL_KEY: task.role},
             )
             try:

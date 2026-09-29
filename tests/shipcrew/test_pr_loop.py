@@ -94,7 +94,8 @@ class LoopSessions(FakeSessions):
         assert self.repo is not None and self.wt_root is not None
         wt = self.wt_root / request.task_id
         if not wt.exists():
-            git(self.repo, "worktree", "add", "-q", "-b", request.branch, str(wt), "main")
+            base = request.base_branch or "main"
+            git(self.repo, "worktree", "add", "-q", "-b", request.branch, str(wt), base)
         self.worktrees[session_id] = wt
         return session_id
 
@@ -350,6 +351,8 @@ class TestOpen:
         assert "- [ ] tests pass" in pr["body"]
         assert "Closes #7" in pr["body"]
         assert done.to_api()["branch"] == branch
+        # With the loop on, worktrees fork from the fetched remote base.
+        assert sessions.created[0].base_branch == "origin/main"
 
     @pytest.mark.parametrize(
         ("verdict", "files", "reason"),
@@ -823,3 +826,20 @@ async def test_session_sync_respects_loop_holds(
     sessions.snapshots["sessX"] = SessionSnapshot(status="running")
     await service.sync_active()
     assert (await service.require_task(task.id)).status == "running"
+
+
+async def test_merge_unblocks_a_dependant_on_the_merged_code(
+    service: ShipcrewService, sessions: LoopSessions, repo: Path, scheduler: ShipcrewScheduler
+) -> None:
+    first, _ = await start(service, sessions, repo, files={"src/a.txt": "a\n", "ok": ""})
+    dependant = await service.create_task(
+        first.mission_id, title="next", depends_on=[first.id], owned_paths=["src/**"]
+    )
+    await service.patch_task(dependant.id, {"status": "ready"}, OWNER)
+    await run_until(scheduler, service, first.id, status_is("merged"))
+    # Started by the same tick that merged its dependency.
+    started = await service.require_task(dependant.id)
+    assert (started.status, started.blocked_reason) == ("running", None)
+    assert started.root_session_id is not None
+    # Its worktree forks from the fetched origin/main, which has the merge.
+    assert (sessions.worktrees[started.root_session_id] / "src" / "a.txt").exists()

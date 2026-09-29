@@ -381,6 +381,18 @@ def _fetch(cwd: Path, *refs: str) -> None:
     _git(["fetch", "--quiet", "origin", *refs], cwd, check=False)
 
 
+def default_base_ref(repo_path: str, base: str) -> str | None:
+    """``origin/<base>`` when the local repo has it (the loop fetches it after
+    each merge, so dependants fork from the merged code), else ``None`` (HEAD)."""
+    repo = Path(repo_path)
+    if not repo.is_dir():
+        return None
+    try:
+        return f"origin/{base}" if _rev(repo, f"origin/{base}") else None
+    except GitError:
+        return None
+
+
 # ── The loop ────────────────────────────────────────────────────
 
 
