@@ -283,17 +283,36 @@ def create_session(
     run.timings["t0"] = t0
 
 
+def wait_runner_online(client: httpx.Client, run: Run, timeout_s: float = 60) -> None:
+    """Block until the session's host-launched runner has registered its tunnel.
+
+    Posting the first message before that makes the server wait a fixed
+    10 s grace (``_HOST_BOUND_RUNNER_CONNECT_GRACE_S``) and, when a cold
+    runner is slower than that, relaunch it and supersede the first one.
+    """
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        rid = client.get(f"/v1/sessions/{run.session_id}").json().get("runner_id")
+        if rid and client.get(f"/v1/runners/{rid}/status").json().get("online"):
+            run.timings["runner_online_s"] = time.monotonic() - run.timings["t0"]
+            return
+        time.sleep(0.25)
+
+
 def drive(
     client: httpx.Client,
     run: Run,
     base_url: str,
     timeout_s: float,
     sampler: Sampler | None = None,
+    wait_runner: bool = True,
 ) -> None:
-    """Send the prompt right after create; wait for the turn's terminal SSE event."""
+    """Send the prompt (once the runner is up); wait for the turn to finish."""
     t0 = run.timings["t0"]
     run.sse = SseRecorder(base_url, run.session_id)
     run.sse.start()
+    if wait_runner:
+        wait_runner_online(client, run)
     client.post(f"/v1/sessions/{run.session_id}/events", json=_msg(run.prompt)).raise_for_status()
     deadline = t0 + timeout_s
     while time.monotonic() < deadline:
@@ -345,54 +364,21 @@ def git_changes(workspace: str | None) -> str:
 # ── main ─────────────────────────────────────────────────────────────────
 
 
-def main() -> None:
-    ap = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
-    ap.add_argument("--base-url", default="http://127.0.0.1:16767")
-    ap.add_argument("--repo", required=True, help="throwaway git repo (worktrees branch off it)")
-    ap.add_argument("--timeout", type=float, default=300)
-    ap.add_argument("--idle-seconds", type=float, default=10, help="idle sampling after turns")
-    ap.add_argument(
-        "--stagger",
-        type=float,
-        default=0.0,
-        help="seconds between session creates (0 = all at once)",
-    )
-    ap.add_argument("--keep", action="store_true", help="leave sessions running")
-    ap.add_argument("--out", default=None, help="write the JSON report here")
-    args = ap.parse_args()
-
-    tag = uuid.uuid4().hex[:6]
-    client = httpx.Client(base_url=args.base_url, timeout=30)
-    host_id, agent_id = discover(client)
-    report: dict[str, Any] = {
-        "host_id": host_id,
-        "agent_id": agent_id,
-        "tag": tag,
-        "stagger_s": args.stagger,
-    }
-    sampler = Sampler()
-    sampler.start()
-
-    # Phase 1: N parallel sessions, one worktree each.
-    runs = [Run(name=f"p{i + 1}", prompt=p) for i, p in enumerate(PROMPTS)]
-    t_all = time.monotonic()
-    with ThreadPoolExecutor(len(runs)) as pool:
-        futures = []
-        for i, r in enumerate(runs):
-            if i and args.stagger:
-                time.sleep(args.stagger)
-            create_session(client, r, host_id, agent_id, args.repo, tag)
-            sampler.watch(r.session_id, r.workspace)
-            futures.append(pool.submit(drive, client, r, args.base_url, args.timeout, sampler))
-        for f in futures:
-            f.result()
-    report["parallel_wall_s"] = round(time.monotonic() - t_all, 1)
-
+def child_phases(
+    client: httpx.Client,
+    args: argparse.Namespace,
+    host_id: str,
+    agent_id: str,
+    tag: str,
+    sampler: Sampler,
+    report: dict[str, Any],
+) -> Run:
+    """Run a parent whose Claude spawns a Task sub-agent, then attach an API child."""
     # Phase 2: parent session whose Claude spawns a Task sub-agent.
     parent = Run(name="parent", prompt=CHILD_PROMPT)
     create_session(client, parent, host_id, agent_id, args.repo, tag)
     sampler.watch(parent.session_id, parent.workspace)
-    drive(client, parent, args.base_url, args.timeout, sampler)
+    drive(client, parent, args.base_url, args.timeout, sampler, not args.no_wait_runner)
     children: list[dict[str, Any]] = []
     for _ in range(20):  # the forwarder posts the child shortly after meta.json lands
         children = (
@@ -421,11 +407,81 @@ def main() -> None:
     except (httpx.HTTPError, ValueError) as exc:
         report["api_child_create"] = {"error": str(exc)}
 
+    return parent
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
+    ap.add_argument("--base-url", default="http://127.0.0.1:16767")
+    ap.add_argument("--repo", required=True, help="throwaway git repo (worktrees branch off it)")
+    ap.add_argument("--timeout", type=float, default=300)
+    ap.add_argument("--idle-seconds", type=float, default=10, help="idle sampling after turns")
+    ap.add_argument(
+        "--stagger",
+        type=float,
+        default=0.0,
+        help="seconds between session creates (0 = all at once)",
+    )
+    ap.add_argument(
+        "--no-wait-runner",
+        action="store_true",
+        help="post the prompt right after create instead of waiting for the runner tunnel",
+    )
+    ap.add_argument("--parallel", type=int, default=3, help="phase-1 session count")
+    ap.add_argument("--skip-child", action="store_true", help="skip the sub-agent phases")
+    ap.add_argument("--keep", action="store_true", help="leave sessions running")
+    ap.add_argument("--out", default=None, help="write the JSON report here")
+    args = ap.parse_args()
+
+    tag = uuid.uuid4().hex[:6]
+    client = httpx.Client(base_url=args.base_url, timeout=90)
+    host_id, agent_id = discover(client)
+    report: dict[str, Any] = {
+        "host_id": host_id,
+        "agent_id": agent_id,
+        "tag": tag,
+        "stagger_s": args.stagger,
+        "wait_runner": not args.no_wait_runner,
+    }
+    sampler = Sampler()
+    sampler.start()
+
+    # Phase 1: N parallel sessions, one worktree each.
+    runs = [Run(name=f"p{i + 1}", prompt=PROMPTS[i % len(PROMPTS)]) for i in range(args.parallel)]
+    t_all = time.monotonic()
+    with ThreadPoolExecutor(len(runs)) as pool:
+        futures = []
+        for i, r in enumerate(runs):
+            if i and args.stagger:
+                time.sleep(args.stagger)
+            create_session(client, r, host_id, agent_id, args.repo, tag)
+            sampler.watch(r.session_id, r.workspace)
+            futures.append(
+                pool.submit(
+                    drive,
+                    client,
+                    r,
+                    args.base_url,
+                    args.timeout,
+                    sampler,
+                    not args.no_wait_runner,
+                )
+            )
+        for f in futures:
+            f.result()
+    report["parallel_wall_s"] = round(time.monotonic() - t_all, 1)
+
+    parent = (
+        None
+        if args.skip_child
+        else child_phases(client, args, host_id, agent_id, tag, sampler, report)
+    )
+
     # Idle footprint once every turn is over.
     time.sleep(args.idle_seconds)
     sampler.stop()
 
-    all_runs = [*runs, parent]
+    all_runs = [*runs, *([parent] if parent else [])]
     for r in all_runs:
         if r.sse:
             r.sse.stop()
@@ -445,7 +501,7 @@ def main() -> None:
         }
         for r in all_runs
     ]
-    parent_sse = parent.sse.types() if parent.sse else {}
+    parent_sse = parent.sse.types() if parent and parent.sse else {}
     report["parent_saw_session_created"] = parent_sse.get("session.created", 0) > 0
 
     if not args.keep:
