@@ -4,6 +4,7 @@ import { fn } from "storybook/test";
 import { BoardColumn } from "./BoardColumn";
 import { BOARD_COLUMNS, projectColumns } from "./columns";
 import { SAMPLE_TASKS } from "./sampleBoard";
+import { withBoardProviders } from "./storyDecorators";
 
 function Columns() {
   const columns = projectColumns(SAMPLE_TASKS);
@@ -29,6 +30,7 @@ function Columns() {
 const meta = {
   title: "Board/Columns",
   component: Columns,
+  decorators: [withBoardProviders],
   parameters: { layout: "fullscreen" },
 } satisfies Meta<typeof Columns>;
 

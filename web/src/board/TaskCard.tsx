@@ -1,10 +1,19 @@
 // One task on the board. Pointer users drag the whole card; keyboard users
 // drag from the grip handle or use the actions menu ("Move to …"), which is
-// also where the assignee is changed.
+// also where the assignee is changed. The card also carries the PR loop's
+// state: branch, issue and PR links, CI, review verdict, approval gate, and
+// why an Intervention card needs a human.
 
 import { memo, type HTMLAttributes, type MouseEvent } from "react";
 import { useDraggable } from "@dnd-kit/core";
-import { BanIcon, GripVerticalIcon, LinkIcon, MoreHorizontalIcon } from "lucide-react";
+import {
+  BanIcon,
+  GripVerticalIcon,
+  InboxIcon,
+  LinkIcon,
+  MoreHorizontalIcon,
+  TriangleAlertIcon,
+} from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
@@ -15,9 +24,20 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { formatSessionCostUsd } from "@/lib/formatCost";
+import { Link } from "@/lib/routing";
 import { cn } from "@/lib/utils";
 import { BOARD_COLUMNS, canMoveTo, columnForStatus, isBlocked, type ColumnId } from "./columns";
-import { AssigneeAvatar, CiBadge, PullRequestLink, RoleBadge } from "./TaskBadges";
+import { interventionReason, type InterventionReason } from "./intervention";
+import {
+  ApprovalBadge,
+  AssigneeAvatar,
+  BranchChip,
+  CiBadge,
+  IssueLink,
+  PullRequestLink,
+  ReviewBadge,
+  RoleBadge,
+} from "./TaskBadges";
 import type { Task, TaskAssignee } from "./types";
 
 export interface TaskCardActions {
@@ -36,6 +56,33 @@ interface TaskCardProps extends TaskCardActions {
 
 function dependencyLabel(count: number): string {
   return count === 1 ? "1 dependency" : `${count} dependencies`;
+}
+
+/** Why an Intervention card waits, with a way to act on it. */
+function InterventionNote({ reason }: { reason: InterventionReason }) {
+  return (
+    <div
+      className="flex items-center gap-1.5 rounded-md bg-warning/10 px-2 py-1 text-xs text-warning"
+      data-testid="intervention-reason"
+      data-kind={reason.kind}
+      title={reason.detail}
+    >
+      <TriangleAlertIcon aria-hidden className="size-3 shrink-0" />
+      <span className="min-w-0 flex-1 truncate font-medium">{reason.label}</span>
+      {reason.kind === "guardrail" && (
+        <Link
+          to="/inbox"
+          className="inline-flex shrink-0 items-center gap-1 font-medium underline-offset-2 hover:underline"
+          onClick={(event) => event.stopPropagation()}
+          onPointerDown={(event) => event.stopPropagation()}
+          onMouseDown={(event) => event.stopPropagation()}
+        >
+          <InboxIcon aria-hidden className="size-3" />
+          Inbox
+        </Link>
+      )}
+    </div>
+  );
 }
 
 type DragListeners = ReturnType<typeof useDraggable>["listeners"];
@@ -82,6 +129,7 @@ function TaskCardView({
 }: TaskCardProps & { drag?: DragWiring }) {
   const { attributes, listeners, setNodeRef, setActivatorNodeRef, isDragging = false } = drag;
   const blocked = isBlocked(task);
+  const intervention = interventionReason(task);
   const currentColumn = columnForStatus(task.status);
   const stop = (event: MouseEvent) => event.stopPropagation();
 
@@ -173,9 +221,20 @@ function TaskCardView({
             Blocked
           </span>
         )}
-        <CiBadge ci={task.ci} />
+        <ApprovalBadge task={task} />
+        <ReviewBadge task={task} />
+        <CiBadge ci={task.ci} attempts={task.ci_attempts} />
         <PullRequestLink task={task} />
+        <IssueLink task={task} />
       </div>
+
+      {task.branch && (
+        <div className="flex min-w-0">
+          <BranchChip branch={task.branch} />
+        </div>
+      )}
+
+      {intervention && <InterventionNote reason={intervention} />}
 
       {blocked && task.blocked_reason && (
         <p className="line-clamp-2 text-xs text-destructive" title={task.blocked_reason}>

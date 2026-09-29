@@ -7,8 +7,11 @@
  *   card PATCHes its status: Ready schedules it, Running starts it now, and
  *   Merged asks for confirmation since it normally comes from the PR loop.
  *   The card menu offers the same moves for keyboard users, plus assignment.
- * - A card opens a drawer with the task's acceptance criteria and its live
- *   sub-agent tree (the chat view's `SubagentsGraphView`).
+ * - A card opens a drawer with the task's acceptance criteria, its pull
+ *   request, review and approval gate, and its live sub-agent tree (the chat
+ *   view's `SubagentsGraphView`).
+ * - The mission header starts the planner ("Plan from PRD"), shows its run,
+ *   and forces a GitHub sync.
  * - The selected mission and task live in `?mission=` / `?task=`.
  */
 
@@ -28,14 +31,18 @@ import {
   type DragEndEvent,
   type DragStartEvent,
 } from "@dnd-kit/core";
-import { BanIcon, TriangleAlertIcon } from "lucide-react";
+import { BanIcon, RefreshCwIcon, TriangleAlertIcon } from "lucide-react";
 import {
+  useApproveTask,
   useCreateMission,
   useCreateTask,
   useMissions,
   useMissionTasks,
+  usePlanMission,
+  useRequestTaskChanges,
   useStartTask,
   useStopTask,
+  useSyncMission,
   useUpdateTask,
 } from "@/board/api";
 import { BoardColumn } from "@/board/BoardColumn";
@@ -47,6 +54,7 @@ import {
   type ColumnId,
 } from "@/board/columns";
 import { columnKeyboardCoordinates } from "@/board/keyboard";
+import { MissionPlanStatus, missionPlan, PlanFromPrdDialog } from "@/board/MissionPlan";
 import { NewMissionDialog } from "@/board/NewMissionDialog";
 import { NewTaskForm } from "@/board/NewTaskForm";
 import { TaskCard } from "@/board/TaskCard";
@@ -111,6 +119,10 @@ export function BoardPage() {
   const { mutate: mutateTask } = useUpdateTask();
   const { mutate: mutateStart, isPending: starting } = useStartTask();
   const { mutate: mutateStop, isPending: stopping } = useStopTask();
+  const { mutate: mutateApprove, isPending: approving } = useApproveTask();
+  const { mutateAsync: requestChangesAsync } = useRequestTaskChanges();
+  const { mutateAsync: planAsync } = usePlanMission();
+  const { mutate: mutateSync, isPending: syncing } = useSyncMission();
 
   const selectedTaskId = searchParams.get(TASK_QUERY_PARAM);
   const selectedTask = tasks.find((task) => task.id === selectedTaskId) ?? null;
@@ -159,6 +171,26 @@ export function BoardPage() {
         onError: (error) => showToast(`Could not stop "${task.title}": ${errorMessage(error)}`),
       }),
     [mutateStop],
+  );
+
+  const approve = useCallback(
+    (task: Task) =>
+      mutateApprove(task, {
+        onError: (error) => showToast(`Could not approve "${task.title}": ${errorMessage(error)}`),
+      }),
+    [mutateApprove],
+  );
+  const requestChanges = useCallback(
+    (task: Task, message: string) => requestChangesAsync({ task, message }),
+    [requestChangesAsync],
+  );
+  const sync = useCallback(
+    (target: Mission) =>
+      mutateSync(target, {
+        onSuccess: () => showToast("GitHub sync done"),
+        onError: (error) => showToast(`Could not sync with GitHub: ${errorMessage(error)}`),
+      }),
+    [mutateSync],
   );
 
   const moveTask = useCallback(
@@ -279,19 +311,29 @@ export function BoardPage() {
               </span>
             )}
           </div>
+          {mission && (
+            <MissionPlanStatus plan={missionPlan(mission)} className="mt-1 max-w-[480px]" />
+          )}
         </div>
         {mission && (
-          <Button
-            variant={blockedOnly ? "secondary" : "ghost"}
-            size="sm"
-            aria-pressed={blockedOnly}
-            onClick={() => setBlockedOnly((value) => !value)}
-            className={cn(blockedCount > 0 && !blockedOnly && "text-destructive")}
-          >
-            <BanIcon className="size-3.5" />
-            Blocked
-            <span className="tabular-nums">{blockedCount}</span>
-          </Button>
+          <div className="flex shrink-0 flex-wrap items-center justify-end gap-1.5">
+            <PlanFromPrdDialog mission={mission} onPlan={(prd) => planAsync({ mission, prd })} />
+            <Button variant="ghost" size="sm" onClick={() => sync(mission)} loading={syncing}>
+              <RefreshCwIcon className="size-3.5" />
+              Sync GitHub
+            </Button>
+            <Button
+              variant={blockedOnly ? "secondary" : "ghost"}
+              size="sm"
+              aria-pressed={blockedOnly}
+              onClick={() => setBlockedOnly((value) => !value)}
+              className={cn(blockedCount > 0 && !blockedOnly && "text-destructive")}
+            >
+              <BanIcon className="size-3.5" />
+              Blocked
+              <span className="tabular-nums">{blockedCount}</span>
+            </Button>
+          </div>
         )}
       </header>
 
@@ -346,7 +388,7 @@ export function BoardPage() {
           onDragCancel={() => setActiveTask(null)}
         >
           <div
-            className="flex min-h-0 flex-1 gap-3 overflow-x-auto border-t px-6 py-4"
+            className="flex min-h-0 flex-1 gap-2.5 overflow-x-auto border-t px-5 py-4"
             data-testid="board-columns"
           >
             {BOARD_COLUMNS.map((column) => (
@@ -390,7 +432,10 @@ export function BoardPage() {
         onClose={() => setParam(TASK_QUERY_PARAM, null)}
         onStart={start}
         onStop={stop}
+        onApprove={approve}
+        onRequestChanges={requestChanges}
         pending={starting || stopping}
+        approving={approving}
       />
 
       <Dialog open={pendingMerge !== null} onOpenChange={(open) => !open && setPendingMerge(null)}>

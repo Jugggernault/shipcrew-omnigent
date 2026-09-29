@@ -12,7 +12,7 @@ import type { ComponentProps } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { makeMission, makeTask } from "@/board/fixtures";
-import type { Task } from "@/board/types";
+import type { Mission, Task } from "@/board/types";
 import { authenticatedFetch } from "@/lib/identity";
 import { BoardPage } from "./BoardPage";
 
@@ -43,6 +43,7 @@ vi.mock("@/shell/SubagentsGraphView", () => ({
 
 const fetchMock = vi.mocked(authenticatedFetch);
 let tasks: Task[] = [];
+let missions: Mission[] = [];
 let requests: { method: string; url: string; body: unknown }[] = [];
 
 function json(body: unknown, status = 200): Response {
@@ -57,7 +58,18 @@ function serve(input: RequestInfo | URL, init?: RequestInit): Response {
   const method = init?.method ?? "GET";
   const body = typeof init?.body === "string" ? (JSON.parse(init.body) as unknown) : undefined;
   requests.push({ method, url, body });
-  if (url === "/v1/shipcrew/missions") return json({ missions: [makeMission()] });
+  if (url === "/v1/shipcrew/missions") return json({ missions });
+  if (url === "/v1/shipcrew/missions/mission_1/plan" && method === "POST") {
+    const planned: Mission = {
+      ...missions[0],
+      plan: { status: "running", session_id: "conv_plan", error: null, imported_count: 0 },
+    };
+    missions = [planned];
+    return json(planned);
+  }
+  if (url === "/v1/shipcrew/missions/mission_1/sync" && method === "POST") {
+    return json(missions[0]);
+  }
   if (url.endsWith("/stream")) return new Response("unavailable", { status: 503 });
   if (/^\/v1\/sessions\/[^/]+\/child_sessions$/.test(url)) {
     return json({ object: "list", data: [] });
@@ -70,7 +82,9 @@ function serve(input: RequestInfo | URL, init?: RequestInit): Response {
     tasks = [...tasks, created];
     return json(created);
   }
-  const match = /^\/v1\/shipcrew\/tasks\/([^/]+)(?:\/(start|stop))?$/.exec(url);
+  const match = /^\/v1\/shipcrew\/tasks\/([^/]+)(?:\/(start|stop|approve|request-changes))?$/.exec(
+    url,
+  );
   if (match) {
     const [, id, action] = match;
     const current = tasks.find((task) => task.id === id);
@@ -80,7 +94,11 @@ function serve(input: RequestInfo | URL, init?: RequestInit): Response {
         ? { ...current, status: "running", root_session_id: "conv_started" }
         : action === "stop"
           ? { ...current, status: "backlog" }
-          : { ...current, ...(body as Partial<Task>) };
+          : action === "approve"
+            ? { ...current, status: "merged", needs_human_approval: false }
+            : action === "request-changes"
+              ? { ...current, status: "running" }
+              : { ...current, ...(body as Partial<Task>) };
     tasks = tasks.map((task) => (task.id === id ? next : task));
     return json(next);
   }
@@ -141,6 +159,7 @@ beforeEach(() => {
   fetchMock.mockImplementation(async (input, init) => serve(input, init));
   requests = [];
   dndProps.current = null;
+  missions = [makeMission()];
   tasks = [
     makeTask({
       id: "t_backlog",
@@ -378,5 +397,146 @@ describe("BoardPage", () => {
         owned_paths: ["src/refunds/**", "api/refunds.py"],
       },
     });
+  });
+  it("shows the PR loop state on cards and why Intervention cards wait", async () => {
+    tasks = [
+      ...tasks.map((task) =>
+        task.id === "t_review"
+          ? {
+              ...task,
+              branch: "shipcrew/t_review-billing-page",
+              issue_number: 7,
+              issue_url: "https://github.com/acme/app/issues/7",
+              ci: "red" as const,
+              ci_attempts: 2,
+              review: { verdict: "changes" as const, summary: "", findings: [] },
+            }
+          : task,
+      ),
+      makeTask({
+        id: "t_gate",
+        title: "Migrate invoices",
+        status: "intervention",
+        needs_human_approval: true,
+        approval_reasons: ["Touches migrations/**"],
+      }),
+      makeTask({
+        id: "t_rounds",
+        title: "Refund flow",
+        status: "intervention",
+        review: { verdict: "changes", summary: "", findings: [] },
+        position: 1,
+      }),
+      makeTask({ id: "t_ask", title: "Send receipts", status: "intervention", position: 2 }),
+    ];
+    renderBoard();
+    await screen.findByText("Migrate invoices");
+
+    const review = within(cardFor("Billing page"));
+    expect(review.getByTestId("branch-chip")).toHaveTextContent("shipcrew/t_review-billing-page");
+    expect(review.getByRole("link", { name: "Open issue #7" })).toBeInTheDocument();
+    expect(review.getByTestId("ci-badge")).toHaveTextContent("fix 2/3");
+    expect(review.getByTestId("review-badge")).toHaveAttribute("data-verdict", "changes");
+    expect(review.queryByTestId("intervention-reason")).not.toBeInTheDocument();
+
+    const gate = within(cardFor("Migrate invoices"));
+    expect(
+      gate.getByRole("button", { name: "Needs approval: Touches migrations/**" }),
+    ).toBeVisible();
+    expect(gate.getByTestId("intervention-reason")).toHaveTextContent("Needs your approval");
+    expect(within(cardFor("Refund flow")).getByTestId("intervention-reason")).toHaveTextContent(
+      "Review rounds exhausted",
+    );
+    const ask = within(cardFor("Send receipts"));
+    expect(ask.getByTestId("intervention-reason")).toHaveTextContent("Guardrail ask pending");
+    expect(ask.getByRole("link", { name: "Inbox" })).toHaveAttribute("href", "/inbox");
+  });
+
+  it("starts the planner from a PRD and links its session", async () => {
+    renderBoard();
+    await screen.findByText("Billing page");
+    fireEvent.click(screen.getByRole("button", { name: "Plan from PRD" }));
+    const dialog = await screen.findByRole("dialog", { name: "Plan from PRD" });
+    fireEvent.change(within(dialog).getByLabelText("PRD (optional)"), {
+      target: { value: "Ship refunds" },
+    });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Start planning" }));
+
+    expect(await screen.findByRole("link", { name: /Planning/ })).toHaveAttribute(
+      "href",
+      "/c/conv_plan",
+    );
+    expect(requests).toContainEqual({
+      method: "POST",
+      url: "/v1/shipcrew/missions/mission_1/plan",
+      body: { prd: "Ship refunds" },
+    });
+    expect(screen.getByRole("button", { name: "Plan from PRD" })).toBeDisabled();
+  });
+
+  it("shows the imported plan of a mission", async () => {
+    missions = [
+      makeMission({
+        plan: { status: "imported", session_id: "conv_plan", error: null, imported_count: 4 },
+      }),
+    ];
+    renderBoard();
+    expect(await screen.findByText("Imported 4 tasks")).toBeInTheDocument();
+  });
+
+  it("forces a GitHub sync", async () => {
+    renderBoard();
+    await screen.findByText("Billing page");
+    fireEvent.click(screen.getByRole("button", { name: "Sync GitHub" }));
+    await waitFor(() =>
+      expect(requests).toContainEqual({
+        method: "POST",
+        url: "/v1/shipcrew/missions/mission_1/sync",
+        body: undefined,
+      }),
+    );
+  });
+
+  it("approves a gated merge from the drawer", async () => {
+    tasks = [
+      ...tasks,
+      makeTask({
+        id: "t_gate",
+        title: "Migrate invoices",
+        status: "intervention",
+        needs_human_approval: true,
+        approval_reasons: ["Touches migrations/**"],
+      }),
+    ];
+    renderBoard("/board?task=t_gate");
+    const inDrawer = within(await screen.findByTestId("task-drawer"));
+    fireEvent.click(inDrawer.getByRole("button", { name: "Approve merge" }));
+    await waitFor(() => expect(inDrawer.getByTestId("drawer-status")).toHaveTextContent("Merged"));
+    expect(requests).toContainEqual({
+      method: "POST",
+      url: "/v1/shipcrew/tasks/t_gate/approve",
+      body: undefined,
+    });
+    expect(inDrawer.queryByTestId("drawer-approval")).not.toBeInTheDocument();
+  });
+
+  it("sends requested changes to the developer from the drawer", async () => {
+    renderBoard("/board?task=t_review");
+    const inDrawer = within(await screen.findByTestId("task-drawer"));
+    fireEvent.change(inDrawer.getByLabelText("Feedback for the developer"), {
+      target: { value: "Paginate the invoice list" },
+    });
+    fireEvent.click(
+      within(inDrawer.getByRole("form", { name: "Request changes" })).getByRole("button", {
+        name: "Request changes",
+      }),
+    );
+    await waitFor(() => expect(inDrawer.getByTestId("drawer-status")).toHaveTextContent("Running"));
+    expect(requests).toContainEqual({
+      method: "POST",
+      url: "/v1/shipcrew/tasks/t_review/request-changes",
+      body: { message: "Paginate the invoice list" },
+    });
+    expect(column("running").getByText("Billing page")).toBeInTheDocument();
   });
 });
