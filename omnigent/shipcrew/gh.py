@@ -10,8 +10,9 @@ import json
 import subprocess
 from collections.abc import Sequence
 from pathlib import Path
+from typing import Any
 
-from omnigent.shipcrew.tools import session_env
+from omnigent.shipcrew.tools import registry, resolve, session_env
 
 LABELS = {
     "feature": "0E8A16",
@@ -22,9 +23,23 @@ LABELS = {
 }
 
 
-def gh(*args: str, cwd: Path, check: bool = True) -> str:
+def gh_bin() -> str:
+    """The ``gh`` executable: ``SHIPCREW_GH`` env, saved tools config, PATH, known dirs.
+
+    Tests and the local e2e point ``SHIPCREW_GH`` at a fake ``gh``.
+    """
+    tool = next(t for t in registry() if t.key == "GH")
+    return resolve(tool) or "gh"
+
+
+def gh(*args: str, cwd: Path | None, check: bool = True, timeout: float = 1800) -> str:
     r = subprocess.run(
-        ["gh", *args], cwd=cwd, capture_output=True, text=True, timeout=1800, env=session_env()
+        [gh_bin(), *args],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        env=session_env(),
     )
     if check and r.returncode:
         raise RuntimeError(f"gh {' '.join(args[:3])} failed: {r.stderr[-1500:]}")
@@ -62,7 +77,7 @@ def protect_main(cwd: Path, checks: list[str], human_approval: bool) -> bool:
     }
     r = subprocess.run(
         [
-            "gh",
+            gh_bin(),
             "api",
             "-X",
             "PUT",
@@ -119,7 +134,7 @@ def pr_for_branch(cwd: Path, branch: str) -> int | None:
 def pr_checks(cwd: Path, pr: int) -> tuple[bool, str]:
     """Wait for CI on the PR. (green, failing-check summary)."""
     r = subprocess.run(
-        ["gh", "pr", "checks", str(pr), "--watch", "--fail-fast", "--interval", "20"],
+        [gh_bin(), "pr", "checks", str(pr), "--watch", "--fail-fast", "--interval", "20"],
         cwd=cwd,
         capture_output=True,
         text=True,
@@ -133,7 +148,7 @@ def pr_checks(cwd: Path, pr: int) -> tuple[bool, str]:
 
 def pr_merge(cwd: Path, pr: int) -> bool:
     r = subprocess.run(
-        ["gh", "pr", "merge", str(pr), "--squash", "--delete-branch"],
+        [gh_bin(), "pr", "merge", str(pr), "--squash", "--delete-branch"],
         cwd=cwd,
         capture_output=True,
         text=True,
@@ -145,7 +160,7 @@ def pr_merge(cwd: Path, pr: int) -> bool:
 def update_branch(cwd: Path, pr: int) -> bool:
     """Bring the PR up to date with main. False = conflict (needs the integrator)."""
     r = subprocess.run(
-        ["gh", "pr", "update-branch", str(pr)],
+        [gh_bin(), "pr", "update-branch", str(pr)],
         cwd=cwd,
         capture_output=True,
         text=True,
@@ -156,3 +171,114 @@ def update_branch(cwd: Path, pr: int) -> bool:
 
 def repo_url(cwd: Path) -> str:
     return gh("repo", "view", "--json", "url", "-q", ".url", cwd=cwd, check=False)
+
+
+# ── Issue sync (repo-targeted, bounded) ─────────────────────────────
+# Every call names the repository with ``--repo`` so the result never depends on
+# the server's cwd, and uses a short timeout so a hung ``gh`` cannot stall a tick.
+
+SYNC_TIMEOUT_S = 60.0
+
+
+def auth_status(cwd: Path | None = None) -> tuple[bool, str]:
+    """``(logged_in, reason)`` from ``gh auth status``; reason is empty when logged in."""
+    try:
+        r = subprocess.run(
+            [gh_bin(), "auth", "status"],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=SYNC_TIMEOUT_S,
+            env=session_env(),
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return False, f"gh unavailable: {exc}"
+    if r.returncode:
+        return False, "gh is not logged in (run `gh auth login`)"
+    return True, ""
+
+
+def ensure_repo_labels(repo: str, names: Sequence[str], cwd: Path | None = None) -> None:
+    """Create (or refresh) labels in ``repo``; best effort."""
+    for name in names:
+        gh(
+            "label",
+            "create",
+            name,
+            "--color",
+            LABELS.get(name, "C5DEF5"),
+            "--force",
+            "--repo",
+            repo,
+            cwd=cwd,
+            check=False,
+            timeout=SYNC_TIMEOUT_S,
+        )
+
+
+def create_issue(
+    repo: str, title: str, body: str, labels: Sequence[str], cwd: Path | None = None
+) -> tuple[int, str]:
+    """Open an issue in ``repo``. Returns ``(number, url)``."""
+    label_args = [arg for label in labels for arg in ("--label", label)]
+    out = gh(
+        "issue",
+        "create",
+        "--repo",
+        repo,
+        "--title",
+        title,
+        "--body",
+        body,
+        *label_args,
+        cwd=cwd,
+        timeout=SYNC_TIMEOUT_S,
+    )
+    url = out.strip().splitlines()[-1].strip() if out.strip() else ""
+    return int(url.rstrip("/").rsplit("/", 1)[-1]), url
+
+
+def list_issues(
+    repo: str, label: str, cwd: Path | None = None, limit: int = 500
+) -> list[dict[str, Any]]:
+    """Open and closed issues carrying ``label``: number, state, assignees, labels, url."""
+    out = gh(
+        "issue",
+        "list",
+        "--repo",
+        repo,
+        "--label",
+        label,
+        "--state",
+        "all",
+        "--limit",
+        str(limit),
+        "--json",
+        "number,state,assignees,labels,url",
+        cwd=cwd,
+        timeout=SYNC_TIMEOUT_S,
+    )
+    data = json.loads(out or "[]")
+    return [d for d in data if isinstance(d, dict)] if isinstance(data, list) else []
+
+
+def list_pull_requests(
+    repo: str, cwd: Path | None = None, limit: int = 200
+) -> list[dict[str, Any]]:
+    """Recent PRs in any state: number, state, headRefName, url."""
+    out = gh(
+        "pr",
+        "list",
+        "--repo",
+        repo,
+        "--state",
+        "all",
+        "--limit",
+        str(limit),
+        "--json",
+        "number,state,headRefName,url",
+        cwd=cwd,
+        timeout=SYNC_TIMEOUT_S,
+    )
+    data = json.loads(out or "[]")
+    return [d for d in data if isinstance(d, dict)] if isinstance(data, list) else []

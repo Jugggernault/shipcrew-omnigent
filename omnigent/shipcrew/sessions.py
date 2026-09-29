@@ -45,6 +45,8 @@ class RootSessionRequest:
 
     :param branch: Git branch for the task worktree, e.g. ``"task/<id>"``.
     :param acting_user: Identity the session is created for (its owner).
+    :param workspace: Run in this directory as is (no worktree), e.g. the
+        planner in the mission repo; ``branch`` is then ignored.
     """
 
     task_id: str
@@ -56,6 +58,7 @@ class RootSessionRequest:
     acting_user: str | None = None
     base_branch: str | None = None
     labels: dict[str, str] = field(default_factory=dict)
+    workspace: str | None = None
 
 
 @dataclass(frozen=True)
@@ -253,7 +256,7 @@ class OmnigentSessionService:
     async def create_root_session(self, request: RootSessionRequest) -> str:
         bundle = await asyncio.to_thread(bundle_agent_dir, request.agent_dir)
         host_id, conn = await self._resolve_host(request.acting_user)
-        workspace = await self._task_worktree(conn, request)
+        workspace = request.workspace or await self._task_worktree(conn, request)
         await asyncio.to_thread(_pretrust_claude_workspace, workspace)
         metadata = {
             "title": request.title[:200],

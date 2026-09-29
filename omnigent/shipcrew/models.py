@@ -26,6 +26,7 @@ MISSION_STATUSES = ("planning", "active", "done")
 TASK_STATUSES = ("backlog", "ready", "running", "review", "intervention", "merged", "blocked")
 CI_STATES = ("none", "pending", "green", "red")
 ASSIGNEE_KINDS = ("agent", "human")
+PLAN_STATUSES = ("idle", "running", "imported", "failed")
 
 
 def _in_check(column: str, values: tuple[str, ...]) -> str:
@@ -50,9 +51,19 @@ class SqlMission(ShipcrewBase):
     # Identity that created the mission; background starts act as this user.
     owner_user_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     created_at: Mapped[int] = mapped_column(Integer, nullable=False)
+    # Planner import (see omnigent/shipcrew/planner.py).
+    plan_status: Mapped[str] = mapped_column(String(16), nullable=False, server_default="idle")
+    plan_session_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    plan_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    plan_imported_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    # Wall-clock start of the planner run: a plan.json older than this is stale.
+    plan_started_at: Mapped[float | None] = mapped_column(Float, nullable=True)
 
     __table_args__ = (
         CheckConstraint(_in_check("status", MISSION_STATUSES), name="ck_shipcrew_missions_status"),
+        CheckConstraint(
+            _in_check("plan_status", PLAN_STATUSES), name="ck_shipcrew_missions_plan_status"
+        ),
         Index("ix_shipcrew_missions_created_at", "created_at"),
     )
 
@@ -74,6 +85,9 @@ class SqlTask(ShipcrewBase):
     depends_on: Mapped[list[Any]] = mapped_column(JSON, nullable=False, default=list)
     owned_paths: Mapped[list[Any]] = mapped_column(JSON, nullable=False, default=list)
     issue_number: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    issue_url: Mapped[str | None] = mapped_column(String(2048), nullable=True)
+    # The plan.json ``key`` this task was imported from; re-imports match on it.
+    plan_key: Mapped[str | None] = mapped_column(String(128), nullable=True)
     pr_number: Mapped[int | None] = mapped_column(Integer, nullable=True)
     pr_url: Mapped[str | None] = mapped_column(String(2048), nullable=True)
     ci: Mapped[str] = mapped_column(String(8), nullable=False, server_default="none")
@@ -94,4 +108,5 @@ class SqlTask(ShipcrewBase):
         CheckConstraint(_in_check("ci", CI_STATES), name="ck_shipcrew_tasks_ci"),
         Index("ix_shipcrew_tasks_mission", "mission_id", "position"),
         Index("ix_shipcrew_tasks_status", "status"),
+        Index("ix_shipcrew_tasks_plan_key", "mission_id", "plan_key"),
     )

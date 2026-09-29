@@ -35,6 +35,7 @@ class ShipcrewSettings:
     :param base_branch: Base ref task branches fork from; ``None`` uses HEAD.
     :param db_url: Dedicated database for the shipcrew tables; ``None`` shares
         omnigent's database.
+    :param sync_interval_s: Seconds between GitHub issue syncs of a mission.
     """
 
     agents_dir: Path = Path(DEFAULT_AGENTS_DIR)
@@ -45,6 +46,7 @@ class ShipcrewSettings:
     host_id: str | None = None
     base_branch: str | None = None
     db_url: str | None = None
+    sync_interval_s: float = 60.0
 
     @classmethod
     def from_env(cls) -> ShipcrewSettings:
@@ -59,4 +61,5 @@ class ShipcrewSettings:
             host_id=env.get("SHIPCREW_HOST_ID") or None,
             base_branch=env.get("SHIPCREW_BASE_BRANCH") or None,
             db_url=env.get("SHIPCREW_DB_URL") or None,
+            sync_interval_s=max(5.0, float(env.get("SHIPCREW_SYNC_INTERVAL_S") or 60.0)),
         )

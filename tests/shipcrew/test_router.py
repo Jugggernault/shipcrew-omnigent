@@ -88,7 +88,9 @@ class TestMissions:
     async def test_create_and_list(self, client: httpx.AsyncClient) -> None:
         created = await _mission(client, repo_url="https://github.com/o/r")
         assert created["status"] == "planning"
-        assert set(created) == {"id", "title", "repo_path", "repo_url", "status", "created_at"}
+        assert set(created) == {
+            "id", "title", "repo_path", "repo_url", "status", "created_at", "plan"
+        }  # fmt: skip
         r = await client.get(f"{P}/missions")
         assert r.json() == {"missions": [created]}
 
@@ -113,7 +115,7 @@ class TestTasks:
         assert task["owned_paths"] == ["src/**"]
         assert set(task) == {
             "id", "mission_id", "title", "body", "acceptance", "status", "assignee", "role",
-            "depends_on", "owned_paths", "issue_number", "pr_number", "pr_url", "ci",
+            "depends_on", "owned_paths", "issue_number", "issue_url", "pr_number", "pr_url", "ci",
             "root_session_id", "cost_usd", "position", "blocked_reason", "created_at",
             "updated_at",
         }  # fmt: skip

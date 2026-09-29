@@ -1,5 +1,8 @@
 """Background loop: sync session state onto cards, then start gated ready tasks.
 
+Each tick also imports finished planner runs and (every ``sync_interval_s``)
+syncs GitHub issues.
+
 State lives in the DB; every tick recomputes capacity, overlap and budget from
 it, so a restart or a manual edit never leaves the loop with a stale view.
 """
@@ -31,10 +34,14 @@ class ShipcrewScheduler:
         self._wake = asyncio.Event()
 
     async def tick(self) -> list[str]:
-        """One pass: session sync, then gated starts. Returns started task ids."""
+        """One pass: session sync, plan import, gated starts, GitHub sync. Returns started ids."""
         service = await asyncio.to_thread(self._get_service)
         await service.sync_active()
-        return await service.schedule_ready()
+        await service.planner.sync()
+        started = await service.schedule_ready()
+        # Last: gh calls are the slowest part, and each one is time-bounded.
+        await service.github.tick()
+        return started
 
     def poke(self) -> None:
         """Run the next tick now (e.g. right after a card moved to ready)."""

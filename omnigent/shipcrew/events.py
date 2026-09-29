@@ -8,7 +8,7 @@ import threading
 from collections.abc import AsyncIterator
 from typing import Any
 
-from omnigent.shipcrew.store import Task
+from omnigent.shipcrew.store import Mission, Task
 
 # Slow consumers drop events past this backlog instead of growing memory; the
 # board refetches on reconnect.
@@ -16,7 +16,7 @@ _QUEUE_MAX = 1000
 
 
 class MissionEventBus:
-    """Publish ``task.updated`` / ``task.deleted`` events per mission.
+    """Publish ``task.updated`` / ``task.deleted`` / ``mission.updated`` events per mission.
 
     Publishing is thread-safe: store work runs in worker threads, so events are
     handed to each subscriber's loop with ``call_soon_threadsafe``.
@@ -35,6 +35,9 @@ class MissionEventBus:
 
     def task_updated(self, task: Task) -> None:
         self.publish(task.mission_id, {"type": "task.updated", "task": task.to_api()})
+
+    def mission_updated(self, mission: Mission) -> None:
+        self.publish(mission.id, {"type": "mission.updated", "mission": mission.to_api()})
 
     def task_deleted(self, mission_id: str, task_id: str) -> None:
         self.publish(mission_id, {"type": "task.deleted", "id": task_id})
