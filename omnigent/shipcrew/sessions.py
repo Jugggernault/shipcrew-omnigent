@@ -37,8 +37,6 @@ class RootSessionRequest:
     """Everything needed to start a task's root session.
 
     :param branch: Git branch for the task worktree, e.g. ``"task/<id>"``.
-    :param existing_branch: Check out ``branch`` instead of creating it (a
-        restart after an earlier attempt already created the branch).
     :param acting_user: Identity the session is created for (its owner).
     """
 
@@ -49,7 +47,6 @@ class RootSessionRequest:
     branch: str
     agent_dir: Path
     acting_user: str | None = None
-    existing_branch: bool = False
     base_branch: str | None = None
     labels: dict[str, str] = field(default_factory=dict)
 
@@ -137,19 +134,24 @@ class OmnigentSessionService:
         )
 
     def _auth_headers(self, user_id: str | None) -> dict[str, str]:
+        from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
         from omnigent.server.auth import (
             RESERVED_USER_LOCAL,
             resolve_auth_header,
             resolve_auth_header_strip_prefix,
         )
 
+        # First-party Origin satisfies the CSRF guard on multipart session create.
+        headers = {"Origin": OMNIGENT_INTERNAL_WS_ORIGIN}
         provider = self._auth_provider
         if provider is None or user_id is None or user_id == RESERVED_USER_LOCAL:
-            return {}
+            return headers
         token = provider.mint_runner_token(user_id, _TOKEN_TTL_S)
         if token:
-            return {"Authorization": f"Bearer {token}"}
-        return {resolve_auth_header(): resolve_auth_header_strip_prefix() + user_id}
+            headers["Authorization"] = f"Bearer {token}"
+        else:
+            headers[resolve_auth_header()] = resolve_auth_header_strip_prefix() + user_id
+        return headers
 
     async def _resolve_host(self, acting_user: str | None) -> tuple[str, Any]:
         from omnigent.server.auth import RESERVED_USER_LOCAL
@@ -178,29 +180,58 @@ class OmnigentSessionService:
             "no online host: run `omnigent host` on the machine that holds the repo"
         )
 
-    async def create_root_session(self, request: RootSessionRequest) -> str:
+    async def _task_worktree(self, conn: Any, request: RootSessionRequest) -> str:
+        """Workspace of the task's worktree, reusing one left by an earlier start.
+
+        Idempotent across retries: an existing worktree on the branch is reused,
+        an existing branch without a worktree is checked out afresh.
+        """
         from omnigent.server.routes._host_worktree import (
             WorktreeProxyError,
             create_worktree_on_host,
+            list_worktrees_on_host,
         )
 
-        bundle = await asyncio.to_thread(bundle_agent_dir, request.agent_dir)
-        host_id, conn = await self._resolve_host(request.acting_user)
+        registry = self._app.state.host_registry
         try:
-            worktree = await create_worktree_on_host(
-                host_registry=self._app.state.host_registry,
-                host_conn=conn,
-                repo_path=request.repo_path,
-                branch_name=request.branch,
-                base_branch=None if request.existing_branch else request.base_branch,
-                existing_branch=request.existing_branch,
+            listed = await list_worktrees_on_host(
+                host_registry=registry, host_conn=conn, repo_path=request.repo_path
             )
         except WorktreeProxyError as exc:
             raise SessionServiceError(exc.message) from exc
+        for entry in listed:
+            if entry.get("branch") == request.branch and entry.get("path"):
+                return str(entry["path"])
+        try:
+            created = await create_worktree_on_host(
+                host_registry=registry,
+                host_conn=conn,
+                repo_path=request.repo_path,
+                branch_name=request.branch,
+                base_branch=request.base_branch,
+            )
+        except WorktreeProxyError as first:
+            try:
+                created = await create_worktree_on_host(
+                    host_registry=registry,
+                    host_conn=conn,
+                    repo_path=request.repo_path,
+                    branch_name=request.branch,
+                    base_branch=None,
+                    existing_branch=True,
+                )
+            except WorktreeProxyError:
+                raise SessionServiceError(first.message) from first
+        return created.workspace or created.worktree_path
+
+    async def create_root_session(self, request: RootSessionRequest) -> str:
+        bundle = await asyncio.to_thread(bundle_agent_dir, request.agent_dir)
+        host_id, conn = await self._resolve_host(request.acting_user)
+        workspace = await self._task_worktree(conn, request)
         metadata = {
             "title": request.title[:200],
             "host_id": host_id,
-            "workspace": worktree.workspace or worktree.worktree_path,
+            "workspace": workspace,
             "labels": request.labels,
         }
         headers = self._auth_headers(request.acting_user)

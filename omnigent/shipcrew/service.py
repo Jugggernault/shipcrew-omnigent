@@ -224,7 +224,6 @@ class ShipcrewService:
                 branch=f"task/{task.id}",
                 agent_dir=agent_dir,
                 acting_user=acting_user or mission.owner_user_id,
-                existing_branch=task.root_session_id is not None,
                 base_branch=self.settings.base_branch,
                 labels={TASK_LABEL_KEY: task.id, ROLE_LABEL_KEY: task.role},
             )

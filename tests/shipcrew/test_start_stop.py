@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import httpx
@@ -49,7 +50,6 @@ class TestStart:
         assert req.repo_path == "/repo"
         assert req.agent_dir == service.settings.agents_dir / "developer"
         assert req.acting_user == "alice@example.com"
-        assert req.existing_branch is False
         assert req.labels == {"shipcrew.task_id": task["id"], "shipcrew.role": "developer"}
         assert "# Add login" in req.prompt
         assert "Use OAuth." in req.prompt
@@ -91,7 +91,7 @@ class TestStart:
         await client.post(f"{P}/tasks/{task['id']}/start")
         await client.post(f"{P}/tasks/{task['id']}/stop")
         await client.post(f"{P}/tasks/{task['id']}/start")
-        assert [r.existing_branch for r in sessions.created] == [False, True]
+        assert [r.branch for r in sessions.created] == [f"task/{task['id']}"] * 2
 
     async def test_start_is_idempotent_while_running(
         self, client: httpx.AsyncClient, sessions: FakeSessions
@@ -272,3 +272,34 @@ def test_prompt_without_optional_sections() -> None:
     assert prompt.startswith("# Fix")
     assert "Acceptance" not in prompt
     assert "task/abc" in prompt
+
+
+class TestSchedulerLoop:
+    async def test_poke_runs_a_tick_and_survives_failures(
+        self, client: httpx.AsyncClient, service: ShipcrewService, sessions: FakeSessions
+    ) -> None:
+        calls = 0
+
+        def get_service() -> ShipcrewService:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise RuntimeError("database not ready")
+            return service
+
+        _, task = await _setup(client)
+        await client.patch(f"{P}/tasks/{task['id']}", json={"status": "ready"})
+        scheduler = ShipcrewScheduler(get_service, 60)
+        scheduler.start()
+        try:
+            for done in (lambda: calls >= 1, lambda: bool(sessions.created)):
+                scheduler.poke()
+                for _ in range(200):
+                    if done():
+                        break
+                    await asyncio.sleep(0.01)
+        finally:
+            await scheduler.stop()
+        assert calls >= 2
+        assert [r.task_id for r in sessions.created] == [task["id"]]
+        assert (await service.require_task(task["id"])).status == "running"
