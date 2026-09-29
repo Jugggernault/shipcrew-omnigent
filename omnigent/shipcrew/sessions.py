@@ -59,6 +59,23 @@ class RootSessionRequest:
 
 
 @dataclass(frozen=True)
+class ChildSessionRequest:
+    """A loop-started child of a task's root session (reviewer, integrator).
+
+    :param parent_session_id: The task's root session; the child shows in its tree.
+    :param workspace: The task worktree the child runs in.
+    """
+
+    parent_session_id: str
+    title: str
+    prompt: str
+    workspace: str
+    agent_dir: Path
+    acting_user: str | None = None
+    labels: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
 class SessionSnapshot:
     """The slice of an omnigent session snapshot the board cares about.
 
@@ -96,6 +113,18 @@ class SessionService(Protocol):
         self, session_id: str, *, acting_user: str | None
     ) -> SessionSnapshot | None:
         """Current state of the session, or ``None`` when it no longer exists."""
+        ...
+
+    async def send_message(self, session_id: str, text: str, *, acting_user: str | None) -> None:
+        """Send ``text`` as a new user turn (e.g. CI logs, review feedback)."""
+        ...
+
+    async def last_agent_text(self, session_id: str, *, acting_user: str | None) -> str | None:
+        """Text of the latest assistant message, or ``None`` when there is none."""
+        ...
+
+    async def create_child_session(self, request: ChildSessionRequest) -> str:
+        """Create a child session under a root session, send the prompt, return the id."""
         ...
 
 
@@ -274,22 +303,87 @@ class OmnigentSessionService:
             session_id = str(created.json()["session_id"])
             try:
                 await self._wait_runner_online(client, session_id, headers)
-                sent = await client.post(
-                    f"/v1/sessions/{session_id}/events",
-                    json={
-                        "type": "message",
-                        "data": {
-                            "role": "user",
-                            "content": [{"type": "input_text", "text": request.prompt}],
-                        },
-                    },
-                    headers=headers,
-                )
-                if sent.status_code >= 400:
-                    raise SessionServiceError(f"prompt dispatch failed: {_error_detail(sent)}")
+                await self._post_message(client, session_id, request.prompt, headers)
             except BaseException:
                 # The caller never learns this id: end the session, or its
                 # runner lingers unowned by any card.
+                with contextlib.suppress(Exception):
+                    await self.stop(session_id, acting_user=request.acting_user)
+                raise
+        return session_id
+
+    async def _post_message(
+        self, client: httpx.AsyncClient, session_id: str, text: str, headers: dict[str, str]
+    ) -> None:
+        sent = await client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={
+                "type": "message",
+                "data": {"role": "user", "content": [{"type": "input_text", "text": text}]},
+            },
+            headers=headers,
+        )
+        if sent.status_code >= 400:
+            raise SessionServiceError(f"prompt dispatch failed: {_error_detail(sent)}")
+
+    async def send_message(self, session_id: str, text: str, *, acting_user: str | None) -> None:
+        async with self._client() as client:
+            await self._post_message(client, session_id, text, self._auth_headers(acting_user))
+
+    async def last_agent_text(self, session_id: str, *, acting_user: str | None) -> str | None:
+        async with self._client() as client:
+            response = await client.get(
+                f"/v1/sessions/{session_id}/items",
+                params={"limit": 50, "order": "desc"},
+                headers=self._auth_headers(acting_user),
+            )
+        if response.status_code == 404:
+            return None
+        if response.status_code >= 400:
+            raise SessionServiceError(f"session items read failed: {_error_detail(response)}")
+        for item in response.json().get("data") or []:
+            text = assistant_text(item)
+            if text is not None:
+                return text
+        return None
+
+    async def create_child_session(self, request: ChildSessionRequest) -> str:
+        bundle = await asyncio.to_thread(bundle_agent_dir, request.agent_dir)
+        await asyncio.to_thread(_pretrust_claude_workspace, request.workspace)
+        headers = self._auth_headers(request.acting_user)
+        metadata: dict[str, Any] = {
+            "title": request.title[:200],
+            "workspace": request.workspace,
+            "parent_session_id": request.parent_session_id,
+            "labels": request.labels,
+        }
+        async with self._client() as client:
+            parent = await client.get(
+                f"/v1/sessions/{request.parent_session_id}",
+                params={"include_items": "false", "include_liveness": "false"},
+                headers=headers,
+            )
+            if parent.status_code >= 400:
+                raise SessionServiceError(f"parent session read failed: {_error_detail(parent)}")
+            if not parent.json().get("runner_id"):
+                # No live parent runner to co-locate on: launch on the host.
+                # Only then does the child get a host_id, because stopping a
+                # host-bound session also tears down its runner, which for a
+                # co-located child would be the parent's.
+                metadata["host_id"], _conn = await self._resolve_host(request.acting_user)
+            created = await client.post(
+                "/v1/sessions",
+                data={"metadata": json.dumps(metadata)},
+                files={"bundle": ("bundle.tar.gz", bundle, "application/gzip")},
+                headers=headers,
+            )
+            if created.status_code >= 400:
+                raise SessionServiceError(f"child session create failed: {_error_detail(created)}")
+            session_id = str(created.json()["session_id"])
+            try:
+                await self._wait_runner_online(client, session_id, headers)
+                await self._post_message(client, session_id, request.prompt, headers)
+            except BaseException:
                 with contextlib.suppress(Exception):
                     await self.stop(session_id, acting_user=request.acting_user)
                 raise
@@ -405,6 +499,23 @@ def _is_agent_item(item: Any) -> bool:
     if item.get("type") == "message":
         return item.get("role") == "assistant"
     return item.get("type") in _AGENT_ITEM_TYPES
+
+
+def assistant_text(item: Any) -> str | None:
+    """Concatenated text of an assistant ``message`` item, else ``None``."""
+    if not isinstance(item, dict) or item.get("type") != "message":
+        return None
+    if item.get("role") != "assistant":
+        return None
+    content = item.get("content")
+    if isinstance(content, str):
+        return content
+    parts = [
+        str(part.get("text") or "")
+        for part in content or []
+        if isinstance(part, dict) and part.get("type") in ("output_text", "text")
+    ]
+    return "".join(parts) if parts else None
 
 
 def snapshot_from_payload(payload: dict[str, Any]) -> SessionSnapshot:

@@ -41,13 +41,15 @@ class TestAuth:
             ("PATCH", "/tasks/x"),
             ("POST", "/tasks/x/start"),
             ("POST", "/tasks/x/stop"),
+            ("POST", "/tasks/x/approve"),
+            ("POST", "/tasks/x/request-changes"),
             ("GET", "/missions/x/stream"),
         ],
     )
     async def test_every_route_requires_identity(
         self, client: httpx.AsyncClient, method: str, path: str
     ) -> None:
-        body = {"title": "t", "repo_path": "/r"} if method != "GET" else None
+        body = {"title": "t", "repo_path": "/r", "message": "m"} if method != "GET" else None
         r = await client.request(method, P + path, json=body, headers={USER_HEADER: ""})
         assert r.status_code == 401
 
@@ -75,8 +77,10 @@ class TestOwnership:
             ("PATCH", f"/tasks/{task['id']}"),
             ("POST", f"/tasks/{task['id']}/start"),
             ("POST", f"/tasks/{task['id']}/stop"),
+            ("POST", f"/tasks/{task['id']}/approve"),
+            ("POST", f"/tasks/{task['id']}/request-changes"),
         ]:
-            body = {"title": "t"} if method != "GET" else None
+            body = {"title": "t", "message": "m"} if method != "GET" else None
             r = await client.request(method, P + path, json=body, headers=bob)
             assert r.status_code == 404, (method, path, r.text)
         # Nothing bob sent reached alice's card.
@@ -115,8 +119,11 @@ class TestTasks:
             "id", "mission_id", "title", "body", "acceptance", "status", "assignee", "role",
             "depends_on", "owned_paths", "issue_number", "pr_number", "pr_url", "ci",
             "root_session_id", "cost_usd", "position", "blocked_reason", "created_at",
-            "updated_at",
+            "updated_at", "branch", "ci_attempts", "review", "needs_human_approval",
+            "approval_reasons",
         }  # fmt: skip
+        assert (task["branch"], task["ci_attempts"], task["review"]) == (None, 0, None)
+        assert (task["needs_human_approval"], task["approval_reasons"]) == (False, [])
 
     async def test_list_ordered_by_position(self, client: httpx.AsyncClient) -> None:
         mission = await _mission(client)

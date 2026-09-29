@@ -31,9 +31,11 @@ class ShipcrewScheduler:
         self._wake = asyncio.Event()
 
     async def tick(self) -> list[str]:
-        """One pass: session sync, then gated starts. Returns started task ids."""
+        """One pass: session sync, PR loop, then gated starts. Returns started task ids."""
         service = await asyncio.to_thread(self._get_service)
         await service.sync_active()
+        # Before the starts: a merge this tick unblocks dependants right away.
+        await service.advance_reviews()
         return await service.schedule_ready()
 
     def poke(self) -> None:

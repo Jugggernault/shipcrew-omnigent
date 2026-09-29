@@ -70,6 +70,16 @@ class Task:
     session_seen_active: bool = False
     created_at: int = 0
     updated_at: int = 0
+    branch: str | None = None
+    ci_attempts: int = 0
+    review: dict[str, Any] | None = None
+    review_sha: str | None = None
+    review_rounds: int = 0
+    reviewer_session_id: str | None = None
+    integrator_session_id: str | None = None
+    needs_human_approval: bool = False
+    approval_reasons: list[str] = field(default_factory=list)
+    human_approved: bool = False
 
     @property
     def human_assigned(self) -> bool:
@@ -100,7 +110,23 @@ class Task:
             "blocked_reason": self.blocked_reason,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
+            "branch": self.branch,
+            "ci_attempts": self.ci_attempts,
+            "review": _review_api(self.review),
+            "needs_human_approval": self.needs_human_approval,
+            "approval_reasons": list(self.approval_reasons),
         }
+
+
+def _review_api(review: dict[str, Any] | None) -> dict[str, Any] | None:
+    """The contract shape of a stored review: ``{verdict, summary, findings}``."""
+    if review is None:
+        return None
+    return {
+        "verdict": review.get("verdict"),
+        "summary": str(review.get("summary") or ""),
+        "findings": [dict(f) for f in review.get("findings") or [] if isinstance(f, dict)],
+    }
 
 
 def _mission(row: SqlMission) -> Mission:
@@ -143,6 +169,16 @@ def _task(row: SqlTask) -> Task:
         session_seen_active=bool(row.session_seen_active),
         created_at=row.created_at,
         updated_at=row.updated_at,
+        branch=row.branch,
+        ci_attempts=int(row.ci_attempts or 0),
+        review=dict(row.review) if isinstance(row.review, dict) else None,
+        review_sha=row.review_sha,
+        review_rounds=int(row.review_rounds or 0),
+        reviewer_session_id=row.reviewer_session_id,
+        integrator_session_id=row.integrator_session_id,
+        needs_human_approval=bool(row.needs_human_approval),
+        approval_reasons=[str(r) for r in row.approval_reasons or []],
+        human_approved=bool(row.human_approved),
     )
 
 
@@ -164,6 +200,16 @@ _TASK_FIELDS = frozenset(
         "position",
         "blocked_reason",
         "session_seen_active",
+        "branch",
+        "ci_attempts",
+        "review",
+        "review_sha",
+        "review_rounds",
+        "reviewer_session_id",
+        "integrator_session_id",
+        "needs_human_approval",
+        "approval_reasons",
+        "human_approved",
     }
 )
 _UNSET: Any = object()
@@ -252,6 +298,10 @@ class ShipcrewStore:
                 depends_on=list(depends_on or []),
                 owned_paths=list(owned_paths or []),
                 ci="none",
+                ci_attempts=0,
+                review_rounds=0,
+                needs_human_approval=False,
+                human_approved=False,
                 cost_usd=0.0,
                 position=(float(last) + 1.0) if last is not None else 0.0,
                 session_seen_active=False,

@@ -87,6 +87,10 @@ class PatchTaskBody(BaseModel):
         return {k: v for k, v in sent.items() if v is not None or k == "assignee"}
 
 
+class RequestChangesBody(BaseModel):
+    message: str = Field(min_length=1, max_length=20_000)
+
+
 def _sse(event: dict[str, Any]) -> str:
     return f"data: {json.dumps(event, separators=(',', ':'))}\n\n"
 
@@ -164,6 +168,25 @@ def create_shipcrew_router(
         service = await _svc()
         await service.authorize_task(task_id, user_id)
         return (await service.stop_task(task_id, user_id)).to_api()
+
+    @router.post("/tasks/{task_id}/approve")
+    async def approve_task(request: Request, task_id: str) -> dict[str, Any]:
+        user_id = require_user(request, auth_provider)
+        service = await _svc()
+        await service.authorize_task(task_id, user_id)
+        task = await service.approve_task(task_id)
+        if on_ready is not None:
+            on_ready()  # merge on the next tick, not the next poll
+        return task.to_api()
+
+    @router.post("/tasks/{task_id}/request-changes")
+    async def request_changes(
+        request: Request, task_id: str, body: RequestChangesBody
+    ) -> dict[str, Any]:
+        user_id = require_user(request, auth_provider)
+        service = await _svc()
+        await service.authorize_task(task_id, user_id)
+        return (await service.request_changes(task_id, body.message)).to_api()
 
     @router.get("/missions/{mission_id}/stream")
     async def stream(request: Request, mission_id: str) -> StreamingResponse:
