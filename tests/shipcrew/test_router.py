@@ -107,9 +107,17 @@ class TestMissions:
         created = await _mission(client, repo_url="https://github.com/o/r")
         assert created["status"] == "planning"
         assert set(created) == {
-            "id", "title", "repo_path", "repo_url", "status", "created_at", "plan", "auto_run"
+            "id", "title", "repo_path", "repo_url", "status", "created_at", "plan", "auto_run",
+            "plan_decisions", "auto_ship", "ship",
         }  # fmt: skip
         assert created["auto_run"] is False
+        assert created["auto_ship"] is True
+        assert created["plan_decisions"] == []
+        assert created["ship"] == {
+            "status": "idle", "url": None, "report_md": None, "error": None, "note": None,
+            "started_at": None, "finished_at": None, "session_id": None, "decisions": [],
+            "cost_usd": 0.0,
+        }  # fmt: skip
         r = await client.get(f"{P}/missions")
         assert r.json() == {"missions": [created]}
 
@@ -137,8 +145,9 @@ class TestTasks:
             "depends_on", "owned_paths", "issue_number", "issue_url", "pr_number", "pr_url", "ci",
             "root_session_id", "cost_usd", "position", "blocked_reason", "created_at",
             "updated_at", "branch", "ci_attempts", "review", "needs_human_approval",
-            "approval_reasons",
+            "approval_reasons", "decisions", "started_at", "interventions",
         }  # fmt: skip
+        assert (task["decisions"], task["started_at"], task["interventions"]) == ([], None, [])
         assert (task["branch"], task["ci_attempts"], task["review"]) == (None, 0, None)
         assert (task["needs_human_approval"], task["approval_reasons"]) == (False, [])
 

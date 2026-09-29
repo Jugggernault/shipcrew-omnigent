@@ -17,7 +17,7 @@ import re
 import unicodedata
 from typing import Literal
 
-Intent = Literal["start_all", "plan", "sync", "stop_all"]
+Intent = Literal["start_all", "plan", "sync", "stop_all", "ship"]
 
 # Verb -> intent. Every word is compared after accent and case folding.
 _VERBS: dict[str, Intent] = {
@@ -44,6 +44,14 @@ _VERBS: dict[str, Intent] = {
     "synchronise": "sync",
     "synchroniser": "sync",
     "synchronisez": "sync",
+    # deploy the merged mission (POST /ship)
+    "ship": "ship",
+    "deploy": "ship",
+    "deploie": "ship",
+    "deployer": "ship",
+    "deployez": "ship",
+    "livre": "ship",
+    "livrer": "ship",
     # stop the running tasks
     "stop": "stop_all",
     "halt": "stop_all",
@@ -63,7 +71,8 @@ _FILLER = frozenset(
         "from", "prd", "github", "with", "it", "them", "again", "board", "crew", "cards",
         "tout", "toutes", "tous", "les", "la", "le", "l", "de", "du", "des", "taches",
         "tache", "maintenant", "svp", "stp", "s", "il", "te", "vous", "plait", "avec",
-        "a", "partir", "cartes", "equipe", "encore",
+        "a", "partir", "cartes", "equipe", "encore", "to", "vercel", "prod", "production",
+        "en", "sur", "app",
     }
 )  # fmt: skip
 
@@ -72,6 +81,7 @@ SUPPORTED_COMMANDS: tuple[str, ...] = (
     "plan / planifie: plan from the repo's PRD (.shipcrew/prd.md)",
     "sync / synchronise: sync GitHub issues and PRs now",
     "stop all / arrête tout: stop every running task",
+    "ship / deploy / déploie: deploy the merged mission to Vercel",
 )
 
 MAX_COMMAND_CHARS = 2000

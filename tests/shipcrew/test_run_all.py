@@ -250,6 +250,9 @@ class TestCommand:
             ("stop all", "stop_all"),
             ("Arrête tout", "stop_all"),
             ("ARRETER TOUTES LES TACHES", "stop_all"),
+            ("ship", "ship"),
+            ("deploy to production", "ship"),
+            ("Déploie sur Vercel", "ship"),
         ],
     )
     def test_classify(self, text: str, intent: str) -> None:
@@ -264,7 +267,7 @@ class TestCommand:
             "ne lance pas tout",
             "run all and stop",
             "lance tout puis arrête",
-            "deploy to production",
+            "deploy and stop",
             "rm -rf /",
         ],
     )
@@ -331,7 +334,7 @@ class TestCommand:
         mission = await _mission(client)
         await _task(client, mission["id"])
         r = await client.post(
-            f"{P}/missions/{mission['id']}/command", json={"text": "deploy to prod"}
+            f"{P}/missions/{mission['id']}/command", json={"text": "build a rocket"}
         )
         assert r.status_code == 400
         message = r.json()["error"]["message"]

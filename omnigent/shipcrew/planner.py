@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Any
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.shipcrew.decisions import parse_decisions
 from omnigent.shipcrew.sessions import RootSessionRequest, SessionServiceError, SessionSnapshot
 from omnigent.shipcrew.store import Mission, PlanTaskSpec
 
@@ -343,6 +344,21 @@ class PlanRunner:
             await self._service.start_all(mission.id, {t.id for t in tasks})
         return mission
 
+    async def _record_decisions(self, mission: Mission) -> None:
+        """The planner's ``Decisions:`` list -> ``mission.plan_decisions`` (best effort)."""
+        if mission.plan_session_id is None:
+            return
+        try:
+            text = await self._service.sessions.last_agent_text(
+                mission.plan_session_id, acting_user=mission.owner_user_id
+            )
+        except SessionServiceError as exc:
+            _logger.warning("shipcrew: planner reply read failed for %s: %s", mission.id, exc)
+            return
+        await asyncio.to_thread(
+            self._service.store.update_mission, mission.id, plan_decisions=parse_decisions(text)
+        )
+
     async def _finish(self, mission: Mission, snap: SessionSnapshot | None) -> None:
         if snap is None:
             await self._fail(mission, "planner session no longer exists")
@@ -350,6 +366,7 @@ class PlanRunner:
         if snap.status == "failed":
             await self._fail(mission, snap.error or "planner session failed")
         elif snap.status == "idle" and snap.agent_replied and not snap.awaiting_human:
+            await self._record_decisions(mission)
             await self.import_plan(mission.id)
         else:
             return

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections.abc import Callable
 from typing import Any
 
@@ -22,6 +23,7 @@ from omnigent.shipcrew.sessions import (
     SessionSnapshot,
 )
 from omnigent.shipcrew.settings import ShipcrewSettings
+from omnigent.shipcrew.ship import ShipRunner
 from omnigent.shipcrew.store import ACTIVE_STATUSES, Assignee, Mission, ShipcrewStore, Task
 
 _logger = logging.getLogger(__name__)
@@ -113,6 +115,7 @@ class ShipcrewService:
         self.pr_loop = PrLoop(self)
         self.planner = PlanRunner(self)
         self.github = GitHubSync(self)
+        self.ship = ShipRunner(self)
 
     async def _call(self, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
         return await asyncio.to_thread(fn, *args, **kwargs)
@@ -170,6 +173,14 @@ class ShipcrewService:
         if task is None or mission is None or not self.visible_to(mission, user_id):
             raise _not_found("task", task_id)
         return task
+
+    async def set_auto_ship(self, mission_id: str, auto_ship: bool) -> Mission:
+        """Turn "deploy when every task is merged" on or off (``mission.updated``)."""
+        mission = await self._call(self.store.update_mission, mission_id, auto_ship=auto_ship)
+        if mission is None:
+            raise _not_found("mission", mission_id)
+        self.bus.mission_updated(mission)
+        return mission
 
     async def set_auto_run(self, mission_id: str, auto_run: bool) -> Mission:
         """Turn "run automatically after planning" on or off (``mission.updated``)."""
@@ -329,6 +340,7 @@ class ShipcrewService:
                 blocked_reason=None,
                 session_seen_active=False,
                 branch=branch,
+                started_at=task.started_at or time.time(),
             )
             base_branch = self.settings.base_branch
             if base_branch is None and self.settings.pr_loop_enabled:

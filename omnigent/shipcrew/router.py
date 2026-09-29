@@ -100,6 +100,7 @@ class PlanBody(BaseModel):
 
 class PatchMissionBody(BaseModel):
     auto_run: bool | None = None
+    auto_ship: bool | None = None
 
 
 class CommandBody(BaseModel):
@@ -155,6 +156,18 @@ def create_shipcrew_router(
         mission = await service.authorize_mission(mission_id, user_id)
         if body.auto_run is not None:
             mission = await service.set_auto_run(mission_id, body.auto_run)
+        if body.auto_ship is not None:
+            mission = await service.set_auto_ship(mission_id, body.auto_ship)
+            if body.auto_ship and on_ready is not None:
+                on_ready()  # a finished mission ships on the next tick
+        return mission.to_api()
+
+    @router.post("/missions/{mission_id}/ship")
+    async def ship_mission(request: Request, mission_id: str) -> dict[str, Any]:
+        user_id = require_user(request, auth_provider)
+        service = await _svc()
+        await service.authorize_mission(mission_id, user_id)
+        mission = await service.ship.start(mission_id, user_id, manual=True)
         return mission.to_api()
 
     async def _start_all(service: ShipcrewService, mission_id: str) -> list[str]:
@@ -198,6 +211,13 @@ def create_shipcrew_router(
                 f"Stopped {_plural(len(stopped), 'running task')}."
                 if stopped
                 else "No running task to stop."
+            )
+        elif intent == "ship":
+            mission = await service.ship.start(mission_id, user_id, manual=True)
+            result["message"] = (
+                "Deploying to Vercel."
+                if mission.ship_status == "deploying"
+                else f"Ship failed: {mission.ship_error}"
             )
         elif intent == "plan":
             # The PRD comes from the repo (.shipcrew/prd.md); the dialog sends text.

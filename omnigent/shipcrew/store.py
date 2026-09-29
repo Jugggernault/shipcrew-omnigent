@@ -40,6 +40,20 @@ class Mission:
     plan_imported_count: int = 0
     plan_started_at: float | None = None
     auto_run: bool = False
+    plan_decisions: list[str] = field(default_factory=list)
+    auto_ship: bool = True
+    ship_status: str = "idle"
+    ship_url: str | None = None
+    ship_report_md: str | None = None
+    ship_error: str | None = None
+    ship_note: str | None = None
+    ship_started_at: float | None = None
+    ship_finished_at: float | None = None
+    ship_session_id: str | None = None
+    ship_branch: str | None = None
+    ship_verify_until: float | None = None
+    ship_decisions: list[str] = field(default_factory=list)
+    ship_cost_usd: float = 0.0
 
     def to_api(self) -> dict[str, Any]:
         """Serialize to the shared API contract shape."""
@@ -57,6 +71,20 @@ class Mission:
                 "imported_count": self.plan_imported_count,
             },
             "auto_run": self.auto_run,
+            "plan_decisions": list(self.plan_decisions),
+            "auto_ship": self.auto_ship,
+            "ship": {
+                "status": self.ship_status,
+                "url": self.ship_url,
+                "report_md": self.ship_report_md,
+                "error": self.ship_error,
+                "note": self.ship_note,
+                "started_at": self.ship_started_at,
+                "finished_at": self.ship_finished_at,
+                "session_id": self.ship_session_id,
+                "decisions": list(self.ship_decisions),
+                "cost_usd": self.ship_cost_usd,
+            },
         }
 
 
@@ -95,6 +123,9 @@ class Task:
     needs_human_approval: bool = False
     approval_reasons: list[str] = field(default_factory=list)
     human_approved: bool = False
+    decisions: list[str] = field(default_factory=list)
+    started_at: float | None = None
+    interventions: list[dict[str, Any]] = field(default_factory=list)
 
     @property
     def human_assigned(self) -> bool:
@@ -131,6 +162,9 @@ class Task:
             "review": _review_api(self.review),
             "needs_human_approval": self.needs_human_approval,
             "approval_reasons": list(self.approval_reasons),
+            "decisions": list(self.decisions),
+            "started_at": self.started_at,
+            "interventions": [dict(i) for i in self.interventions],
         }
 
 
@@ -160,6 +194,20 @@ def _mission(row: SqlMission) -> Mission:
         plan_imported_count=int(row.plan_imported_count or 0),
         plan_started_at=row.plan_started_at,
         auto_run=bool(row.auto_run),
+        plan_decisions=[str(d) for d in row.plan_decisions or []],
+        auto_ship=True if row.auto_ship is None else bool(row.auto_ship),
+        ship_status=row.ship_status or "idle",
+        ship_url=row.ship_url,
+        ship_report_md=row.ship_report_md,
+        ship_error=row.ship_error,
+        ship_note=row.ship_note,
+        ship_started_at=row.ship_started_at,
+        ship_finished_at=row.ship_finished_at,
+        ship_session_id=row.ship_session_id,
+        ship_branch=row.ship_branch,
+        ship_verify_until=row.ship_verify_until,
+        ship_decisions=[str(d) for d in row.ship_decisions or []],
+        ship_cost_usd=float(row.ship_cost_usd or 0.0),
     )
 
 
@@ -203,6 +251,9 @@ def _task(row: SqlTask) -> Task:
         needs_human_approval=bool(row.needs_human_approval),
         approval_reasons=[str(r) for r in row.approval_reasons or []],
         human_approved=bool(row.human_approved),
+        decisions=[str(d) for d in row.decisions or []],
+        started_at=row.started_at,
+        interventions=[dict(i) for i in row.interventions or [] if isinstance(i, dict)],
     )
 
 
@@ -236,6 +287,8 @@ _TASK_FIELDS = frozenset(
         "needs_human_approval",
         "approval_reasons",
         "human_approved",
+        "decisions",
+        "started_at",
     }
 )
 _MISSION_FIELDS = frozenset(
@@ -247,11 +300,26 @@ _MISSION_FIELDS = frozenset(
         "plan_imported_count",
         "plan_started_at",
         "auto_run",
+        "plan_decisions",
+        "auto_ship",
+        "ship_status",
+        "ship_url",
+        "ship_report_md",
+        "ship_error",
+        "ship_note",
+        "ship_started_at",
+        "ship_finished_at",
+        "ship_session_id",
+        "ship_branch",
+        "ship_verify_until",
+        "ship_decisions",
+        "ship_cost_usd",
     }
 )
 _PLAN_TASK_FIELDS = ("title", "body", "acceptance", "role", "owned_paths")
 _PLAN_EDITABLE_STATUSES = frozenset({"backlog", "ready"})
 _UNSET: Any = object()
+_MAX_INTERVENTIONS = 50
 
 
 @dataclass(frozen=True)
@@ -302,6 +370,9 @@ class ShipcrewStore:
             owner_user_id=owner_user_id,
             created_at=int(time.time()),
             auto_run=False,
+            auto_ship=True,
+            ship_status="idle",
+            ship_cost_usd=0.0,
         )
         with self._session("create_mission") as session:
             session.add(row)
@@ -512,8 +583,16 @@ class ShipcrewStore:
             row = session.get(SqlTask, task_id)
             if row is None:
                 return None
+            entering = fields.get("status") == "intervention" and row.status != "intervention"
             for name, value in fields.items():
                 setattr(row, name, list(value) if isinstance(value, list | tuple) else value)
+            if entering:
+                # The report lists every time a human had to step in.
+                reason = row.blocked_reason or "the agent asked a human (approval or input)"
+                row.interventions = [
+                    *(row.interventions or []),
+                    {"at": time.time(), "reason": str(reason)[:500]},
+                ][-_MAX_INTERVENTIONS:]
             if assignee is not _UNSET:
                 row.assignee_kind = assignee.kind if assignee is not None else None
                 row.assignee_id = assignee.id if assignee is not None else None
