@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import logging
 import time
 from collections.abc import Callable
@@ -25,6 +26,7 @@ from omnigent.shipcrew.sessions import (
 from omnigent.shipcrew.settings import ShipcrewSettings
 from omnigent.shipcrew.ship import ShipRunner
 from omnigent.shipcrew.store import ACTIVE_STATUSES, Assignee, Mission, ShipcrewStore, Task
+from omnigent.shipcrew.verify import is_verify_hold
 
 _logger = logging.getLogger(__name__)
 
@@ -430,14 +432,18 @@ class ShipcrewService:
                 await self._update(task.id, **changes)
 
     def _loop_owned(self, task: Task, snap: SessionSnapshot | None) -> bool:
-        if not self.settings.pr_loop_enabled or task.pr_number is None:
+        if not self.settings.pr_loop_enabled:
             return False
+        # A loop hold only moves when a human talks to the agent in its session.
+        human_resumed = snap is not None and (
+            snap.awaiting_human or snap.status in ("running", "waiting")
+        )
+        if task.pr_number is None:
+            # A verify card held after its last fix cycle has no PR.
+            return is_verify_hold(task) and not human_resumed
         if task.status in WATCHED_REVIEW_STATUSES:
             return True
-        # A loop hold only moves when a human talks to the agent in its session.
-        return is_loop_hold(task) and not (
-            snap is not None and (snap.awaiting_human or snap.status in ("running", "waiting"))
-        )
+        return is_loop_hold(task) and not human_resumed
 
     async def advance_reviews(self) -> None:
         """PR loop step for every review card (no-op when the loop is off)."""
@@ -451,10 +457,18 @@ class ShipcrewService:
         return await self.pr_loop.request_changes(task_id, message)
 
     async def schedule_ready(self) -> list[str]:
-        """Start every ready task whose four gates pass; returns started ids."""
+        """Start every ready task whose four gates pass, in parallel; returns started ids.
+
+        The gates are evaluated one task at a time against a local view in
+        which each task picked earlier this tick already counts as running, so
+        capacity and owned-path overlap stay exact. The picked tasks then start
+        concurrently: a start is mostly waiting (worktree, runner launch), and
+        the one unsafe step, ``git worktree add`` on a shared repository, is
+        serialized per repository by the session layer.
+        """
         tasks = {t.id: t for t in await self._call(self.store.list_tasks)}
         missions = {m.id: m for m in await self.list_missions()}
-        started: list[str] = []
+        picked: list[Task] = []
         ready = [t for t in tasks.values() if t.status == "ready" and not t.human_assigned]
         for task in sorted(ready, key=lambda t: (t.position, t.created_at)):
             ctx = GateContext(
@@ -468,12 +482,19 @@ class ShipcrewService:
                 if reason != task.blocked_reason:
                     tasks[task.id] = await self._update(task.id, blocked_reason=reason)
                 continue
+            picked.append(task)
+            # Holds a slot (and its paths) for the gates of the next ready tasks.
+            tasks[task.id] = dataclasses.replace(task, status="running")
+
+        async def _start(task: Task) -> str | None:
             mission = missions.get(task.mission_id)
             owner = mission.owner_user_id if mission is not None else None
             try:
-                tasks[task.id] = await self.start_task(task.id, owner)
+                await self.start_task(task.id, owner)
             except OmnigentError as exc:
                 _logger.info("shipcrew: skipped start of task %s: %s", task.id, exc)
-                continue
-            started.append(task.id)
-        return started
+                return None
+            return task.id
+
+        results = await asyncio.gather(*(_start(t) for t in picked))
+        return [task_id for task_id in results if task_id is not None]

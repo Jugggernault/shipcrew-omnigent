@@ -15,6 +15,7 @@ import dataclasses
 import io
 import json
 import logging
+import posixpath
 import re
 import tarfile
 import tempfile
@@ -25,6 +26,8 @@ from pathlib import Path
 from typing import Any, Protocol
 
 import httpx
+
+from omnigent.shipcrew.deps_seed import seed_node_modules
 
 _logger = logging.getLogger(__name__)
 
@@ -79,6 +82,8 @@ class ChildSessionRequest:
     agent_dir: Path
     acting_user: str | None = None
     labels: dict[str, str] = field(default_factory=dict)
+    # Per-session effort (e.g. "low" for a small review diff); None = the agent default.
+    reasoning_effort: str | None = None
 
 
 @dataclass(frozen=True)
@@ -220,6 +225,13 @@ class OmnigentSessionService:
         self._app = app
         self._auth_provider = auth_provider
         self._host_id = host_id
+        # One lock per repository around `git worktree add`: parallel starts
+        # on the same repo race on its .git (index/config/ref locks).
+        self._worktree_locks: dict[str, asyncio.Lock] = {}
+
+    def _worktree_lock(self, repo_path: str) -> asyncio.Lock:
+        key = posixpath.normpath(repo_path)
+        return self._worktree_locks.setdefault(key, asyncio.Lock())
 
     def _client(self) -> httpx.AsyncClient:
         return httpx.AsyncClient(
@@ -290,20 +302,29 @@ class OmnigentSessionService:
         """
         from omnigent.server.routes._host_worktree import (
             WorktreeProxyError,
-            create_worktree_on_host,
             list_worktrees_on_host,
         )
 
         registry = self._app.state.host_registry
-        try:
-            listed = await list_worktrees_on_host(
-                host_registry=registry, host_conn=conn, repo_path=request.repo_path
-            )
-        except WorktreeProxyError as exc:
-            raise SessionServiceError(exc.message) from exc
-        for entry in listed:
-            if entry.get("branch") == request.branch and entry.get("path"):
-                return str(entry["path"])
+        async with self._worktree_lock(request.repo_path):
+            try:
+                listed = await list_worktrees_on_host(
+                    host_registry=registry, host_conn=conn, repo_path=request.repo_path
+                )
+            except WorktreeProxyError as exc:
+                raise SessionServiceError(exc.message) from exc
+            for entry in listed:
+                if entry.get("branch") == request.branch and entry.get("path"):
+                    return str(entry["path"])
+            return await self._add_worktree(conn, request)
+
+    async def _add_worktree(self, conn: Any, request: RootSessionRequest) -> str:
+        from omnigent.server.routes._host_worktree import (
+            WorktreeProxyError,
+            create_worktree_on_host,
+        )
+
+        registry = self._app.state.host_registry
         try:
             created = await create_worktree_on_host(
                 host_registry=registry,
@@ -329,6 +350,10 @@ class OmnigentSessionService:
     async def create_root_session(self, request: RootSessionRequest) -> str:
         host_id, conn = await self._resolve_host(request.acting_user)
         workspace = request.workspace or await self._task_worktree(conn, request)
+        if request.workspace is None:
+            # Skip the agent's dependency install when the main checkout's
+            # node_modules matches the worktree's lockfile (best effort).
+            await asyncio.to_thread(seed_node_modules, request.repo_path, workspace)
         bundle = await asyncio.to_thread(
             bundle_agent_dir,
             request.agent_dir,
@@ -409,6 +434,8 @@ class OmnigentSessionService:
             "parent_session_id": request.parent_session_id,
             "labels": request.labels,
         }
+        if request.reasoning_effort is not None:
+            metadata["reasoning_effort"] = request.reasoning_effort
         async with self._client() as client:
             parent = await client.get(
                 f"/v1/sessions/{request.parent_session_id}",

@@ -111,6 +111,97 @@ reached Vercel.
 - Parallel rounds may add their own `sc0004*` revision: the integrator must
   rechain `down_revision` to keep one head.
 
+## Round 4b: verify roles and speed (2026-09-29)
+
+- **Verify roles write tests only** (`omnigent/shipcrew/policies.py`
+  `test_writes_only`, registered): qa and security may write `test/**`,
+  `tests/**`, `e2e/**` (top level), `**/__tests__/**`, `**/__snapshots__/**`,
+  `**/*.test.*`, `**/*.spec.*` and their report (`.shipcrew/qa.json`,
+  `.shipcrew/security.md`); any other write (write tools and shell targets) is
+  DENY. `owned_paths` gained `extra_free_paths` (the report file) and still asks
+  for a test outside the task. The PR loop re-checks the diff: a non-test file
+  in a verify PR needs approval.
+- **Failures become fix tasks** (`omnigent/shipcrew/verify.py`, hooked at the
+  PR loop's first step): verify `PASS` with no commits -> card `merged`
+  (nothing to merge); `PASS` with tests -> normal PR; `FAIL` or a
+  blocker/major finding -> ONE developer task `Fix: <title>` (findings with
+  file:line and repro, the report, "add a regression test"; owned paths = the
+  files named, fallback the verify task's; plan key `fix:<id>:<n>`), Ready. The
+  verify card goes back to Ready with `depends_on += fix`, its worktree and
+  branch removed so it re-runs on the merged fix. Tests it wrote stay on local
+  branch `shipcrew-tests/<id8>-<n>`, named in the fix body. After 2 fix cycles:
+  Intervention `verification still failing after 2 fix cycles: <reason>` (the
+  session sync leaves that hold alone until a human talks to the agent).
+- **Parallel starts** (`service.schedule_ready`): gates are evaluated in order
+  against a view where each picked card already runs, then the picked cards
+  start with `asyncio.gather`. `git worktree add` is serialized per repository
+  (`OmnigentSessionService._worktree_lock`).
+- **node_modules seeding** (`omnigent/shipcrew/deps_seed.py`): a new task
+  worktree whose lockfile is byte-identical to the main checkout's (and whose
+  `node_modules` is gitignored) gets a reflink copy, else a hardlink copy
+  (`cp -al`, symlinks kept, so pnpm's layout works). Files a package manager
+  rewrites in place (`.package-lock.json`, `.modules.yaml`, ...) are made
+  private, tool caches are dropped. Any failure: silently nothing.
+- **Cheaper reviews** (`omnigent/shipcrew/review_policy.py`): with CI green, a
+  tests-only or docs-only diff (`.md/.rst/.adoc`, not `AGENTS.md`, `CLAUDE.md`,
+  `DESIGN.md`, skills, `.shipcrew/`, `.github/`) skips the reviewer
+  (`review.summary = "review skipped: ..."`, `SHIPCREW_REVIEW_SKIP=0` turns it
+  off). Otherwise the reviewer session gets `reasoning_effort` `low` (<= 40
+  changed lines) or `medium` (< 150), passed as session metadata, which
+  claude-native turns into `--effort` (`SHIPCREW_REVIEW_EFFORT_TINY/SMALL`).
+- **CI template**: pnpm or npm picked from the lockfile, setup-node cache,
+  `--prefer-offline` installs, `.next/cache`, lint + typecheck + test in one
+  parallel step (each log grouped, fails if any failed), `cancel-in-progress`.
+- **Bundles** (shipcrew `v3-qaspeed`): planner (fewest, largest tasks along
+  module boundaries; small PRD = at most 5 tasks + one final qa verify task with
+  the security checklist; verify roles never implement), COMMON speed rules
+  (unit tests on route handlers with the fake DB, one command for the whole
+  suite, e2e and dev servers only when needed, batched reads, no polling,
+  install once), scaffolder on pnpm with `packageManager`.
+
+**Live run** (port 16791, own state dir, fake gh, bundles of shipcrew
+`v3-qaspeed`, real Claude sessions): a CommonJS cart library with a planted bug
+(`cartTotal` ignores `qty`) and one qa task (owned `test/**`).
+
+1. 20:13:50 qa started. 6 tool calls: one batched read, one `npm test`, it
+   added `cartTotal multiplies price by qty` + empty-cart tests to
+   `test/cart.test.js`, wrote `.shipcrew/qa.json`, committed (no prompt), and
+   ended with a findings block (`src/cart.js:4`, blocker, repro) and
+   `FAIL: 1 failures`.
+2. 20:14:43 the board created `Fix: Verify the cart` (developer, owned
+   `src/cart.js`, `test/cart.test.js`, body = finding + qa.json + `git checkout
+   shipcrew-tests/aa5f40e3-1 -- test/cart.test.js`), qa card back to Ready
+   waiting on it.
+3. The developer (5 tool calls) took the tests, fixed the reduce, ran the suite
+   once, committed. One approval card: the old workflows regex asked for
+   `git checkout ... && cat ...; ls .github/workflows` (a read). Approved by
+   hand; that false positive is now fixed (`workflows_guard`).
+4. 20:16:43 PR #1 CI green, reviewer APPROVE, merged. The qa card restarted on
+   the merged code, passed, added one more test: PR #2, tests-only, so the
+   reviewer was skipped ("review skipped: tests-only diff with CI green"),
+   merged 20:17:29. `npm test` on main: 5 pass, 0 fail. Total cost $1.04,
+   3 min 40 s end to end.
+
+A second live run (port 16792, new code) checked the speed paths: three
+independent developer tasks queued with `start-all` got their three worktrees
+and root sessions in the same second (one scheduler tick, `git worktree add`
+serialized per repo), all three PRs went green, each reviewer session ran with
+`reasoning_effort: low` (diffs under 40 lines), and all merged by 20:21:11,
+91 s after the start. $1.52 in total, `npm test` on main 7 pass.
+
+Measured on this machine (ext4, so the hardlink path; Next 15 + React 19 +
+vitest + eslint + faker, 391 MB, ~13k files):
+
+| | fresh worktree install | seed |
+|---|---|---|
+| npm (`npm ci --prefer-offline`, warm cache) | 5.1 s | 0.34 s |
+| pnpm (`pnpm install --frozen-lockfile --prefer-offline`, warm store) | 0.68 s | 0.21 s |
+| cold install (empty worktree, network) | npm 23.5 s, pnpm 33.4 s | 0.2-0.3 s |
+
+The seed also saves the agent's install turn. Parallel starts: N starts take
+the time of the slowest instead of the sum (test: 2 x 0.3 s starts in < 0.6 s).
+CI: the three check scripts run side by side (test: 3 x 0.5 s in < 1.4 s).
+
 ## Round 3: run everything, MCP scoping (2026-09-29)
 
 - **Run all tasks** (`omnigent/shipcrew/router.py`, `service.py`, `store.py`):
@@ -322,8 +413,13 @@ regression test.
   waits on an approval card the task stays in Review (contract: Intervention);
   the ask only shows in the sidebar ("Needs response") and the Inbox. The
   reviewer test-runner allowlist removes the common case.
-- **`workflows_approval` false positive**: a chain such as `git fetch -q
-  origin; ls .github/workflows` asks, although it only reads.
+- **`workflows_approval` false positive**: fixed in round 4 (python
+  `workflows_guard`, per simple command).
+- **Verify follow-ups**: a verify PR whose CI goes red sends the logs to the
+  verify agent, which can only change tests (a real app defect then ends as
+  blocked, not as a fix task). Fix tasks own only the files the findings name,
+  so a fix that needs another file asks once. The node_modules seed covers the
+  root `node_modules` only (not workspace packages).
 - **Loop children never time out**: a reviewer, integrator or planner that
   never answers keeps the card in Review (or `plan.status=running`).
 - **Transient status**: for one tick between review and the approval hold the

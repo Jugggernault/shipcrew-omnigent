@@ -5,6 +5,7 @@ on:
   push:
     branches: [main]
 concurrency:
+  # A new push to the same PR cancels its running CI (no wasted minutes).
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 jobs:
@@ -15,16 +16,51 @@ jobs:
     env:
       CI: "1"
       CHROMIUM_PATH: /usr/bin/google-chrome  # preinstalled on GitHub runners: no Playwright download
+      NEXT_TELEMETRY_DISABLED: "1"
     steps:
       - uses: actions/checkout@v4
+      # pnpm when the repo has pnpm-lock.yaml (version from package.json "packageManager"), else npm.
+      - id: pm
+        run: |
+          if [ -f pnpm-lock.yaml ]; then
+            echo "name=pnpm" >> "$GITHUB_OUTPUT"
+            echo "install=pnpm install --frozen-lockfile --prefer-offline" >> "$GITHUB_OUTPUT"
+            echo "audit=pnpm audit --prod --audit-level high" >> "$GITHUB_OUTPUT"
+          else
+            echo "name=npm" >> "$GITHUB_OUTPUT"
+            echo "install=npm ci --prefer-offline --no-audit --no-fund" >> "$GITHUB_OUTPUT"
+            echo "audit=npm audit --omit=dev --audit-level=high" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: pnpm/action-setup@v4
+        if: steps.pm.outputs.name == 'pnpm'
       - uses: actions/setup-node@v4
-        with: { node-version: 22, cache: npm }
-      - run: npm ci --no-audit --no-fund
-      - run: npm run --if-present lint
-      - run: npm run --if-present typecheck
-      - run: npm run --if-present test
-      - run: npm run build
-      - run: npm audit --omit=dev --audit-level=high
+        with: { node-version: 22, cache: "${{ steps.pm.outputs.name }}" }
+      - run: ${{ steps.pm.outputs.install }}
+      # Next.js build cache: incremental builds across runs of the same lockfile.
+      - uses: actions/cache@v4
+        with:
+          path: .next/cache
+          key: next-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml', 'package-lock.json') }}-${{ github.sha }}
+          restore-keys: next-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml', 'package-lock.json') }}-
+      # lint, typecheck and unit tests are independent: run them at the same time,
+      # then print each log in its own group; the step fails if any of them failed.
+      - name: lint + typecheck + test (parallel)
+        env: { PM: "${{ steps.pm.outputs.name }}" }
+        run: |
+          d="${RUNNER_TEMP:-/tmp}/ci"; mkdir -p "$d"
+          for s in lint typecheck test; do
+            ( $PM run --if-present "$s" > "$d/$s.log" 2>&1; echo $? > "$d/$s.rc" ) &
+          done
+          wait
+          status=0
+          for s in lint typecheck test; do
+            rc="$(cat "$d/$s.rc")"
+            echo "::group::$s (exit $rc)"; cat "$d/$s.log"; echo "::endgroup::"
+            [ "$rc" = 0 ] || { echo "::error::$s failed"; status=1; }
+          done
+          exit $status
+      - run: ${{ steps.pm.outputs.name }} run build
+      - run: ${{ steps.pm.outputs.audit }}
       - name: e2e (production build)
         run: if [ -f playwright.config.ts ]; then npx playwright test; fi
       - uses: actions/upload-artifact@v4
