@@ -743,13 +743,18 @@ def owned_paths(
             absolute = posixpath.normpath(posixpath.join(cwd, target))
         else:
             return f"`{target}` is relative to an unknown directory"
-        if free_abs.match(absolute) or (
-            _WILDCARD.search(absolute) and free_abs.covers_tree(posixpath.dirname(absolute))
+        if root_abs is None or (
+            absolute != root_abs and not absolute.startswith(root_abs.rstrip("/") + "/")
         ):
-            return None
-        if root_abs is None:
-            return f"`{target}` cannot be checked: the task worktree is unknown"
-        if absolute != root_abs and not absolute.startswith(root_abs.rstrip("/") + "/"):
+            # Outside the worktree only the absolute free paths (/tmp, /dev/null)
+            # are writable. Checked after the worktree test: a worktree may
+            # itself live under /tmp.
+            if free_abs.match(absolute) or (
+                _WILDCARD.search(absolute) and free_abs.covers_tree(posixpath.dirname(absolute))
+            ):
+                return None
+            if root_abs is None:
+                return f"`{target}` cannot be checked: the task worktree is unknown"
             return f"`{target}` is outside the task worktree"
         rel = posixpath.relpath(absolute, root_abs)
         rel = "" if rel == "." else rel

@@ -274,6 +274,13 @@ class TestOwnedPaths:
             assert _result(fn, _write("/etc/passwd")) == "ALLOW"
             assert _result(fn, _bash("rm -rf lib")) == "ALLOW"
 
+    def test_a_worktree_under_tmp_is_still_enforced(self) -> None:
+        fn = owned_paths(owned_paths=["src/**"], root="/tmp/x/repo-worktrees/task-1")
+        assert _result(fn, _write("/tmp/x/repo-worktrees/task-1/notes/a.txt")) == "ASK"
+        assert _result(fn, _write("/tmp/x/repo-worktrees/task-1/src/a.js")) == "ALLOW"
+        assert _result(fn, _bash("touch notes/a.txt")) == "ASK"
+        assert _result(fn, _write("/tmp/shot.png")) == "ALLOW"
+
     def test_unknown_root_asks(self) -> None:
         fn = owned_paths(owned_paths=["app/**"], root="")
         assert _result(fn, _write("/wt/x/app/a.ts")) == "ASK"
