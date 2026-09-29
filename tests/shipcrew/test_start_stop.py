@@ -163,6 +163,16 @@ class TestStop:
         await client.patch(f"{P}/tasks/{task['id']}", json={"status": "ready"})
         assert sessions.stopped == ["sess1"]
 
+    async def test_restarting_a_review_card_ends_its_idle_session(
+        self, client: httpx.AsyncClient, sessions: FakeSessions, service: ShipcrewService
+    ) -> None:
+        _, task = await _setup(client)
+        await client.post(f"{P}/tasks/{task['id']}/start")
+        await asyncio.to_thread(service.store.update_task, task["id"], status="review")
+        body = (await client.post(f"{P}/tasks/{task['id']}/start")).json()
+        assert sessions.stopped == ["sess1"]
+        assert (body["status"], body["root_session_id"]) == ("running", "sess2")
+
 
 class TestStartRaces:
     async def test_concurrent_starts_create_one_session(

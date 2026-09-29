@@ -276,6 +276,9 @@ class ShipcrewService:
             if not (agent_dir / "config.yaml").is_file():
                 reason = f"no agent bundle for role {task.role!r} in {self.settings.agents_dir}"
                 return await self._update(task.id, status="blocked", blocked_reason=reason)
+            if task.status in WATCHED_REVIEW_STATUSES:
+                # A restart from Review opens a new session: end the idle one.
+                await self._stop_quietly(task, acting_user)
             # Claim a capacity slot before the slow worktree/session work.
             task = await self._update(
                 task.id, status="running", blocked_reason=None, session_seen_active=False
