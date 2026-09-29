@@ -71,7 +71,7 @@ def map_session_state(task: Task, snap: SessionSnapshot | None) -> dict[str, Any
         changes.update(status="running", session_seen_active=True)
     elif snap.status == "failed":
         changes.update(status="blocked", blocked_reason=snap.error or "agent session failed")
-    elif snap.status == "idle" and task.session_seen_active:
+    elif snap.status == "idle" and (task.session_seen_active or snap.agent_replied):
         changes["status"] = "review"
     return {k: v for k, v in changes.items() if getattr(task, k) != v}
 

@@ -10,6 +10,7 @@ launch and permission logic applies unchanged.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import io
 import json
 import logging
@@ -59,12 +60,15 @@ class SessionSnapshot:
     :param awaiting_human: A pending approval / input prompt is open.
     :param cost_usd: Subtree cost of the session, when reported.
     :param error: Last task error message, when the session failed.
+    :param agent_replied: The latest transcript item is the agent's, not the
+        user's prompt; only read while idle, to tell "finished" from "not started".
     """
 
     status: str
     awaiting_human: bool = False
     cost_usd: float | None = None
     error: str | None = None
+    agent_replied: bool = False
 
 
 class SessionService(Protocol):
@@ -279,11 +283,28 @@ class OmnigentSessionService:
                 params={"include_items": "false", "include_liveness": "false"},
                 headers=self._auth_headers(acting_user),
             )
-        if response.status_code == 404:
-            return None
-        if response.status_code >= 400:
-            raise SessionServiceError(f"session read failed: {_error_detail(response)}")
-        return snapshot_from_payload(response.json())
+            if response.status_code == 404:
+                return None
+            if response.status_code >= 400:
+                raise SessionServiceError(f"session read failed: {_error_detail(response)}")
+            snap = snapshot_from_payload(response.json())
+            if snap.status != "idle":
+                return snap
+            items = await client.get(
+                f"/v1/sessions/{session_id}/items",
+                params={"limit": 1, "order": "desc"},
+                headers=self._auth_headers(acting_user),
+            )
+        if items.status_code >= 400:
+            raise SessionServiceError(f"session items read failed: {_error_detail(items)}")
+        latest = (items.json().get("data") or [None])[0]
+        return dataclasses.replace(snap, agent_replied=_is_agent_item(latest))
+
+
+def _is_agent_item(item: Any) -> bool:
+    if not isinstance(item, dict):
+        return False
+    return not (item.get("type") == "message" and item.get("role") == "user")
 
 
 def snapshot_from_payload(payload: dict[str, Any]) -> SessionSnapshot:

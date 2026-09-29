@@ -41,6 +41,7 @@ class ShipcrewScheduler:
         self._wake.set()
 
     async def _run(self) -> None:
+        failing = False
         while True:
             with contextlib.suppress(asyncio.TimeoutError):
                 await asyncio.wait_for(self._wake.wait(), timeout=self._interval_s)
@@ -49,7 +50,12 @@ class ShipcrewScheduler:
                 await self.tick()
             except Exception:
                 # A failing tick must never kill the loop; the next one retries.
-                _logger.exception("shipcrew scheduler tick failed")
+                # Log the traceback once per failure streak, not every tick.
+                log = _logger.debug if failing else _logger.exception
+                log("shipcrew scheduler tick failed")
+                failing = True
+            else:
+                failing = False
 
     def start(self) -> None:
         if self._task is None:

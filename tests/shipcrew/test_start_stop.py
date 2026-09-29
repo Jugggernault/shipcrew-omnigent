@@ -167,6 +167,10 @@ class TestSessionMapping:
         changes = map_session_state(self._task(session_seen_active=True), snap)
         assert changes == {"status": "review", "cost_usd": 0.42}
 
+    def test_turn_finished_between_ticks_means_review(self) -> None:
+        snap = SessionSnapshot(status="idle", agent_replied=True)
+        assert map_session_state(self._task(), snap) == {"status": "review"}
+
     def test_idle_before_first_turn_stays_running(self) -> None:
         assert map_session_state(self._task(), SessionSnapshot(status="idle")) == {}
 

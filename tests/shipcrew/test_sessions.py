@@ -40,6 +40,7 @@ class _StubApp:
         self.creates: list[dict[str, Any]] = []
         self.events: list[tuple[str, dict[str, Any]]] = []
         self.session_body: dict[str, Any] | None = {"status": "running"}
+        self.latest_items: list[dict[str, Any]] = []
         self.app = FastAPI()
         self.app.state.host_registry = _Registry(host_ids)
         self.app.state.host_store = None
@@ -62,6 +63,11 @@ class _StubApp:
         async def events(session_id: str, request: Request) -> dict[str, Any]:
             self.events.append((session_id, await request.json()))
             return {"ok": True}
+
+        @self.app.get("/v1/sessions/{session_id}/items")
+        async def items(session_id: str, limit: int, order: str) -> dict[str, Any]:
+            assert (limit, order) == (1, "desc")
+            return {"data": self.latest_items}
 
         @self.app.get("/v1/sessions/{session_id}", response_model=None)
         async def get(session_id: str) -> dict[str, Any] | JSONResponse:
@@ -200,6 +206,26 @@ async def test_snapshot_reads_session() -> None:
     assert (snap.status, snap.awaiting_human, snap.cost_usd) == ("running", True, 1.5)
     stub.session_body = None
     assert await service.snapshot("conv_1", acting_user=None) is None
+
+
+@pytest.mark.parametrize(
+    ("latest", "replied"),
+    [
+        ([], False),
+        ([{"type": "message", "role": "user"}], False),
+        ([{"type": "message", "role": "assistant"}], True),
+        ([{"type": "function_call_output"}], True),
+    ],
+)
+async def test_idle_snapshot_reads_latest_item(
+    latest: list[dict[str, Any]], replied: bool
+) -> None:
+    stub = _StubApp(host_ids=[])
+    stub.session_body = {"status": "idle"}
+    stub.latest_items = latest
+    snap = await OmnigentSessionService(stub.app, None).snapshot("c", acting_user=None)
+    assert snap is not None
+    assert snap.agent_replied is replied
 
 
 def test_snapshot_from_payload_failed() -> None:
