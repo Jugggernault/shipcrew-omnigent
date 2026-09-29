@@ -217,6 +217,7 @@ class VerifyLoop:
         text = await self._svc.sessions.last_agent_text(
             task.root_session_id, acting_user=ctx.owner
         )
+        await loop.record_decisions(task, text)
         verdict = pl.parse_verdict(text)
         if verdict is None or ctx.worktree is None:
             return None  # the builder path blocks with its usual reason

@@ -199,6 +199,21 @@ class TestVerifyLoop:
         assert git(repo, "worktree", "list").count("\n") == 0  # only the main checkout
         assert len(await _tasks(service, task.mission_id)) == 1
 
+    async def test_verify_decisions_reach_the_task(
+        self,
+        service: ShipcrewService,
+        sessions: RoleSessions,
+        repo: Path,
+        scheduler: ShipcrewScheduler,
+    ) -> None:
+        # The ship report lists per-task decisions: verify roles write them too.
+        sessions.agents["qa"] = [
+            _says("Walked the demo.\n\nDecisions:\n- skipped the e2e, unit tests cover it\nPASS")
+        ]
+        task = await _verify_task(service, repo)
+        done = await run_until(scheduler, service, task.id, status_is("merged"))
+        assert done.decisions == ["skipped the e2e, unit tests cover it"]
+
     async def test_passing_tests_it_wrote_go_through_the_pr_loop_unreviewed(
         self,
         service: ShipcrewService,
