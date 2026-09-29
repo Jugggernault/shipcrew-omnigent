@@ -312,6 +312,7 @@ class ShipcrewService:
                 acting_user=acting_user or mission.owner_user_id,
                 base_branch=base_branch,
                 labels={TASK_LABEL_KEY: task.id, ROLE_LABEL_KEY: task.role},
+                owned_paths=tuple(str(p) for p in task.owned_paths),
             )
             try:
                 session_id = await self.sessions.create_root_session(request)

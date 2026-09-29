@@ -9734,9 +9734,15 @@ def _derive_terminal_launch_args_from_spec(
     harness = _spec_harness(spec)
     if harness == _CLAUDE_NATIVE_HARNESS:
         permission_mode = spec.executor.config.get("permission_mode")
-        if permission_mode:
-            return _validate_terminal_launch_args(["--permission-mode", str(permission_mode)])
-        return None
+        claude_args = ["--permission-mode", str(permission_mode)] if permission_mode else []
+        # shipcrew fork: ``allowed_tools: "Bash,Edit,..."`` pre-approves those
+        # Claude tools (``--allowedTools``) so the bundle's guardrail policies
+        # are the only gate on them, without bypassPermissions.
+        raw_tools = str(spec.executor.config.get("allowed_tools") or "")
+        allowed_tools = [t for t in re.split(r"[,\s]+", raw_tools) if t]
+        if allowed_tools:
+            claude_args += ["--allowedTools", ",".join(allowed_tools)]
+        return _validate_terminal_launch_args(claude_args) if claude_args else None
     if harness == _CODEX_NATIVE_HARNESS:
         # Headless default: full bypass. The terminal_launch_args set the
         # codex --remote TUI's launch flags, which is what creates the
