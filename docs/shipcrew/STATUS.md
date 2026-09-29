@@ -1,113 +1,138 @@
 # shipcrew on omnigent: status
 
 Branch `shipcrew` of this fork. Design: `shipcrew/PROPOSAL-v3.md`. Role bundles
-live in the separate `shipcrew` repo (`agents/`, branch `v0.2`). Last live smoke
-run: 2026-09-29.
+live in the separate `shipcrew` repo (`agents/`, branch `v0.2`). Round 2 (PR
+loop, planner import, issue sync, worker permissions, board UI) is merged. Last
+live end-to-end run: 2026-09-29.
 
-![Board with one running card, a card in review, and two gated cards](board.png)
-![Task drawer with the live sub-agent tree](drawer.png)
+![Board after the e2e: both cards merged](board-merged.png)
+![Intervention card: a guardrail ask during a CI fix turn](intervention.png)
+![Drawer of a merged card: PR, CI fix 1/3, reviewer findings](drawer-merged.png)
+![Card held for a human merge approval (APPROVALS.md)](board-approval.png)
+![Drawer with the Approve merge action](drawer-approval.png)
 
-## What works (verified live)
+## Round 2 end-to-end (verified live, 2026-09-29)
 
-These steps ran against a real `omnigent server` + `omnigent host`, with
-claude-native sessions on the Claude subscription login:
+Real `omnigent server` + `host` (`scripts/shipcrew_stack.sh`, port 16772, own
+state dir), claude-native and claude-sdk sessions on the Claude subscription
+login, the bundles of `shipcrew` v0.2, and `SHIPCREW_GH` pointing at the fake
+gh (`scripts/shipcrew-fake-gh`). The mission repo was a throwaway CommonJS
+project (`src/sum.js`, node:test tests, `"test": "node --test test/"`) whose
+`origin` is a local bare repository. Nothing reached GitHub.
 
-- **Board at `/board`.** It has mission tabs, six columns (Backlog, Ready,
-  Running, Review, Intervention, Merged) and a Blocked filter. Drag and drop and
-  keyboard moves work. It updates live from the mission SSE stream and polls
-  while the stream is down.
-- **Task drawer.** It shows status, role, cost, Start/Stop, the acceptance
-  checklist, dependencies and owned paths. It also shows the live sub-agent tree:
-  the upstream `SubagentsGraphView` over `child_sessions` of the task's root
-  session. "Open session" links to `/c/{root_session_id}`.
-- **Scheduler, 4 gates.** The smoke used 3 tasks: A owns `src/**`, B owns
-  `src/calc.py`, and C depends on A. All three were marked ready.
-  - Only A started.
-  - B stayed Ready with "owned paths overlap with unmerged task".
-  - C stayed Ready with "waiting on dependencies".
-  - After A was marked merged, B and C both started on the next tick.
+1. **Mission** created with `repo_url=https://github.com/shipcrew/e2e-math` so
+   the issue sync runs (against the fake).
+2. **`POST /missions/{id}/plan`** with a short PRD (two features, #2 depends on
+   #1). The planner session wrote `.shipcrew/plan.json`; the server imported two
+   developer tasks (`sumAll`, `average`), mapped `T01 -> task id` in
+   `depends_on`, and set `plan.status=imported`, `imported_count=2`. The next
+   sync opened issues #1 and #2 with labels `shipcrew` and `role:developer`.
+3. **Both cards PATCHed to Ready.** `sumAll` started on branch
+   `shipcrew/ce64fcc7-sumall` in its own worktree; `average` waited with
+   "waiting on dependencies: sumAll".
+4. **Developer, no prompts.** `npm test`, `git add` and `git commit` ran under
+   the builder allowlist with no approval card; it ended with `PASS`.
+5. **Push + draft PR.** The loop pushed to the bare remote and opened draft PR
+   #3 ("Closes #1", acceptance checklist).
+6. **CI red -> fix loop.** The fake CI ran `npm test` plus a hidden contract
+   check (`sumAll("1,2")` must throw `TypeError("sumAll expects an array")`).
+   The run was red; the loop sent the failing log to the developer as a new
+   turn (`ci_attempts=1`). During that turn a chained `git fetch ...; ls
+   .github/workflows` hit `shipcrew_workflows_approval`: the card went to
+   **Intervention** with a "Guardrail ask" badge; it was approved through the
+   elicitation resolve endpoint. The developer fixed the code and committed; the
+   loop pushed the fix, CI went green.
+7. **Reviewer child.** A `Review: sumAll` child session (parent = the root
+   session, same worktree) got the diff snapshot and the contract, answered
+   `APPROVE` with a fenced findings block (one `minor` finding, shown in the
+   drawer). Its `npm test` asked on the read-only allowlist at the time; the
+   reviewer now has a test-runner allowlist (shipcrew `7f10767`).
+8. **Merge.** `gh pr ready`, `update-branch`, `merge --squash --delete-branch`:
+   bare `main` got `sumAll (#3)`, issue #1 closed, the worktree and the local
+   branch were removed, local `main` fast-forwarded, all sessions stopped.
+9. **Task 2 started in the same tick** from the merged code, went through CI
+   (green first time) and review (`APPROVE`, no findings), then hit the repo's
+   `APPROVALS.md` rule `src/stats.js`: `needs_human_approval=true`, card in
+   **Intervention** ("Needs approval"). "Approve merge" in the drawer called
+   `POST /tasks/{id}/approve`; the loop squash-merged `average (#4)` within one
+   tick. Final `npm test` on `main`: 6 pass, 0 fail. Both issues closed, both
+   PRs merged, no worktree left.
 
-  The other two gates are capacity (`SHIPCREW_MAX_PARALLEL`) and budget
-  (`SHIPCREW_MAX_USD`).
-- **Task start.** It uses the bundle `<SHIPCREW_AGENTS_DIR>/<role>`, which
-  defaults to `/home/jugggernault/Work/Projects/shipcrew/agents`.
-  - It creates a git worktree on branch `task/<id>` and pre-seeds Claude's
-    folder trust for it.
-  - It creates the session with the bundle tarball, waits for the runner to be
-    online, then sends the task contract as the first prompt.
-  - Every task in the smoke committed its change in its own worktree.
-- **Session state flows back to the card.**
-  - `running`: the session is working, or it is idle while children or
-    background shells are still busy.
-  - `intervention`: a guardrail ASK or other elicitation is pending.
-  - `review`: the turn has finished.
-  - `blocked`: the session failed, or a human pressed Stop.
-  - A Review card moves back to Running if its agent resumes, for example when a
-    background sub-agent reports after the turn ended.
-  - `cost_usd` is synced from the session. It measures how much of the
-    subscription quota was used, not money spent.
-- **Role bundles.** All 10 bundles (9 roles + the `shipcrew` orchestrator) pack
-  through the real upload path (`materialize_bundle`, which follows the
-  orchestrator's symlinks) and load through `omnigent.spec.load` with the handler
-  allowlist on. `scripts/validate_agents.py` also runs 49 guardrail cases per
-  bundle.
+## What works (verified by tests, and live where noted)
 
-- **Worker permissions.** There is no `bypassPermissions`.
-  - Each role has a shell allowlist (`omnigent/shipcrew/policies.py`,
-    configured in the bundles' `_shared/policies/`). Allowlisted commands run
-    with no prompt.
-  - Any other command is an ASK approval card, and the card goes to
-    Intervention.
-  - A write outside the task's `owned_paths`, or to `package.json` or a
-    lockfile that the task does not own by name, is an ASK too. Task start
-    injects the owned paths and the worktree root into the bundle.
-  - claude-native bundles run in Claude's `default` mode with `--allowedTools`
-    set to the tools that the guardrails govern, so Claude adds no second
-    prompt.
-  - Verified live, 2026-09-29: see the shipcrew repo `agents/README.md`, "Live
-    check".
+- **PR loop** (`omnigent/shipcrew/pr_loop.py`, live): push -> draft PR -> CI
+  (3 fix turns, then Intervention) -> reviewer child (3rd `CHANGES` ->
+  Intervention) -> `APPROVALS.md` gate (read from `origin/<base>`, defaults
+  when absent) -> serialized squash merge (integrator child on conflict) ->
+  cleanup. All state is re-read from the DB, the worktree and gh on each tick,
+  so a restart resumes. `POST /tasks/{id}/approve` and
+  `POST /tasks/{id}/request-changes` (tests; approve also live).
+- **Planner import** (`omnigent/shipcrew/planner.py`, live): pydantic
+  validation of `plan.json` (unique keys, known `depends_on`, no cycles, with a
+  readable `plan.error`), one-transaction import keyed by plan key (re-import
+  updates, never duplicates), `task.updated` per task then `mission.updated`.
+- **GitHub issue sync** (`omnigent/shipcrew/issue_sync.py`, live against the
+  fake): issue per task (labels, checklist), PR merged outside shipcrew ->
+  merged, closed issue -> blocked, assignee or `shipcrew:human` -> human.
+  Rate-limited per mission (`SHIPCREW_SYNC_INTERVAL_S`), no-op without
+  `repo_url` or when gh is not logged in. `POST /missions/{id}/sync` returns
+  the Mission plus an additive `sync` report that the board shows in its toast.
+- **Worker permissions** (live, round 2 perms run and this e2e): per-role shell
+  allowlists, owned-path guardrail, push guard on `shipcrew/<id8>-<slug>`, no
+  `bypassPermissions`. See the shipcrew repo `agents/README.md`.
+- **One branch scheme**: `omnigent/shipcrew/branches.py`
+  (`shipcrew/<id[:8]>-<slug>`), stored on `Task.branch` at first start, used by
+  worktrees, the loop, the issue sync and the guardrails.
+- **One gh seam**: every call goes through `omnigent/shipcrew/gh.py` `_run`
+  (`SHIPCREW_GH` via `tools.resolve`, bounded timeouts, `GhError`).
+- **One fake gh**: `scripts/shipcrew_fake_gh.py` (+ `scripts/shipcrew-fake-gh`)
+  backs the PR-loop tests, the issue-sync tests and the e2e: real pushes and
+  squash merges into a local bare repo, CI = a shell command per head SHA,
+  issues/labels, `--repo` on every command, `authenticated: false` for the
+  not-logged-in path.
+- **Board** (`web/src/board/`, live): Plan from PRD dialog and plan status,
+  Sync GitHub, card badges (branch, issue, PR, CI fix n/3, review verdict,
+  Needs approval, intervention reason), drawer sections (Approval, Pull request,
+  Review findings, Request changes), `mission.updated` over SSE, six columns
+  without horizontal scroll at 1600 px.
+- **Schema**: Alembic lineage `sc0001 -> sc0002pr (PR loop) -> sc0002p (plan +
+  issue sync)`, single head.
+- Round 1 behaviour (board, drawer tree, 4 scheduler gates, session state ->
+  card, folder pre-trust, ACL per owner) is unchanged.
 
-## What is stubbed or missing
+## What is left / known issues
 
-- **PR loop** (`omnigent/shipcrew/pr_loop.py`): only signatures and TODOs. This
-  covers push, draft PR, the CI fix loop (up to 3 tries), the Claude reviewer
-  child session, the `APPROVALS.md` policy and the serialized merge.
-  - Today "Review" means the agent is idle and its work is committed locally.
-  - "Merged" is set only by a human, from the menu or by dragging (with a
-    confirmation).
-  - Nothing is pushed.
-- **Planner to board:** `.shipcrew/plan.json` (keys, then task ids) is not
-  imported yet. Tasks are created by hand or through the API.
-- **GitHub issues:** there is no issue sync; `issue_number` stays `null`.
-  `ci` stays `none`.
-- **Worktree cleanup:** worktrees stay after stop and merge. Nothing removes them
-  yet.
-- **Idle sessions** are not stopped when a card reaches Review. The spike found
-  an idle `claude` still uses 5–25 % of a core. They are stopped (process and
-  host runner, via `stop_session`) on `/stop` and when the card is moved out of
-  Running/Intervention/Review.
-- **ACL:** a mission and its tasks are visible to their creator only (404 for
-  other users; everything is visible with auth off). There is no sharing and no
-  admin override yet.
-- **Sequential starts:** the scheduler starts ready cards one after the other
-  (each waits for its runner, about 10 s), so N parallel starts take N times as
-  long.
-- **Remote hosts:** folder pre-trust only runs when the host shares the server's
-  filesystem. It is skipped otherwise.
-
-## Known issues
-
-- **A background sub-agent looks finished.** When Claude runs the Task sub-agent
-  in the background, omnigent reports the child as `completed` right away. The
-  card goes to Review while the sub-agent still works, then back to Running when
-  the parent resumes. A foreground Task keeps the card Running.
-- **Long foreground sleeps are blocked.** Claude Code refuses a single long
-  foreground `sleep`. Test prompts that need a long-running agent should loop
-  short sleeps instead.
-- **Board width.** At 1600 px the six columns overflow and Merged needs a
-  horizontal scroll.
-- **Web UI changes need a server restart.** The server caches `index.html` at
-  startup, so after `pnpm --filter web build` you must restart the server.
+- **A reviewer or integrator ask does not move the card.** While a loop child
+  waits on an approval card the task stays in Review (contract: Intervention);
+  the ask only shows in the sidebar ("Needs response") and the Inbox. The
+  reviewer test-runner allowlist removes the common case.
+- **`workflows_approval` false positive**: a chain such as `git fetch -q
+  origin; ls .github/workflows` asks, although it only reads.
+- **Loop children never time out**: a reviewer, integrator or planner that
+  never answers keeps the card in Review (or `plan.status=running`).
+- **Transient status**: for one tick between review and the approval hold the
+  card showed Running with `needs_human_approval=true`.
+- **Declined asks**: an explicit `decline` interrupts the turn; the idle
+  session then maps to Review, which the loop reads as "developer finished"
+  (no PASS line -> blocked before a PR, or re-review after one). `cancel`
+  refuses one call and lets the agent continue.
+- **Drawer tree in headless Chromium**: the reviewer child node is in the React
+  Flow graph (`child_sessions` returns it) but stays `visibility: hidden` in the
+  DevTools browser, so the screenshots show an empty tree. Not reproduced in a
+  normal browser yet.
+- **Blocked filter** counts Ready cards waiting on dependencies and loop holds,
+  because both carry `blocked_reason`.
+- **Loop holds use a capacity slot** (intervention is an active status).
+- **A card dragged to Merged by hand** skips the loop cleanup (worktree stays,
+  PR stays open). The local repo keeps stale `origin/shipcrew/*` refs (fetch
+  without prune).
+- **Orchestrator full mode** sub-agents get no owned-paths contract (the policy
+  abstains there).
+- **Local filesystem assumption**: `plan.json`, worktrees and git/gh calls run
+  on the server's filesystem, like folder pre-trust.
+- **Real gh never exercised**: the fake mimics `--json` shapes and exit codes;
+  a first run against a real repo should watch `pr checks` and `pr create`.
+- **Web UI changes need a server restart** (index.html is cached).
 
 ## How to run
 
@@ -124,37 +149,49 @@ xdg-open "http://127.0.0.1:$PORT/board"
 scripts/shipcrew_stack.sh stop "$STATE"
 ```
 
-Manual check:
+Local PR-loop e2e with the fake gh (never touches GitHub):
 
-1. Create a mission whose repo path is an absolute path to a git repo with a
-   commit on `main`.
-2. Add a task with acceptance lines and owned paths.
-3. Drag the task to Ready. Within one tick it moves to Running.
-4. Open the card. The drawer shows the agent tree and an "Open session" link.
-5. Add a second task whose owned paths overlap the first, and drag it to Ready.
-   It stays in Ready with an overlap badge until the first task is marked Merged.
+```bash
+E=/tmp/shipcrew-e2e; mkdir -p $E
+git init -q --bare -b main $E/origin.git        # the "GitHub" repo
+# clone it to $E/repo, add a tiny npm project + APPROVALS.md, push main
+scripts/shipcrew_fake_gh.py init --state $E/gh.json --remote $E/origin.git \
+    --repo shipcrew/e2e-math --ci-command 'npm test'
+export SHIPCREW_GH=$PWD/scripts/shipcrew-fake-gh SHIPCREW_FAKE_GH_STATE=$E/gh.json
+export SHIPCREW_SYNC_INTERVAL_S=10               # optional, default 60
+scripts/shipcrew_stack.sh start $E/state 16772
+# board: new mission (repo path $E/repo, repo URL https://github.com/shipcrew/e2e-math),
+# Plan from PRD, drag the imported cards to Ready, watch them merge.
+scripts/shipcrew-fake-gh pr list --state all     # or read $E/gh.json "calls"
+scripts/shipcrew_stack.sh stop $E/state 16772
+```
+
+New settings: `SHIPCREW_PR_LOOP` (default on), `SHIPCREW_PR_BASE` (default
+`main`), `SHIPCREW_SYNC_INTERVAL_S` (default 60, min 5), `SHIPCREW_GH`.
 
 API contract: `/v1/shipcrew/*`, with the same auth as the other `/v1` routes.
 It is hidden from OpenAPI so the upstream `openapi.json` does not drift. The
 server side is `omnigent/shipcrew/router.py` and the client side is
 `web/src/board/api.ts`.
 
-## Checks
+## Checks (integration, 2026-09-29)
 
-- **Backend:**
-  - `ruff check` / `ruff format --check` on `omnigent/shipcrew` and
-    `tests/shipcrew`
-  - `pyrefly check` (0 errors)
-  - `pytest tests/shipcrew tests/server/test_shipcrew_mount.py` (117 passed)
-  - `pre-commit run --files <changed>`
-- **Web:**
-  - `pnpm --filter web lint`
-  - `pnpm --filter web type-check`
-  - `pnpm --filter web build`
-  - the full `vitest run` (run it on Node 26 with
-    `NODE_OPTIONS=--no-experimental-webstorage LANG=C.UTF-8 TZ=UTC`)
-- **Bundles:** `python3 scripts/build_agents.py --check`, and
-  `uv run python <shipcrew>/scripts/validate_agents.py` run from this checkout.
+- **Backend:** `ruff check` / `ruff format --check` on `omnigent/shipcrew`,
+  `tests/shipcrew`, `scripts/shipcrew_fake_gh.py`; `pyrefly check
+  omnigent/shipcrew` (0 errors); `pytest tests/shipcrew
+  tests/server/test_shipcrew_mount.py` plus the upstream tests next to the
+  touched files (`tests/policies/test_registry.py`,
+  `tests/server/routes/test_policy_registry.py`,
+  `tests/server/routes/test_sessions_yolo_launch_args.py`): 376 passed;
+  `pre-commit run --files <changed>`.
+- **Web:** `pnpm lint`, `pnpm type-check`, `pnpm build`, and the full
+  `vitest run` with `NODE_OPTIONS=--no-experimental-webstorage LANG=C.UTF-8`:
+  9582 passed, 1 skipped with `--maxWorkers=4`. With the default worker count
+  on this machine 5-7 upstream tests (Sidebar*, streamdownCodeHighlight) time
+  out under load and pass when rerun alone.
+- **Bundles:** `python3 scripts/build_agents.py --check`, and `uv run python
+  <shipcrew>/scripts/validate_agents.py` run from this checkout: 10 bundles
+  valid, 110 guardrail cases each.
 
 ## Upstream footprint (rebase surface)
 
