@@ -48,26 +48,46 @@ function pickListeners(
   return Object.fromEntries(Object.entries(listeners).filter(([key]) => keys.includes(key)));
 }
 
-function TaskCardComponent({
+interface DragWiring {
+  setNodeRef?: (node: HTMLElement | null) => void;
+  setActivatorNodeRef?: (node: HTMLElement | null) => void;
+  attributes?: HTMLAttributes<HTMLElement>;
+  listeners?: DragListeners;
+  isDragging?: boolean;
+}
+
+const NO_DRAG: DragWiring = {};
+
+function DraggableTaskCard(props: Omit<TaskCardProps, "overlay">) {
+  const { attributes, listeners, setNodeRef, setActivatorNodeRef, isDragging } = useDraggable({
+    id: props.task.id,
+    data: { task: props.task },
+  });
+  return (
+    <TaskCardView
+      {...props}
+      drag={{ attributes, listeners, setNodeRef, setActivatorNodeRef, isDragging }}
+    />
+  );
+}
+
+function TaskCardView({
   task,
   viewerId,
   overlay = false,
   onOpen,
   onMove,
   onAssign,
-}: TaskCardProps) {
-  const { attributes, listeners, setNodeRef, setActivatorNodeRef, isDragging } = useDraggable({
-    id: task.id,
-    data: { task },
-    disabled: overlay,
-  });
+  drag = NO_DRAG,
+}: TaskCardProps & { drag?: DragWiring }) {
+  const { attributes, listeners, setNodeRef, setActivatorNodeRef, isDragging = false } = drag;
   const blocked = isBlocked(task);
   const currentColumn = columnForStatus(task.status);
   const stop = (event: MouseEvent) => event.stopPropagation();
 
   return (
     <div
-      ref={overlay ? undefined : setNodeRef}
+      ref={setNodeRef}
       data-testid="task-card"
       data-task-id={task.id}
       data-status={task.status}
@@ -184,6 +204,14 @@ function TaskCardComponent({
       </div>
     </div>
   );
+}
+
+/**
+ * A board card. The overlay variant (inside `DragOverlay`) must not register a
+ * second draggable under the same id, so it renders the bare view.
+ */
+function TaskCardComponent({ overlay = false, ...props }: TaskCardProps) {
+  return overlay ? <TaskCardView {...props} overlay /> : <DraggableTaskCard {...props} />;
 }
 
 export const TaskCard = memo(TaskCardComponent);
