@@ -11,6 +11,60 @@ live end-to-end run: 2026-09-29.
 ![Card held for a human merge approval (APPROVALS.md)](board-approval.png)
 ![Drawer with the Approve merge action](drawer-approval.png)
 
+## Round 8: the last live-run-4 interventions (2026-09-30)
+
+Branch `shipcrew-round8` (bundles: shipcrew `v3-round8`). Live run 4 shipped
+in 36 min, 6/6 merged, QA passed first try, with 3 human interventions.
+
+- **Push with a lease** (`pr_loop._sync_branch`, `Task.pushed_sha`, migration
+  `sc0008ps`): a developer that rebased its branch in a CI-fix turn made the
+  plain push fail (non-fast-forward). The loop pushes only its own task branch
+  (`shipcrew/<id8>-<slug>`, `_unsafe_push_branch` refuses anything else) with
+  `--force-with-lease=refs/heads/<branch>:<sha it last pushed or followed>`:
+  a rewritten branch replaces the PR head; a human push since then fails the
+  lease and holds the card ("the PR branch moved on GitHub since shipcrew
+  last pushed it ... someone else pushed to it").
+- **Stale branch before a CI fix** (`pr_loop._ci_red`, `_behind_base`): on red
+  CI, when `origin/main` has commits the branch lacks (live: a sibling's
+  merge replaced the Foundation stub answering 501), the loop runs `gh pr
+  update-branch` (a conflict starts the integrator), follows the new head and
+  re-runs CI; only a red CI on an up-to-date branch sends the logs and counts
+  a fix attempt.
+- **First-turn retry** (`OmnigentSessionService._retry_first_turn`,
+  `SessionSnapshot.error_code`): a session's first prompt is kept until the
+  agent answers; a `failed` snapshot with `last_task_error.code ==
+  "runner_error"` and no agent item (live: the planner's "turn failed (status
+  204)", a duplicate-delivery race right after create) re-sends it once after
+  2 s and reads as `running` (30 s grace for the stale failure), so
+  `mission.plan` stays `running`. Covers every shipcrew first prompt (task
+  root, planner, reviewer, integrator, ship). A later turn is never retried.
+- **ANSI-C strings** (`policies._scan_expansions`, `_ansi_c_literal`): the
+  reviewer chain `...; grep -c $'\u00a0' lib/results.ts; ...` asked as
+  "substitutions, heredocs, complex expansions or unbalanced quotes" (the
+  `$'..'`, not the `\|` or `--radius`). A decodable `$'..'` is re-quoted as
+  its literal value, so the allowlist judges the word the shell runs (`git
+  diff $'--output=x'` still asks); `\c`, NUL, an embedded quote still ask.
+- **Reviewer sees Decisions** (`reviewer_prompt`): the developer's
+  `Decisions:` list is in the prompt, where new dependencies are justified.
+- **Bundles** (shipcrew `v3-round8`): COMMON: merge `origin/main`, never
+  rebase a branch with a PR; "Keep the app light" (every dependency justified
+  in `Decisions:`, built-ins first, no state/ORM/UI-kit/date/lodash libs
+  unless the PRD needs them, shadcn components only when used, server
+  components by default). Planner + scaffolder: API stubs answer 200 with a
+  valid empty contract shape, never 501/500; minimal Foundation toolchain.
+  Reviewer: an unjustified or built-in-duplicating dependency is `major` /
+  `CHANGES`. COMMON rewritten tighter without dropping rules (10.7 -> 7.8 KB);
+  AGENTS.md: planner 17.1 -> 12.5 KB, shipcrew 15.7 -> 12.6, scaffolder 14.7
+  -> 11.4, qa 14.0 -> 11.1, reviewer 13.3 -> 10.7, security 13.3 -> 10.4,
+  developer 12.7 -> 9.7, devops 12.5 -> 9.6, integrator 11.6 -> 8.7, designer
+  11.6 -> 8.7. 260 validator cases per bundle (the live chain is ALLOW for
+  every role).
+
+Known gaps: the first-turn retry is in memory (a server restart in between
+surfaces the failure); a stale-branch update happens outside the merge lock
+(harmless, `update-branch` is idempotent); planner and orchestrator
+AGENTS.md stay slightly above 12 KB.
+
 ## Round 7: refuse with a hint, ask only for real decisions (2026-09-30)
 
 Branch `shipcrew-round7` (bundles: shipcrew `v3-round7`). Live run 3 shipped
