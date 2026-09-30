@@ -1,0 +1,15 @@
+# Production preview of main. ArgoCD tracks the `gitops/main` branch: main plus
+# one commit where .github/workflows/gitops.yml sets newTag to the main SHA.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../../base
+images:
+  - name: app
+    newName: __IMAGE__
+    newTag: "latest"
+patches:
+  - target: { kind: Ingress, name: app }
+    patch: |-
+      - { op: replace, path: /spec/rules/0/host, value: __HOST__ }
+      - { op: replace, path: /spec/tls/0/hosts/0, value: __HOST__ }

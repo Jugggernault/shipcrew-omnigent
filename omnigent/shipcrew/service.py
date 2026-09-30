@@ -17,6 +17,7 @@ from omnigent.shipcrew.branches import task_branch
 from omnigent.shipcrew.ci_install import CiInstall, ensure_ci_workflow
 from omnigent.shipcrew.events import MissionEventBus
 from omnigent.shipcrew.gates import GateContext, evaluate_gates, find_cycle
+from omnigent.shipcrew.gitops_install import ensure_for_mission
 from omnigent.shipcrew.inherited_tests import grant_inherited_tests
 from omnigent.shipcrew.issue_sync import GitHubSync
 from omnigent.shipcrew.models import TASK_STATUSES
@@ -544,6 +545,12 @@ class ShipcrewService:
                 _logger.warning("shipcrew: CI not installed: %s", result.detail)
             if result.status != "skipped":
                 self._ci_done[mission.id] = result
+                # argocd deploy target: deploy/k8s + gitops.yml, so PRs get previews.
+                gitops = await self._call(
+                    ensure_for_mission, mission.repo_url, mission.repo_path, self.settings.pr_base
+                )
+                if gitops is not None and gitops.status == "failed":
+                    _logger.warning("shipcrew: gitops files not installed: %s", gitops.detail)
             return result
 
     async def update_fields(self, task_id: str, **fields: Any) -> Task:
