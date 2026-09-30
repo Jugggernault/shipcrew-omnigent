@@ -85,6 +85,9 @@ class SqlMission(ShipcrewBase):
     # ── Project (sc0005pj, see omnigent/shipcrew/projects.py) ──
     # The omnigent project (``projects.id``) that groups the mission's sessions.
     project_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # ── Preview (sc0008pv, see omnigent/shipcrew/preview.py) ──
+    # The continuous deploy of main: {status, url, sha, updated_at, live_since, ...}.
+    preview: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
 
     __table_args__ = (
         CheckConstraint(_in_check("status", MISSION_STATUSES), name="ck_shipcrew_missions_status"),

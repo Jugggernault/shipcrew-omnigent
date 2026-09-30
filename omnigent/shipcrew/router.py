@@ -193,6 +193,31 @@ def create_shipcrew_router(
         mission = await service.ship.start(mission_id, user_id, manual=True)
         return mission.to_api()
 
+    @router.post("/missions/{mission_id}/preview")
+    async def redeploy_preview(request: Request, mission_id: str) -> dict[str, Any]:
+        """Redeploy ``main`` now (also after a teardown): server-side targets only."""
+        user_id = require_user(request, auth_provider)
+        service = await _svc()
+        await service.authorize_mission(mission_id, user_id)
+        target = await asyncio.to_thread(service.deploy_target)
+        if not getattr(target, "server_side", False):
+            raise OmnigentError(
+                f"the {target.name} target has no preview: it deploys at ship time",
+                code=ErrorCode.CONFLICT,
+            )
+        mission = await service.preview.resume(mission_id)
+        return mission.to_api()
+
+    @router.delete("/missions/{mission_id}/preview")
+    async def teardown_preview(request: Request, mission_id: str) -> dict[str, Any]:
+        """Stop the mission's live preview (container, tunnel, images)."""
+        user_id = require_user(request, auth_provider)
+        service = await _svc()
+        await service.authorize_mission(mission_id, user_id)
+        await asyncio.to_thread(service.deploy_target)
+        mission = await service.preview.teardown(mission_id)
+        return mission.to_api()
+
     async def _start_all(service: ShipcrewService, mission_id: str) -> list[str]:
         started = [t.id for t in await service.start_all(mission_id)]
         if started and on_ready is not None:
@@ -237,8 +262,10 @@ def create_shipcrew_router(
             )
         elif intent == "ship":
             mission = await service.ship.start(mission_id, user_id, manual=True)
+            target = getattr(service.deploy_target(), "name", "vercel")
+            where = "to Vercel" if target == "vercel" else f"with the {target} target"
             result["message"] = (
-                "Deploying to Vercel."
+                f"Deploying {where}."
                 if mission.ship_status == "deploying"
                 else f"Ship failed: {mission.ship_error}"
             )

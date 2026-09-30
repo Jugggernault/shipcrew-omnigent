@@ -48,7 +48,8 @@ class Tool:
     :param bins: Candidate executable names.
     :param check: Args proving it works (version or auth).
     :param fix: What to tell the human.
-    :param install: ``"gh"`` (built-in downloader) or a shell command, run by ``fix``.
+    :param install: ``"gh"`` / ``"cloudflared"`` (built-in downloaders) or a shell
+        command, run by ``fix``.
     :param scopes: gh token scopes that must be present.
     :param mcp: A Claude Code MCP server, checked via ``claude mcp get``.
     """
@@ -75,6 +76,20 @@ def _local() -> bool:
 
 def _deploy() -> bool:
     return not _local() and os.environ.get("SHIPCREW_DEPLOY", "1") != "0"
+
+
+def _deploy_target() -> str:
+    """``SHIPCREW_DEPLOY_TARGET`` (``auto`` when unset: docker when it works)."""
+    return (os.environ.get("SHIPCREW_DEPLOY_TARGET") or "auto").strip().lower()
+
+
+def _needs_tunnel() -> bool:
+    """The docker target without a VPS domain publishes through a quick tunnel."""
+    return (
+        _deploy()
+        and _deploy_target() in ("auto", "docker")
+        and not os.environ.get("SHIPCREW_PUBLIC_BASE_DOMAIN")
+    )
 
 
 def registry() -> list[Tool]:
@@ -113,8 +128,8 @@ def registry() -> list[Tool]:
             "vercel (logged in)",
             ("vercel",),
             ("whoami",),
-            "npm i -g vercel && vercel login   (or SHIPCREW_DEPLOY=0 to skip deploy)",
-            required=_deploy(),
+            "npm i -g vercel && vercel login   (only for SHIPCREW_DEPLOY_TARGET=vercel)",
+            required=_deploy() and _deploy_target() == "vercel",
             install="npm i -g vercel",
         ),
         Tool(
@@ -144,10 +159,27 @@ def registry() -> list[Tool]:
         ),
         Tool(
             "DOCKER",
-            "docker (for strix)",
+            "docker (deploy target + strix)",
             ("docker",),
             ("info",),
-            "start docker: sudo systemctl start docker",
+            "install Docker, then: sudo systemctl start docker",
+            required=_deploy() and _deploy_target() == "docker",
+        ),
+        Tool(
+            "CLOUDFLARED",
+            "cloudflared (public URL: quick tunnel, no account)",
+            ("cloudflared",),
+            ("--version",),
+            "python -m omnigent.shipcrew.tools --fix downloads it to ~/.local/bin",
+            required=_needs_tunnel() and _deploy_target() == "docker",
+            install="cloudflared",
+        ),
+        Tool(
+            "CADDY",
+            "caddy (VPS: https://<mission>.<SHIPCREW_PUBLIC_BASE_DOMAIN>)",
+            ("caddy",),
+            ("version",),
+            "installed by the VPS setup script (only with SHIPCREW_PUBLIC_BASE_DOMAIN)",
             required=False,
         ),
         Tool(
@@ -266,13 +298,39 @@ def _install_gh() -> str | None:
     return str(dest)
 
 
+_CLOUDFLARED_URL = (
+    "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-{arch}"
+)
+
+
+def _install_cloudflared() -> str | None:
+    """The official static cloudflared binary into ~/.local/bin, no sudo. Linux only."""
+    arch = {"x86_64": "amd64", "aarch64": "arm64", "arm64": "arm64"}.get(platform.machine())
+    if sys.platform != "linux" or not arch:
+        return None
+    with urllib.request.urlopen(_CLOUDFLARED_URL.format(arch=arch), timeout=300) as r:
+        payload = r.read()
+    if not payload.startswith(b"\x7fELF"):
+        return None
+    BIN_DIR.mkdir(parents=True, exist_ok=True)
+    dest = BIN_DIR / "cloudflared"
+    tmp = dest.with_name(".cloudflared.tmp")
+    tmp.write_bytes(payload)
+    tmp.chmod(0o755)
+    tmp.replace(dest)
+    return str(dest)
+
+
+_BUILTIN_INSTALLERS = {"gh": _install_gh, "cloudflared": _install_cloudflared}
+
+
 def install(t: Tool) -> bool:
     if not t.install:
         return False
     print(f"  installing {t.name}...")
     try:
-        if t.install == "gh":
-            if p := _install_gh():
+        if installer := _BUILTIN_INSTALLERS.get(t.install):
+            if p := installer():
                 save(t.key, p)
                 return True
             return False
@@ -335,3 +393,8 @@ def session_env() -> dict[str, str]:
     if "CHROMIUM_PATH" not in env and saved.get("CHROMIUM"):
         env["CHROMIUM_PATH"] = saved["CHROMIUM"]
     return env
+
+
+if __name__ == "__main__":
+    # `python -m omnigent.shipcrew.tools [--fix]`: check (and install) every tool.
+    sys.exit(0 if doctor(fix="--fix" in sys.argv[1:]) else 1)

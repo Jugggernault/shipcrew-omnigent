@@ -56,6 +56,9 @@ class Mission:
     ship_decisions: list[str] = field(default_factory=list)
     ship_cost_usd: float = 0.0
     project_id: str | None = None
+    # Continuous deploy of main (see omnigent/shipcrew/preview.py); {} before
+    # the first one.
+    preview: dict[str, Any] = field(default_factory=dict)
 
     def to_api(self) -> dict[str, Any]:
         """Serialize to the shared API contract shape."""
@@ -88,6 +91,7 @@ class Mission:
                 "decisions": list(self.ship_decisions),
                 "cost_usd": self.ship_cost_usd,
             },
+            "preview": preview_api(self.preview),
         }
 
 
@@ -175,6 +179,27 @@ class Task:
         }
 
 
+PREVIEW_API_FIELDS = (
+    "status",
+    "url",
+    "sha",
+    "updated_at",
+    "live_since",
+    "error",
+    "target",
+    "deploying_sha",
+)
+
+
+def preview_api(preview: dict[str, Any]) -> dict[str, Any]:
+    """The contract shape of the mission preview: ``status`` is ``idle`` |
+    ``deploying`` | ``live`` | ``failed``; ``url`` / ``sha`` / ``updated_at`` are
+    the last good deploy; ``live_since`` its first one."""
+    out = {name: preview.get(name) for name in PREVIEW_API_FIELDS}
+    out["status"] = out["status"] or "idle"
+    return out
+
+
 def _review_api(review: dict[str, Any] | None) -> dict[str, Any] | None:
     """The contract shape of a stored review: ``{verdict, summary, findings}``."""
     if review is None:
@@ -216,6 +241,7 @@ def _mission(row: SqlMission) -> Mission:
         ship_decisions=[str(d) for d in row.ship_decisions or []],
         ship_cost_usd=float(row.ship_cost_usd or 0.0),
         project_id=row.project_id,
+        preview=dict(row.preview) if isinstance(row.preview, dict) else {},
     )
 
 
@@ -330,6 +356,7 @@ _MISSION_FIELDS = frozenset(
         "ship_verify_until",
         "ship_decisions",
         "ship_cost_usd",
+        "preview",
     }
 )
 _PLAN_TASK_FIELDS = ("title", "body", "acceptance", "role", "owned_paths")

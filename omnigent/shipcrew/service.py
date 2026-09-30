@@ -22,6 +22,7 @@ from omnigent.shipcrew.issue_sync import GitHubSync
 from omnigent.shipcrew.models import TASK_STATUSES
 from omnigent.shipcrew.planner import PlanRunner
 from omnigent.shipcrew.pr_loop import PrLoop, default_base_ref, is_loop_hold
+from omnigent.shipcrew.preview import PreviewRunner
 from omnigent.shipcrew.projects import MissionProjects
 from omnigent.shipcrew.sessions import (
     RootSessionRequest,
@@ -158,7 +159,25 @@ class ShipcrewService:
         self.planner = PlanRunner(self)
         self.github = GitHubSync(self)
         self.ship = ShipRunner(self)
+        self.preview = PreviewRunner(self)
+        self._deploy_target: Any | None = None
         self.projects = MissionProjects(self)
+
+    def deploy_target(self) -> Any:
+        """The deploy target (``SHIPCREW_DEPLOY_TARGET``), resolved once per process.
+
+        ``auto`` runs ``docker info`` the first time: call it from a thread.
+        """
+        if self._deploy_target is None:
+            from omnigent.shipcrew.deploy_targets import select_target
+
+            self._deploy_target = select_target(self.settings)
+            _logger.info("shipcrew: deploy target %s", self._deploy_target.name)
+        return self._deploy_target
+
+    def set_deploy_target(self, target: Any) -> None:
+        """Replace the deploy target (tests, embedders)."""
+        self._deploy_target = target
 
     async def _call(self, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
         return await asyncio.to_thread(fn, *args, **kwargs)

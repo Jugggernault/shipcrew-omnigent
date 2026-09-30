@@ -40,6 +40,29 @@ export interface MissionShip {
   cost_usd: number;
 }
 
+export type PreviewStatus = "idle" | "deploying" | "live" | "failed";
+
+/**
+ * The live preview: with a server-side deploy target (docker, argocd) the
+ * server redeploys `main` after every merge, from the first one on, and checks
+ * the public URL itself. `url` / `sha` / `updated_at` are the last good deploy.
+ */
+export interface MissionPreview {
+  status: PreviewStatus;
+  url: string | null;
+  /** Commit of `main` that `url` serves. */
+  sha: string | null;
+  /** Unix epoch seconds (server clock) of that deploy. */
+  updated_at: number | null;
+  /** First deploy of the mission. */
+  live_since: number | null;
+  /** Last failed deploy (the previous version may still serve). */
+  error: string | null;
+  target: string | null;
+  /** Commit being deployed right now. */
+  deploying_sha: string | null;
+}
+
 export interface Mission {
   id: string;
   title: string;
@@ -57,6 +80,8 @@ export interface Mission {
   /** Deploy as soon as every agent task is merged (default on). */
   auto_ship?: boolean;
   ship?: MissionShip;
+  /** Optional: servers that predate continuous deploys omit it. */
+  preview?: MissionPreview;
   /**
    * The omnigent project (sidebar folder) that groups the mission's sessions.
    * Optional: older servers omit it; `null` until the first use created it.
