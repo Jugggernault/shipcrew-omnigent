@@ -1,0 +1,23 @@
+# Production image, generic Node app (shipcrew fallback when the repo has no
+# Dockerfile): install, build when a build script exists, drop dev
+# dependencies, run `npm start` as the non-root `node` user on $PORT.
+FROM node:22-alpine
+WORKDIR /app
+ENV CI=1 NEXT_TELEMETRY_DISABLED=1
+COPY package.json pnpm-lock.yaml* pnpm-workspace.yaml* package-lock.json* yarn.lock* .npmrc* ./
+RUN corepack enable && \
+    if [ -f pnpm-lock.yaml ]; then pnpm install --frozen-lockfile; \
+    elif [ -f yarn.lock ]; then yarn install --frozen-lockfile; \
+    elif [ -f package-lock.json ]; then npm ci --no-audit --no-fund; \
+    else npm install --no-audit --no-fund; fi
+COPY . .
+RUN npm run build --if-present && \
+    if [ -f pnpm-lock.yaml ]; then pnpm prune --prod; else npm prune --omit=dev --no-audit --no-fund; fi && \
+    find . -path ./node_modules -prune -o -name '*.map' -print -delete >/dev/null && \
+    chown -R node:node /app
+ENV NODE_ENV=production PORT=3000 HOSTNAME=0.0.0.0
+USER node
+EXPOSE 3000
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+  CMD node -e "fetch('http://127.0.0.1:'+process.env.PORT+'/').then(r=>process.exit(r.status<500?0:1),()=>process.exit(1))"
+CMD ["npm", "start"]

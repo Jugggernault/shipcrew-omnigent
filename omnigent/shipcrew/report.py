@@ -81,10 +81,29 @@ def build_report(mission: Mission, tasks: Sequence[Task]) -> str:
     """The Markdown ship report of ``mission`` (see the module docstring)."""
     lines: list[str] = [f"# Ship report: {_inline(mission.title)}", ""]
     shipped = mission.ship_status == "done"
+    preview = mission.preview or {}
+    live_url = preview.get("url") if preview.get("status") == "live" else None
     if mission.ship_url:
         lines.append(f"- **Deployment:** {mission.ship_url}")
+    elif live_url:
+        lines.append(f"- **Deployment:** {live_url} (live preview)")
     else:
         lines.append("- **Deployment:** not deployed")
+    if preview.get("live_since"):
+        lines.append(f"- **Live since:** {_stamp(float(preview['live_since']))} (first deploy)")
+    if preview.get("sha"):
+        detail = preview.get("detail") or {}
+        facts = [f"commit `{str(preview['sha'])[:12]}`"]
+        if preview.get("target"):
+            facts.insert(0, str(preview["target"]))
+        for key, label in (("build_s", "build"), ("start_s", "start"), ("deploy_s", "deploy")):
+            if isinstance(detail.get(key), int | float):
+                facts.append(f"{label} {format_duration(float(detail[key]))}")
+        if isinstance(detail.get("image_mb"), int | float):
+            facts.append(f"image {detail['image_mb']} MB")
+        lines.append(
+            f"- **Last deploy:** {', '.join(facts)} at {_stamp(preview.get('updated_at'))}"
+        )
     lines.append(f"- **Repository:** {mission.repo_url or mission.repo_path}")
     if shipped:
         lines.append("- **Status:** Shipped")

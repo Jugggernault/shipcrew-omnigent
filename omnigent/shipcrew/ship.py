@@ -1,4 +1,16 @@
-"""The ship stage: deploy a finished mission to Vercel, verify it, write the report.
+"""The ship stage: deploy a finished mission, verify it, write the report.
+
+The deploy target (``SHIPCREW_DEPLOY_TARGET``, see
+:mod:`omnigent.shipcrew.deploy_targets`) decides how step 3 runs:
+
+* a **server-side** target (``docker``, the default when Docker works, or
+  ``argocd``) already redeploys ``main`` after every merge (the mission
+  preview, :mod:`omnigent.shipcrew.preview`); the ship is one last redeploy
+  through :meth:`PreviewRunner.deploy_now`, with no agent session (no devops
+  bundle needed), then steps 4 and 5. A restart re-runs it (idempotent).
+* an **agent** target (``vercel``) runs the devops session below.
+
+With the ``vercel`` target:
 
 When every agent task of a mission is merged (and ``auto_ship`` is on), or on
 ``POST /missions/{id}/ship``, the scheduler:
@@ -32,8 +44,6 @@ import asyncio
 import dataclasses
 import ipaddress
 import logging
-import re
-import subprocess
 import time
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
@@ -44,9 +54,15 @@ from urllib.parse import urlsplit
 import httpx
 
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.shipcrew import tools
 from omnigent.shipcrew.branches import task_branch
 from omnigent.shipcrew.decisions import parse_decisions
+from omnigent.shipcrew.deploy_targets.vercel import (
+    DEVOPS_ROLE,
+    parse_deploy_reply,
+    ship_prompt,
+    vercel_preflight,
+    vercel_project_name,
+)
 from omnigent.shipcrew.pr_loop import (
     GitError,
     _cleanup_worktree,
@@ -63,16 +79,25 @@ if TYPE_CHECKING:
 
 _logger = logging.getLogger(__name__)
 
-DEVOPS_ROLE = "devops"
+__all__ = [
+    "DEVOPS_ROLE",
+    "ShipRunner",
+    "check_url",
+    "parse_deploy_reply",
+    "probe_url",
+    "ship_prompt",
+    "ship_readiness",
+    "vercel_preflight",
+    "vercel_project_name",
+    "verify_url",
+]
 SHIP_LABEL_KEY = "shipcrew.ship"
 MISSION_LABEL_KEY = "shipcrew.mission_id"
 SHIPPING_STATUSES = frozenset({"deploying", "verifying"})
 # Card states only a human can move on: they stop a ship.
 STUCK_STATUSES = frozenset({"blocked", "intervention"})
-_PREFLIGHT_TIMEOUT_S = 30.0
 _PROBE_TIMEOUT_S = 10.0
 _MAX_REDIRECTS = 10
-_PROJECT_MAX = 100
 
 
 def _conflict(message: str) -> OmnigentError:
@@ -116,76 +141,6 @@ def ship_readiness(tasks: Sequence[Task]) -> Readiness:
         noun = "task is" if len(pending) == 1 else "tasks are"
         return Readiness(False, f"{len(pending)} {noun} not merged yet: {_titles(pending)}")
     return Readiness(True)
-
-
-# ── Names, prompt, reply ────────────────────────────────────────
-
-_GITHUB_NAME = re.compile(r"[/:](?P<name>[^/:]+?)(?:\.git)?/?$")
-
-
-def vercel_project_name(repo_url: str | None, repo_path: str) -> str:
-    """A valid Vercel project name from the repo name (lowercase, ``[a-z0-9._-]``)."""
-    raw = ""
-    if repo_url:
-        match = _GITHUB_NAME.search(repo_url.strip())
-        raw = match.group("name") if match else ""
-    raw = raw or Path(repo_path).name
-    name = re.sub(r"[^a-z0-9._-]+", "-", raw.lower())
-    name = re.sub(r"-{2,}", "-", name).strip("-._")[:_PROJECT_MAX].strip("-._")
-    return name or "shipcrew-app"
-
-
-def ship_prompt(mission: Mission, project: str) -> str:
-    """The devops session's only message."""
-    repo = mission.repo_url or mission.repo_path
-    return "\n".join(
-        [
-            f"# Ship: {mission.title}",
-            "",
-            "Every task of this mission is merged. Your cwd is a fresh worktree of `main` "
-            f"of {repo}.",
-            "Deploy it to Vercel production, nothing else:",
-            "",
-            "1. `vercel whoami` (not logged in: stop with `FAIL: vercel is not logged in`).",
-            f"2. `vercel link --yes --project {project}`",
-            "3. `vercel deploy --prod --yes` (Vercel builds remotely: do not build locally).",
-            "4. If the deployment fails, read `vercel inspect <deployment-url> --logs` and report",
-            "   the cause. If the build needs environment variables, list their NAMES in the FAIL",
-            "   reason; never invent values or secrets.",
-            "",
-            "Do not edit files, do not commit, do not push. The server checks the URL itself.",
-            "",
-            "End your reply with a `Decisions:` list (what you chose without asking, one line",
-            "each, or `Decisions: none`), then the final line, nothing after it:",
-            "`DEPLOYED: <https production url>` (prefer the production alias Vercel prints,",
-            "e.g. `https://<project>.vercel.app`) or `FAIL: <reason>`.",
-        ]
-    )
-
-
-def _last_line(text: str | None) -> str:
-    lines = [line.strip() for line in (text or "").splitlines() if line.strip()]
-    return lines[-1].strip("*`_#> \t") if lines else ""
-
-
-_DEPLOYED = re.compile(r"^\W*DEPLOYED\W*:?\s*<?`?(?P<url>\S+?)`?>?[.)]*$", re.IGNORECASE)
-
-
-def parse_deploy_reply(text: str | None) -> tuple[str, str] | None:
-    """``("deployed", url)``, ``("fail", reason)`` or ``None`` (no verdict).
-
-    The final line wins; a ``DEPLOYED:`` line further up counts when the final
-    line is no verdict (an agent adding a sign-off).
-    """
-    line = _last_line(text)
-    fail = re.match(r"FAIL\b[\s:.-]*(.*)", line, re.IGNORECASE)
-    if fail:
-        return "fail", fail.group(1).strip() or "no reason given"
-    for candidate in [line, *reversed([ln.strip() for ln in (text or "").splitlines()])]:
-        match = _DEPLOYED.match(candidate.strip("*_#> \t"))
-        if match:
-            return "deployed", match.group("url")
-    return None
 
 
 def check_url(url: str, *, allow_private: bool = False) -> str | None:
@@ -286,35 +241,6 @@ async def verify_url(
     )
 
 
-# ── vercel preflight ────────────────────────────────────────────
-
-
-def _vercel_tool() -> tools.Tool:
-    return next(t for t in tools.registry() if t.key == "VERCEL")
-
-
-def vercel_preflight() -> str | None:
-    """Why the ``vercel`` CLI cannot deploy from this machine, or ``None``."""
-    path = tools.resolve(_vercel_tool())
-    if path is None:
-        return "vercel CLI not found: npm i -g vercel (or set SHIPCREW_VERCEL)"
-    try:
-        run = subprocess.run(
-            [path, "whoami"],
-            capture_output=True,
-            text=True,
-            timeout=_PREFLIGHT_TIMEOUT_S,
-            env=tools.session_env(),
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        return f"vercel whoami failed: {exc}"
-    if run.returncode != 0:
-        detail = (run.stderr or run.stdout).strip().splitlines()
-        tail = f" ({detail[-1][:200]})" if detail else ""
-        return f"vercel is not logged in on the server machine: run `vercel login`{tail}"
-    return None
-
-
 # ── The runner ──────────────────────────────────────────────────
 
 
@@ -322,7 +248,8 @@ class ShipRunner:
     """Starts, polls and verifies ship runs. See the module docstring.
 
     :param service: The board service (store, sessions, event bus, settings).
-    :param preflight: Server-side CLI check; tests replace it.
+    :param preflight: Server-side check before a deploy; ``None`` (the
+        default) uses the deploy target's own. Tests replace it.
     :param probe: One HTTP check of a URL; tests replace it.
     """
 
@@ -330,14 +257,18 @@ class ShipRunner:
         self,
         service: ShipcrewService,
         *,
-        preflight: Callable[[], str | None] = vercel_preflight,
+        preflight: Callable[[], str | None] | None = None,
         probe: Callable[[str], Awaitable[tuple[int | None, str, str]]] = probe_url,
     ) -> None:
         self._svc = service
         self._busy: set[str] = set()
         self._verifying: dict[str, asyncio.Task[None]] = {}
+        self._server_deploys: dict[str, asyncio.Task[None]] = {}
         self.preflight = preflight
         self.probe = probe
+
+    def _preflight(self, target: Any) -> str | None:
+        return (self.preflight or target.preflight)()
 
     # ── plumbing ──
 
@@ -446,13 +377,22 @@ class ShipRunner:
                 ship_cost_usd=0.0,
                 ship_branch=None,
             )
-            agent_dir = self._svc.settings.agents_dir / DEVOPS_ROLE
+            target = self._svc.deploy_target()
+            if getattr(target, "server_side", False):
+                # The server deploys itself: no devops session, no bundle needed.
+                problem = await asyncio.to_thread(self._preflight, target)
+                if problem is not None:
+                    return await self._fail(mission, problem)
+                self._launch_server_deploy(mission.id)
+                return mission
+            role = getattr(target, "agent_role", DEVOPS_ROLE)
+            agent_dir = self._svc.settings.agents_dir / role
             if not (agent_dir / "config.yaml").is_file():
                 return await self._fail(
                     mission,
-                    f"no agent bundle for role {DEVOPS_ROLE!r} in {self._svc.settings.agents_dir}",
+                    f"no agent bundle for role {role!r} in {self._svc.settings.agents_dir}",
                 )
-            problem = await asyncio.to_thread(self.preflight)
+            problem = await asyncio.to_thread(self._preflight, target)
             if problem is not None:
                 return await self._fail(mission, problem)
             repo = Path(mission.repo_path)
@@ -460,12 +400,11 @@ class ShipRunner:
             if repo.is_dir():
                 await asyncio.to_thread(_fetch, repo, base)
             base_ref = await asyncio.to_thread(default_base_ref, mission.repo_path, base)
-            project = vercel_project_name(mission.repo_url, mission.repo_path)
             mission = await self._set(mission.id, ship_branch=branch)
             request = RootSessionRequest(
                 task_id=f"ship-{mission.id}",
                 title=f"Ship: {mission.title}",
-                prompt=ship_prompt(mission, project),
+                prompt=target.agent_prompt(mission),
                 repo_path=mission.repo_path,
                 branch=branch,
                 agent_dir=agent_dir,
@@ -473,7 +412,7 @@ class ShipRunner:
                 base_branch=base_ref,
                 labels={
                     MISSION_LABEL_KEY: mission.id,
-                    "shipcrew.role": DEVOPS_ROLE,
+                    "shipcrew.role": role,
                     SHIP_LABEL_KEY: "deploy",
                 },
                 project_id=await self._svc.mission_project_id(mission, acting_user),
@@ -532,7 +471,48 @@ class ShipRunner:
         if mission.ship_error != wanted:
             await self._set(mission.id, ship_error=wanted)
 
+    # ── server-side deploy (docker, argocd) ──
+
+    def _launch_server_deploy(self, mission_id: str) -> None:
+        running = self._server_deploys.get(mission_id)
+        if running is not None and not running.done():
+            return
+        self._server_deploys[mission_id] = asyncio.create_task(
+            self._server_deploy(mission_id), name=f"shipcrew-ship-deploy-{mission_id[:8]}"
+        )
+
+    async def _server_deploy(self, mission_id: str) -> None:
+        """The ship's last redeploy of ``main``, then the URL check."""
+        try:
+            outcome = await self._svc.preview.deploy_now(mission_id, final=True)
+            mission = await self._svc.require_mission(mission_id)
+            if mission.ship_status != "deploying":
+                return  # changed meanwhile
+            if not outcome.ok or not outcome.url:
+                error = f"the last redeploy failed: {outcome.error or 'unknown error'}"
+                if outcome.url:
+                    error += f" ({outcome.url} still serves an older commit)"
+                await self._fail(mission, error)
+                return
+            mission = await self._set(
+                mission_id,
+                ship_status="verifying",
+                ship_url=outcome.url,
+                ship_note=outcome.note,
+                ship_verify_until=time.time() + self._svc.settings.ship_verify_s,
+            )
+            self._ensure_verifying(mission)
+        except Exception:
+            _logger.exception("shipcrew ship: server deploy of %s crashed", mission_id)
+
     async def _poll_deploy(self, mission: Mission) -> None:
+        if mission.ship_session_id is None and getattr(
+            self._svc.deploy_target(), "server_side", False
+        ):
+            # Deterministic and idempotent: after a restart it simply runs again.
+            if mission.id not in self._busy:
+                self._launch_server_deploy(mission.id)
+            return
         if mission.ship_session_id is None:
             # Re-read: a start may have finished since this tick listed the missions.
             mission = await self._svc.require_mission(mission.id)
@@ -627,14 +607,17 @@ class ShipRunner:
             _logger.exception("shipcrew ship: URL check of mission %s crashed", mission_id)
 
     async def drain(self) -> None:
-        """Wait for the in-flight URL checks (tests, shutdown)."""
+        """Wait for the in-flight deploys and URL checks (tests, shutdown)."""
+        pending = [t for t in self._server_deploys.values() if not t.done()]
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
         pending = [t for t in self._verifying.values() if not t.done()]
         if pending:
             await asyncio.gather(*pending, return_exceptions=True)
 
     async def close(self) -> None:
         """Cancel the in-flight URL checks; a restart resumes them from the DB."""
-        for task in self._verifying.values():
+        for task in [*self._server_deploys.values(), *self._verifying.values()]:
             task.cancel()
         await self.drain()
         self._verifying.clear()

@@ -25,7 +25,7 @@ def test_upgrade_then_downgrade(tmp_path: Path) -> None:
     assert _tables(url) >= _TABLES | {migrate.VERSION_TABLE}
     with engine.connect() as conn:
         version = conn.execute(text(f"SELECT version_num FROM {migrate.VERSION_TABLE}"))
-        assert version.scalar_one() == "sc0007ap"
+        assert version.scalar_one() == "sc0008pv"
     migrate.downgrade(engine)
     assert not _tables(url) & _TABLES
     # Upgrading again after a full downgrade restores the schema.

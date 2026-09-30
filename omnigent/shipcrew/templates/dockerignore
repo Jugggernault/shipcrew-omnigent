@@ -1,0 +1,14 @@
+.git
+.github
+.shipcrew
+node_modules
+.next
+.vercel
+.env*
+!.env.example
+coverage
+playwright-report
+test-results
+*.tsbuildinfo
+Dockerfile
+.dockerignore

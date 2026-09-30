@@ -1,7 +1,8 @@
 """Background loop: sync session state onto cards, then start gated ready tasks.
 
-Each tick also imports finished planner runs, ships missions whose tasks are
-all merged, and (every ``sync_interval_s``) syncs GitHub issues.
+Each tick also imports finished planner runs, redeploys the preview of
+missions whose ``main`` moved, ships missions whose tasks are all merged, and
+(every ``sync_interval_s``) syncs GitHub issues.
 
 State lives in the DB; every tick recomputes capacity, overlap and budget from
 it, so a restart or a manual edit never leaves the loop with a stale view.
@@ -44,6 +45,10 @@ class ShipcrewScheduler:
         # Before the starts: a merge this tick unblocks dependants right away.
         await service.advance_reviews()
         started = await service.schedule_ready()
+        # After the merges above: a merge redeploys main (server-side targets),
+        # the first merge publishes the mission's live URL.
+        await asyncio.to_thread(service.deploy_target)
+        await service.preview.tick()
         # After the merges above: the last merge of a mission ships it this tick.
         await service.ship.tick()
         # Last: gh calls are the slowest part, and each one is time-bounded.
