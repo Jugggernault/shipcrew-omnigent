@@ -1,15 +1,94 @@
 # shipcrew on omnigent: status
 
-Branch `shipcrew` of this fork. Design: `shipcrew/PROPOSAL-v3.md`. Role bundles
-live in the separate `shipcrew` repo (`agents/`, branch `v0.2`). Round 2 (PR
-loop, planner import, issue sync, worker permissions, board UI) is merged. Last
-live end-to-end run: 2026-09-29.
+Fork branch `shipcrew-r9` (bundles: shipcrew `v3-r9`). Design:
+`shipcrew/PROPOSAL-v3.md`. Last live end-to-end run: 2026-09-30 (r9 smoke,
+below). The dated sections after this one are the history of each round.
 
-![Board after the e2e: both cards merged](board-merged.png)
-![Intervention card: a guardrail ask during a CI fix turn](intervention.png)
-![Drawer of a merged card: PR, CI fix 1/3, reviewer findings](drawer-merged.png)
-![Card held for a human merge approval (APPROVALS.md)](board-approval.png)
-![Drawer with the Approve merge action](drawer-approval.png)
+## Current state (round 9 integration, 2026-09-30)
+
+`shipcrew-r9` = round 8 + deploy + headless + gitops; `v3-r9` = the matching
+bundle branches. Details of each part are in the sections below.
+
+- **Pipeline**: plan -> tasks (one worktree, branch, PR each) -> CI (the
+  server installs `ci.yml`) -> fresh reviewer -> merge (push with a lease,
+  stale branches updated from main before a CI fix, first-prompt retry) ->
+  **live preview after every merge** -> ship (last redeploy, URL check,
+  report). Alembic is one linear chain: `... sc0007ap -> sc0008ps`
+  (`Task.pushed_sha`) `-> sc0008pv` (`Mission.preview`, head).
+- **Deploy targets** (`omnigent/shipcrew/deploy_targets/`): `base.py` holds
+  the protocol, `__init__.py` the lazy registry. Targets: `docker` (default
+  under `auto` when docker answers; quick tunnel or Caddy on a VPS domain),
+  `vercel` (agent target, as before) and `argocd` (server side, k3s + ArgoCD
+  on a VPS, see [VPS.md](VPS.md)). `argocd.py` implements the real protocol
+  (`server_side`, `DeployContext` fields, `refresh`, built as
+  `Target(settings)`). The integration stub is gone. The gitops files
+  (`deploy/k8s`, `gitops.yml`) are installed next to CI only when
+  `SHIPCREW_DEPLOY_TARGET=argocd`, decided from `settings.deploy_target`.
+  `SHIPCREW_BASE_DOMAIN` falls back to `SHIPCREW_PUBLIC_BASE_DOMAIN`.
+- **Harness** (`SHIPCREW_WORKER_HARNESS=auto`): claude-sdk for planner,
+  designer, scaffolder, developer, reviewer, integrator and devops.
+  claude-native only for qa and security, which need the chrome-devtools MCP.
+  No bundle loads the shadcn MCP any more (~265 MB per session). Builders
+  add components with `pnpm dlx shadcn@latest add <c> --yes` or `npx
+  shadcn@latest add <c> --yes`. That is the only shadcn form on the builder
+  and scaffolder allowlists (no `--cwd`, `--path`, `--overwrite` or `--all`).
+  Auto capacity, parked idle developers and the headless browser are
+  unchanged ([RESOURCES.md](RESOURCES.md)).
+- **Bundles (v3-r9)**: COMMON stays lean (8.0 KB): round 8's "Keep the app
+  light" section and merge-not-rebase rule, headless Playwright only, and the
+  shadcn CLI rule. The planner and scaffolder carry the deployable Foundation
+  (`Dockerfile`, `.dockerignore`, `output: "standalone"`). Devops runs only
+  for agent targets. validate_agents: 267 cases per bundle, plus 261 in the
+  sdk rendering.
+- **Local e2e without anything public**: with `SHIPCREW_SHIP_ALLOW_PRIVATE_URLS=1`
+  the tunnel exposure also accepts a loopback URL printed by a fake
+  `cloudflared` (`SHIPCREW_CLOUDFLARED`).
+
+### r9 smoke (port 16831, own state dir, real docker, fake gh + fake cloudflared, real Claude)
+
+A plain node repo (`server.js` + `lib/page.js`, `node --test`, no Dockerfile,
+so the `Dockerfile.node` fallback was used). Two developer tasks, the second
+depending on the first, with `auto_run` + `auto_ship` and
+`SHIPCREW_DOCKER_BUILD_NETWORK=host`.
+
+- The first merge happened at 14:25:35. By 14:25:45 the preview was `live` at
+  `http://127.0.0.1:51137`, serving `v1`.
+- The second merge happened at 14:27:05. The ship redeployed it, and by
+  14:27:10 the preview had the new sha on the **same URL**, serving `v2` plus
+  the footer. The ship ended `done` with the report: Live since, Last deploy
+  (docker, build 5 s, image 61.3 MB), 2/2 merged, $0.42, 3 min 05 s wall
+  time, 0 interventions.
+- Both developer sessions ran on `claude-sdk`, and so did the reviewers.
+- `DELETE /preview` afterwards: no container, image, tunnel or forwarder left.
+
+![Board after the r9 smoke: Shipped + Live chip with the deployed sha](live-preview.png)
+
+### Checks (r9)
+
+ruff + format, `pyrefly check` (0 errors), pre-commit on every changed file.
+`pytest tests/shipcrew tests/server/test_shipcrew_mount.py`: 1103 passed.
+Upstream tests next to the touched files (claude-native hook/bridge,
+claude-sdk harness/executor/spawn env, session policy/relay/elicitation
+routes, `tests/policies`, the shipcrew child runner): 1604 passed. Web:
+lint, type-check and build are green. vitest on `src/board`,
+`src/pages/BoardPage*` and `src/shell`: 3069 passed, 2 expected fail.
+`build_agents.py --check` and `validate_agents.py` (all 10 bundles valid)
+both pass.
+
+### Open issues
+
+- `shadcn add` can install packages (for example `radix-ui`), and that is
+  not modelled as a `package.json` write. A feature task adding a component
+  whose dependency the Foundation did not install can therefore race on the
+  lockfile. The integrator resolves it at merge time.
+- The argocd target is covered by unit tests with a fake kubectl, and by
+  gitops' own k3d proof. It has not been re-run live after the rewrite onto
+  `base.py`. A preview deploy through argocd waits for GitHub Actions and
+  ArgoCD (up to `SHIPCREW_ARGOCD_WAIT_S`) while holding the mission's
+  preview lock.
+- Earlier known gaps stand: the first-turn retry is in memory, the stale
+  branch update happens outside the merge lock, and `CanvasPage.test.tsx`
+  failures predate this round and were not in scope.
 
 ## Deploy without Vercel: docker target, live URL from the first merge (2026-09-30)
 
