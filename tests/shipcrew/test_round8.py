@@ -153,3 +153,18 @@ class TestFirstTurnRetry:
         stub.session_body, stub.latest_items = dict(RUNNER_204), [USER_ITEM]
         snap = await service.snapshot("conv_other", acting_user=None)
         assert snap is not None and snap.status == "failed" and _prompts(stub) == []
+
+
+# ── lightweight apps: the reviewer sees the developer's justifications ──
+
+
+def test_reviewer_prompt_lists_the_developer_decisions() -> None:
+    from omnigent.shipcrew.pr_loop import reviewer_prompt
+    from omnigent.shipcrew.store import Task
+
+    kw = {"branch": "b", "base_ref": "origin/main", "base_sha": "a", "head_sha": "c"}
+    task = Task(id="t1", mission_id="m", title="Cart", decisions=["Added zod: request schemas"])
+    prompt = reviewer_prompt(task, diff_path="/tmp/d.diff", **kw)
+    assert "Developer decisions:\n- Added zod: request schemas" in prompt
+    bare = reviewer_prompt(Task(id="t2", mission_id="m", title="Cart"), diff_path="/d", **kw)
+    assert "Developer decisions:\n- none" in bare

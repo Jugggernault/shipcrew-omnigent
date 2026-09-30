@@ -364,6 +364,8 @@ def reviewer_prompt(
         lines += ["", "Acceptance criteria:", *(f"- {a}" for a in task.acceptance)]
     if task.owned_paths:
         lines += ["", "Owned paths: " + ", ".join(f"`{p}`" for p in task.owned_paths)]
+    # The developer's Decisions: where a new dependency must be justified.
+    lines += ["", "Developer decisions:", *(f"- {d}" for d in task.decisions or ["none"])]
     lines += [
         "",
         "## Output format",
