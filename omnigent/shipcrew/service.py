@@ -461,6 +461,7 @@ class ShipcrewService:
                 other_tasks=tuple(
                     {"title": o.title, "owned_paths": list(o.owned_paths)} for o in others
                 ),
+                harness=self.settings.harness_for(task.role),
             )
             try:
                 session_id = await self.sessions.create_root_session(request)
@@ -652,11 +653,17 @@ class ShipcrewService:
         missions = {m.id: m for m in await self.list_missions()}
         picked: list[Task] = []
         ready = [t for t in tasks.values() if t.status == "ready" and not t.human_assigned]
+        # Fixed cap, or (SHIPCREW_MAX_PARALLEL=auto) derived from free memory
+        # and CPUs now; the running sessions' memory is already in use.
+        running = sum(
+            1 for t in tasks.values() if t.status in ACTIVE_STATUSES and not t.human_assigned
+        )
+        max_parallel = self.settings.capacity(running) if ready else running
         for task in sorted(ready, key=lambda t: (t.position, t.created_at)):
             ctx = GateContext(
                 tasks_by_id=tasks,
                 repo_of={m.id: m.repo_path for m in missions.values()},
-                max_parallel=self.settings.max_parallel,
+                max_parallel=max_parallel,
                 max_usd=self.settings.max_usd,
             )
             reason = evaluate_gates(task, ctx)

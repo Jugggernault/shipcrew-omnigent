@@ -381,7 +381,12 @@ def doctor(fix: bool = False, interactive: bool | None = None) -> bool:
 
 
 def session_env() -> dict[str, str]:
-    """os.environ + resolved tool dirs first on PATH + CHROMIUM_PATH, for every subprocess."""
+    """os.environ + resolved tool dirs first on PATH + CHROMIUM_PATH, for every subprocess.
+
+    ``CHROMIUM_PATH`` (when not set already): ``SHIPCREW_CHROMIUM``, else
+    ``chrome-headless-shell`` (:func:`omnigent.shipcrew.resources.headless_chromium`),
+    else the resolved full browser.
+    """
     env = dict(os.environ)
     saved = _saved()
     dirs: list[str] = []
@@ -390,8 +395,15 @@ def session_env() -> dict[str, str]:
         if d and d not in dirs:
             dirs.append(d)
     env["PATH"] = os.pathsep.join([*dirs, env.get("PATH", "")])
-    if "CHROMIUM_PATH" not in env and saved.get("CHROMIUM"):
-        env["CHROMIUM_PATH"] = saved["CHROMIUM"]
+    if "CHROMIUM_PATH" not in env:
+        # Headless shell first (lighter), else the resolved full Chromium.
+        from omnigent.shipcrew.resources import headless_chromium
+
+        chromium = (
+            os.environ.get("SHIPCREW_CHROMIUM") or headless_chromium() or saved.get("CHROMIUM")
+        )
+        if chromium:
+            env["CHROMIUM_PATH"] = chromium
     return env
 
 

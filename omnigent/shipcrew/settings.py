@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+
+from omnigent.shipcrew import resources
+from omnigent.shipcrew.harness import SDK, WorkerHarness, parse_worker_harness
 
 DEFAULT_AGENTS_DIR = "/home/jugggernault/Work/Projects/shipcrew/agents"
 DEFAULT_DEPLOY_STATE_DIR = Path.home() / ".local" / "state" / "shipcrew" / "deploy"
@@ -26,7 +29,20 @@ class ShipcrewSettings:
 
     :param agents_dir: Directory holding one agent bundle per role, e.g.
         ``<agents_dir>/developer/config.yaml``.
-    :param max_parallel: Capacity gate: at most this many agent-run tasks at once.
+    :param max_parallel: Capacity gate: at most this many agent-run tasks at
+        once. ``None`` = ``SHIPCREW_MAX_PARALLEL=auto``: derived each tick from
+        free memory and CPUs (:meth:`capacity`).
+    :param max_parallel_ceiling: Upper bound of the auto cap (``auto:<n>``).
+    :param mem_reserve_mb: Memory the auto cap never hands to new sessions
+        (``SHIPCREW_MEM_RESERVE_MB``).
+    :param session_mb: Footprint of one session for the auto cap
+        (``SHIPCREW_SESSION_MB``; ``None`` = the measured value of the
+        developer's harness).
+    :param worker_harness: Harness per worker role (``SHIPCREW_WORKER_HARNESS``,
+        see :mod:`omnigent.shipcrew.harness`).
+    :param park_idle_workers: Stop a task's developer session while its PR
+        waits for CI and review (``SHIPCREW_PARK_IDLE_WORKERS``); the next
+        message (CI fix, review feedback) relaunches it with its conversation.
     :param max_usd: Budget gate: no new start once the summed task cost reaches
         this. ``None`` disables the gate.
     :param poll_interval_s: Scheduler tick period (status sync + starts).
@@ -80,7 +96,12 @@ class ShipcrewSettings:
     """
 
     agents_dir: Path = Path(DEFAULT_AGENTS_DIR)
-    max_parallel: int = 4
+    max_parallel: int | None = 4
+    max_parallel_ceiling: int | None = None
+    mem_reserve_mb: int = resources.DEFAULT_RESERVE_MB
+    session_mb: int | None = None
+    worker_harness: WorkerHarness = field(default_factory=WorkerHarness)
+    park_idle_workers: bool = True
     max_usd: float | None = 100.0
     poll_interval_s: float = 5.0
     scheduler_enabled: bool = True
@@ -110,13 +131,52 @@ class ShipcrewSettings:
     tunnel_url_timeout_s: float = 45.0
     deploy_parallel: int = 2
 
+    def harness_for(self, role: str) -> str:
+        """Harness a worker session of *role* runs on (bundles authored for native)."""
+        return self.worker_harness.for_role(role)
+
+    def per_session_mb(self) -> int:
+        """Footprint of one more session for the auto capacity cap."""
+        if self.session_mb is not None:
+            return self.session_mb
+        sdk = self.harness_for("developer") == SDK
+        return resources.SESSION_MB_SDK if sdk else resources.SESSION_MB_NATIVE
+
+    def capacity(self, running: int) -> int:
+        """Capacity cap for this tick: fixed, or auto from memory and CPUs."""
+        if self.max_parallel is not None:
+            return self.max_parallel
+        available = resources.mem_available_mb()
+        cgroup = resources.cgroup_limit_mb()
+        if cgroup is not None:
+            available = cgroup if available is None else min(available, cgroup)
+        return resources.auto_max_parallel(
+            running=running,
+            mem_available_mb=available,
+            reserve_mb=self.mem_reserve_mb,
+            per_session_mb=self.per_session_mb(),
+            cpus=resources.cpu_count(),
+            ceiling=self.max_parallel_ceiling,
+        )
+
     @classmethod
     def from_env(cls) -> ShipcrewSettings:
         """Build settings from the process environment."""
         env = os.environ
+        max_parallel, ceiling = resources.parse_max_parallel(env.get("SHIPCREW_MAX_PARALLEL"))
+        session_mb = env.get("SHIPCREW_SESSION_MB", "").strip()
         return cls(
             agents_dir=Path(env.get("SHIPCREW_AGENTS_DIR") or DEFAULT_AGENTS_DIR),
-            max_parallel=max(1, int(env.get("SHIPCREW_MAX_PARALLEL") or 4)),
+            max_parallel=max_parallel,
+            max_parallel_ceiling=ceiling,
+            mem_reserve_mb=max(
+                0, int(env.get("SHIPCREW_MEM_RESERVE_MB") or resources.DEFAULT_RESERVE_MB)
+            ),
+            session_mb=max(50, int(session_mb)) if session_mb else None,
+            worker_harness=parse_worker_harness(env.get("SHIPCREW_WORKER_HARNESS")),
+            park_idle_workers=(
+                env.get("SHIPCREW_PARK_IDLE_WORKERS", "1").strip().lower() not in _FALSEY
+            ),
             max_usd=_env_float("SHIPCREW_MAX_USD", 100.0),
             poll_interval_s=max(0.5, float(env.get("SHIPCREW_POLL_INTERVAL_S") or 5.0)),
             scheduler_enabled=env.get("SHIPCREW_SCHEDULER", "1").strip().lower() not in _FALSEY,

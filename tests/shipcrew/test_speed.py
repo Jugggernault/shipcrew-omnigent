@@ -391,6 +391,38 @@ class TestCiTemplate:
         assert env["CHROMIUM_PATH"] == "/usr/bin/google-chrome"
         assert "playwright install" not in yaml.safe_dump(wf)
 
+    @pytest.mark.parametrize("where", ["path", "cache", "none"])
+    def test_prefers_the_headless_shell_when_present(self, tmp_path: Path, where: str) -> None:
+        steps = self._workflow()["jobs"]["ci"]["steps"]
+        script = next(s for s in steps if s.get("name") == "headless browser")["run"]
+        bindir, cache = tmp_path / "bin", tmp_path / "ms-playwright"
+        bindir.mkdir()
+        shell = None
+        if where == "path":
+            shell = bindir / "chrome-headless-shell"
+        elif where == "cache":
+            (cache / "chromium_headless_shell-1200/chrome-headless-shell-linux64").mkdir(
+                parents=True
+            )
+            shell = cache / "chromium_headless_shell-1234/chrome-headless-shell-linux64"
+            shell.mkdir(parents=True)
+            shell = shell / "chrome-headless-shell"
+            (cache / "chromium_headless_shell-1200/chrome-headless-shell-linux64"
+             / "chrome-headless-shell").write_text("#!/bin/sh\n")  # fmt: skip
+        if shell is not None:
+            shell.write_text("#!/bin/sh\n")
+            shell.chmod(0o755)
+        out = tmp_path / "env"
+        env = {
+            "PATH": f"{bindir}:/usr/bin:/bin",
+            "GITHUB_ENV": str(out),
+            "PLAYWRIGHT_BROWSERS_PATH": str(cache),
+            "CHROMIUM_PATH": "/usr/bin/google-chrome",
+        }
+        subprocess.run(["bash", "-e", "-c", script], env=env, check=True, timeout=30)
+        written = out.read_text() if out.exists() else ""
+        assert written == (f"CHROMIUM_PATH={shell}\n" if shell else "")
+
     @pytest.mark.parametrize(
         ("files", "outputs"),
         [

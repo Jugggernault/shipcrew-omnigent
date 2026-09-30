@@ -18,13 +18,22 @@ jobs:
     timeout-minutes: 30
     env:
       CI: "1"
-      # Google Chrome is preinstalled on ubuntu-latest: Playwright uses it
+      # Google Chrome is preinstalled on ubuntu-latest: Playwright runs it headless
       # (launchOptions.executablePath = process.env.CHROMIUM_PATH), never `playwright install`.
       CHROMIUM_PATH: /usr/bin/google-chrome
       PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1"
       NEXT_TELEMETRY_DISABLED: "1"
     steps:
       - uses: actions/checkout@v4
+      # Always headless. A runner that has Playwright's headless-only Chromium
+      # (chrome-headless-shell, e.g. a self-hosted VPS) uses it instead of the full
+      # browser: about half the memory per e2e run. Never downloaded here.
+      - name: headless browser
+        run: |
+          s="$(command -v chrome-headless-shell || true)"
+          [ -n "$s" ] || s="$(ls -d "${PLAYWRIGHT_BROWSERS_PATH:-$HOME/.cache/ms-playwright}"/chromium_headless_shell-*/chrome-headless-shell-*/chrome-headless-shell 2>/dev/null | sort -V | tail -1 || true)"
+          if [ -n "$s" ] && [ -x "$s" ]; then echo "CHROMIUM_PATH=$s" >> "$GITHUB_ENV"; fi
+          echo "e2e browser: ${s:-$CHROMIUM_PATH}"
       # Package manager from the lockfile: pnpm-lock.yaml -> pnpm, yarn.lock -> yarn,
       # else npm. No package.json yet (before the Foundation task): nothing to run.
       - id: pm

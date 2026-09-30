@@ -230,6 +230,60 @@ surfaces the failure); a stale-branch update happens outside the merge lock
 (harmless, `update-branch` is idempotent); planner and orchestrator
 AGENTS.md stay slightly above 12 KB.
 
+## Headless: lighter sessions per VPS (2026-09-30)
+
+Branch `shipcrew-headless` (bundles: shipcrew `v3-headless`). All numbers,
+the guarantee table and VPS sizing are in [RESOURCES.md](RESOURCES.md).
+
+- **Worker harness per role** (`omnigent/shipcrew/harness.py`,
+  `SHIPCREW_WORKER_HARNESS=auto|native|sdk[,role=native|sdk]`).
+  - The server renders the uploaded copy of a claude-native worker bundle for
+    claude-sdk: `permission_mode: auto`, no `allowed_tools` / `mcp_config`.
+    The bundles on disk are untouched.
+  - `auto` (default): sdk for developer, reviewer, integrator and devops;
+    native for designer, scaffolder, qa and security (they use the shadcn /
+    chrome-devtools MCP, which the SDK path does not load).
+  - Measured with 3 sessions in parallel: sdk ~300 MB per session against
+    ~660 MB for native with shadcn, 6 s of CPU per turn against 14 s, idle CPU
+    3 % against 7 %, and ~40 % less quota per turn.
+- **Guarantees on sdk.** Kept:
+  - DENY with a hint, ASK as an approval card, owned paths;
+  - `--strict-mcp-config`, `--setting-sources project,local`;
+  - cost reporting, interrupt and stop (a message relaunches with the
+    conversation);
+  - the merge-gate memory of an accepted ASK, which is new: the relay path now
+    calls `approvals.notify_accepted_relay_ask` from the `approval` event /
+    resolve URL through `_PendingPolicyAskWrites.policy_reason`.
+
+  Not available on sdk: the role's own MCP servers, Claude Task sub-agents,
+  and a live Claude TUI to attach to. `validate_agents.py` checks the sdk
+  rendering of every worker with 250 cases each, spelled as `sys_os_*` tool
+  calls; every verdict equals native.
+- **Auto capacity** (`omnigent/shipcrew/resources.py`,
+  `SHIPCREW_MAX_PARALLEL=auto[:ceiling]`).
+  - The cap is `running + floor((MemAvailable or the cgroup headroom - reserve)
+    / per-session MB)`, capped by CPUs and recomputed every tick.
+  - Knobs: `SHIPCREW_MEM_RESERVE_MB` (2048), `SHIPCREW_SESSION_MB` (350 on sdk,
+    700 on native).
+- **Parked developers** (`SHIPCREW_PARK_IDLE_WORKERS`, default on). The
+  developer is stopped once its PR is open and after each fix push. The next
+  CI or review message relaunches it.
+- **Headless browser.**
+  - `chrome-headless-shell` is preferred when present, never downloaded:
+    `scripts/shipcrew_stack.sh` exports `CHROMIUM_PATH`, and `tools.session_env`
+    and the CI template's "headless browser" step pick it too. In one e2e run
+    it used 220-330 MB against 480-770 MB for full Chromium.
+  - COMMON: Playwright is always headless.
+  - The stack script also exports `NEXT_TELEMETRY_DISABLED=1`, and
+    `SHIPCREW_NODE_HEAP_MB` is an opt-in V8 heap cap.
+
+Upstream footprint added (all marked `shipcrew fork`):
+
+- `_sessions/common.py`: a `policy_reason` field;
+- `_sessions/orchestration.py`: 2 lines filling it;
+- `routes_events.py` and `routes_elicitations.py`: +4 lines each, the hook
+  call.
+
 ## Round 7: refuse with a hint, ask only for real decisions (2026-09-30)
 
 Branch `shipcrew-round7` (bundles: shipcrew `v3-round7`). Live run 3 shipped
@@ -1039,7 +1093,9 @@ pnpm install --frozen-lockfile --filter web && pnpm --filter web build   # serve
 
 STATE=/tmp/shipcrew-state PORT=16767                    # non-default port
 scripts/shipcrew_stack.sh start "$STATE" "$PORT"          # server + host, telemetry off
-# optional: SHIPCREW_MAX_PARALLEL=4 SHIPCREW_MAX_USD=100 SHIPCREW_POLL_INTERVAL_S=5
+# optional: SHIPCREW_MAX_PARALLEL=4|auto|auto:<n> SHIPCREW_MAX_USD=100 SHIPCREW_POLL_INTERVAL_S=5
+#           SHIPCREW_WORKER_HARNESS=auto|native|sdk[,role=...] SHIPCREW_PARK_IDLE_WORKERS=1
+#           SHIPCREW_MEM_RESERVE_MB=2048 SHIPCREW_SESSION_MB=... SHIPCREW_NODE_HEAP_MB=...
 #           SHIPCREW_AGENTS_DIR=... SHIPCREW_SCHEDULER=0 (disable the loop)
 xdg-open "http://127.0.0.1:$PORT/board"
 scripts/shipcrew_stack.sh stop "$STATE"

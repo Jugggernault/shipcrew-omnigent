@@ -416,6 +416,7 @@ class ShipRunner:
                     SHIP_LABEL_KEY: "deploy",
                 },
                 project_id=await self._svc.mission_project_id(mission, acting_user),
+                harness=self._svc.settings.harness_for(DEVOPS_ROLE),
             )
             try:
                 session_id = await self._svc.sessions.create_root_session(request)

@@ -25,6 +25,27 @@ for v in $(env | grep -oE '^(CLAUDECODE|CLAUDE_[A-Z_]+|ANTHROPIC_API_KEY)=' | tr
   unset "$v"
 done
 
+# Lighter agent sessions (docs/shipcrew/RESOURCES.md). The host passes this
+# environment to every session, so agents, their builds and e2e runs see it.
+# - CHROMIUM_PATH: Playwright's headless-only Chromium when one is on this
+#   machine (about half the memory of a full Chromium in --headless=new); never
+#   downloaded here. Set CHROMIUM_PATH yourself to pin a browser.
+# - NEXT_TELEMETRY_DISABLED: no Next.js telemetry calls from builds.
+# - SHIPCREW_NODE_HEAP_MB (optional): V8 heap cap for every node process
+#   (NODE_OPTIONS=--max-old-space-size), e.g. 2048 on a small VPS.
+if [[ -z ${CHROMIUM_PATH:-} ]]; then
+  shell="$(command -v chrome-headless-shell 2>/dev/null || true)"
+  if [[ -z $shell ]]; then
+    cache="${PLAYWRIGHT_BROWSERS_PATH:-$HOME/.cache/ms-playwright}"
+    shell="$(ls -d "$cache"/chromium_headless_shell-*/chrome-headless-shell-*/chrome-headless-shell 2>/dev/null | sort -V | tail -1 || true)"
+  fi
+  [[ -n $shell && -x $shell ]] && export CHROMIUM_PATH="$shell"
+fi
+export NEXT_TELEMETRY_DISABLED=1
+if [[ -n ${SHIPCREW_NODE_HEAP_MB:-} ]]; then
+  export NODE_OPTIONS="${NODE_OPTIONS:+$NODE_OPTIONS }--max-old-space-size=${SHIPCREW_NODE_HEAP_MB}"
+fi
+
 start() {
   mkdir -p "$OMNIGENT_DATA_DIR" "$OMNIGENT_CONFIG_HOME" "$STATE_DIR/logs"
   grep -qs '^telemetry: false' "$OMNIGENT_CONFIG_HOME/config.yaml" \
@@ -46,6 +67,7 @@ start() {
     >"$STATE_DIR/logs/host.log" 2>&1 &
   echo $! >"$STATE_DIR/host.pid"
   echo "server $URL (pid $(cat "$STATE_DIR/server.pid")), host pid $(cat "$STATE_DIR/host.pid")"
+  echo "browser: ${CHROMIUM_PATH:-/usr/bin/chromium (default)}"
   echo "logs: $STATE_DIR/logs"
 }
 

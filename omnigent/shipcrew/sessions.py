@@ -27,6 +27,7 @@ from typing import Any, Protocol
 
 import httpx
 
+from omnigent.shipcrew.harness import apply_worker_harness
 from omnigent.shipcrew.worktree_prep import prepare_worktree
 
 _logger = logging.getLogger(__name__)
@@ -90,6 +91,9 @@ class RootSessionRequest:
     # The mission's other active tasks at start: ``{"title", "owned_paths"}``
     # each (their files are DENY for this task, see policies.owned_paths).
     other_tasks: tuple[dict[str, Any], ...] = ()
+    # "claude-sdk" renders a claude-native bundle headless (see harness.py);
+    # None / "claude-native" upload it as authored.
+    harness: str | None = None
 
 
 @dataclass(frozen=True)
@@ -111,6 +115,8 @@ class ChildSessionRequest:
     reasoning_effort: str | None = None
     # The mission's omnigent project (same folder as the parent).
     project_id: str | None = None
+    # See RootSessionRequest.harness.
+    harness: str | None = None
 
 
 @dataclass(frozen=True)
@@ -223,6 +229,7 @@ def bundle_agent_dir(
     owned_paths: Sequence[str] = (),
     workspace: str | None = None,
     other_tasks: Sequence[dict[str, Any]] = (),
+    harness: str | None = None,
 ) -> bytes:
     """Pack an agent bundle directory as the ``tar.gz`` omnigent accepts.
 
@@ -232,6 +239,8 @@ def bundle_agent_dir(
     :param workspace: Absolute path of the task worktree.
     :param other_tasks: The mission's other active tasks (see
         :func:`inject_task_contract`).
+    :param harness: ``"claude-sdk"`` renders a claude-native worker bundle for
+        the headless harness (:func:`omnigent.shipcrew.harness.apply_worker_harness`).
     """
     from omnigent.spec import materialize_bundle
 
@@ -241,17 +250,15 @@ def bundle_agent_dir(
     # materialize_bundle dereferences symlinks (the orchestrator's agents/<role>).
     with tempfile.TemporaryDirectory() as tmp:
         root = materialize_bundle(agent_dir, Path(tmp) / "bundle")
+        config = root / "config.yaml"
+        text = original = config.read_text(encoding="utf-8")
         if owned_paths and workspace:
-            config = root / "config.yaml"
-            config.write_text(
-                inject_task_contract(
-                    config.read_text(encoding="utf-8"),
-                    owned_paths=owned_paths,
-                    root=workspace,
-                    other_tasks=other_tasks,
-                ),
-                encoding="utf-8",
+            text = inject_task_contract(
+                text, owned_paths=owned_paths, root=workspace, other_tasks=other_tasks
             )
+        text = apply_worker_harness(text, harness)
+        if text != original:
+            config.write_text(text, encoding="utf-8")
         with tarfile.open(fileobj=buf, mode="w:gz") as tar:
             for path in sorted(root.rglob("*")):
                 rel = path.relative_to(root)
@@ -427,6 +434,7 @@ class OmnigentSessionService:
             owned_paths=request.owned_paths,
             workspace=workspace,
             other_tasks=request.other_tasks,
+            harness=request.harness,
         )
         await asyncio.to_thread(_pretrust_claude_workspace, workspace)
         metadata = {
@@ -565,7 +573,9 @@ class OmnigentSessionService:
         return None
 
     async def create_child_session(self, request: ChildSessionRequest) -> str:
-        bundle = await asyncio.to_thread(bundle_agent_dir, request.agent_dir)
+        bundle = await asyncio.to_thread(
+            bundle_agent_dir, request.agent_dir, harness=request.harness
+        )
         await asyncio.to_thread(_pretrust_claude_workspace, request.workspace)
         headers = self._auth_headers(request.acting_user)
         metadata: dict[str, Any] = {

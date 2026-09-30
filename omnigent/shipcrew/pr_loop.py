@@ -732,6 +732,7 @@ class PrLoop:
                 },
                 reasoning_effort=reasoning_effort,
                 project_id=await self._svc.mission_project_id(ctx.mission, ctx.owner),
+                harness=self._svc.settings.harness_for(role),
             )
         )
 
@@ -925,7 +926,7 @@ class PrLoop:
             )
         else:
             url = (await self._io(gh.pr_view, ctx.repo, number)).url
-        return await self._update(
+        task = await self._update(
             ctx.task,
             pr_number=number,
             pr_url=url,
@@ -934,6 +935,20 @@ class PrLoop:
             blocked_reason=None,
             pushed_sha=pushed,
         )
+        await self._park_developer(ctx)
+        return task
+
+    async def _park_developer(self, ctx: _Ctx) -> None:
+        """Stop the finished developer session while its PR waits for CI and review.
+
+        Its turn is over (PASS read, commits pushed) and an idle Claude process
+        still holds ~300-700 MB and a slice of a core. The transcript stays;
+        the next message (CI logs, review feedback, a human's changes)
+        relaunches the session with its conversation. ``SHIPCREW_PARK_IDLE_WORKERS=0``
+        keeps it running (e.g. to watch a native terminal).
+        """
+        if self._svc.settings.park_idle_workers:
+            await self._stop(ctx, ctx.task.root_session_id)
 
     # ── 2. sync ──
 
@@ -996,6 +1011,8 @@ class PrLoop:
             return await self._hold(ctx, f"push of {ctx.branch} rejected: {detail}")
         # New commits from this worktree (a developer fix, or the integrator's
         # conflict resolution): the head changed, so review and approval start over.
+        if not integrated:
+            await self._park_developer(ctx)
         return await self._update(
             task, ci="pending", blocked_reason=None, human_approved=False, pushed_sha=local
         )
