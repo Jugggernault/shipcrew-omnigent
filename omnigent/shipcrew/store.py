@@ -131,6 +131,7 @@ class Task:
     interventions: list[dict[str, Any]] = field(default_factory=list)
     verdict_nudges: int = 0
     approved_paths: list[str] = field(default_factory=list)
+    pushed_sha: str | None = None
 
     @property
     def human_assigned(self) -> bool:
@@ -263,6 +264,7 @@ def _task(row: SqlTask) -> Task:
         interventions=[dict(i) for i in row.interventions or [] if isinstance(i, dict)],
         verdict_nudges=int(row.verdict_nudges or 0),
         approved_paths=[str(p) for p in row.approved_paths or []],
+        pushed_sha=row.pushed_sha,
     )
 
 
@@ -300,6 +302,7 @@ _TASK_FIELDS = frozenset(
         "started_at",
         "verdict_nudges",
         "approved_paths",
+        "pushed_sha",
     }
 )
 _MISSION_FIELDS = frozenset(

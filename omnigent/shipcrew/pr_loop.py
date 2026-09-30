@@ -52,7 +52,7 @@ from typing import TYPE_CHECKING, Any
 
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.shipcrew import gh, main_deps
-from omnigent.shipcrew.branches import task_branch
+from omnigent.shipcrew.branches import BRANCH_PREFIX, task_branch
 from omnigent.shipcrew.decisions import merge_decisions, parse_decisions
 from omnigent.shipcrew.policies import paths_outside_owned
 from omnigent.shipcrew.review_policy import (
@@ -894,9 +894,12 @@ class PrLoop:
             return await self._block(
                 ctx, f"developer reported PASS but {ctx.branch} has no commits"
             )
+        if (refused := _unsafe_push_branch(ctx)) is not None:
+            return await self._hold(ctx, refused)
         await self._io(
             _git, ["push", "-u", "origin", f"HEAD:refs/heads/{ctx.branch}"], ctx.worktree
         )
+        pushed = await self._io(_rev, ctx.worktree, "HEAD")
         number = await self._io(gh.pr_for_branch, ctx.repo, ctx.branch)
         if number is None:
             number, url = await self._io(
@@ -917,6 +920,7 @@ class PrLoop:
             branch=ctx.branch,
             ci="pending",
             blocked_reason=None,
+            pushed_sha=pushed,
         )
 
     # ── 2. sync ──
@@ -939,6 +943,7 @@ class PrLoop:
                 blocked_reason=None,
                 review_sha=remote if carry else task.review_sha,
                 human_approved=task.human_approved and clean,
+                pushed_sha=remote,
             )
         if not integrated:
             verdict = await self._developer_verdict(ctx)
@@ -948,15 +953,40 @@ class PrLoop:
                 )
             if verdict[0] != "pass":
                 return await self._block(ctx, f"developer did not pass its fix turn: {verdict[1]}")
+        if (refused := _unsafe_push_branch(ctx)) is not None:
+            return await self._hold(ctx, refused)
+        # The task branch is the loop's own: a developer that rebased it (a CI
+        # fix onto main) rewrote it, so the push may replace the PR head, but
+        # only if the remote is still what the loop last pushed or followed.
+        # A human push since then fails the lease and holds the card.
+        lease = task.pushed_sha or remote
         push = await self._io(
-            _git, ["push", "origin", f"HEAD:refs/heads/{ctx.branch}"], ctx.worktree, check=False
+            _git,
+            [
+                "push",
+                f"--force-with-lease=refs/heads/{ctx.branch}:{lease}",
+                "origin",
+                f"HEAD:refs/heads/{ctx.branch}",
+            ],
+            ctx.worktree,
+            check=False,
         )
         if push.returncode:
             detail = (push.stderr or push.stdout).strip()[-500:]
+            if "stale info" in detail or (remote and remote != lease):
+                return await self._hold(
+                    ctx,
+                    f"push of {ctx.branch} refused: the PR branch moved on GitHub since "
+                    f"shipcrew last pushed it (expected {lease[:8]}, found "
+                    f"{(remote or 'unknown')[:8]}); someone else pushed to it. Bring their "
+                    "commits into the task worktree (or drop them on GitHub), then retry.",
+                )
             return await self._hold(ctx, f"push of {ctx.branch} rejected: {detail}")
         # New commits from this worktree (a developer fix, or the integrator's
         # conflict resolution): the head changed, so review and approval start over.
-        return await self._update(task, ci="pending", blocked_reason=None, human_approved=False)
+        return await self._update(
+            task, ci="pending", blocked_reason=None, human_approved=False, pushed_sha=local
+        )
 
     # ── 3. CI ──
 
@@ -1313,6 +1343,17 @@ class PrLoop:
             await self._stop(ctx, task.reviewer_session_id)
             fields["review_sha"] = None
         return await self._send(ctx, human_feedback_prompt(message), **fields)
+
+
+def _unsafe_push_branch(ctx: _Ctx) -> str | None:
+    """Why the loop must not push ``ctx.branch`` (``None``: it is the task's own).
+
+    The loop force-pushes (with a lease) only its task branch
+    ``shipcrew/<id8>-<slug>``, never the base or any other branch.
+    """
+    if ctx.branch == ctx.base or not ctx.branch.startswith(BRANCH_PREFIX):
+        return f"refusing to push {ctx.branch!r}: not a shipcrew task branch"
+    return None
 
 
 def _replace(ctx: _Ctx, task: Task) -> _Ctx:
