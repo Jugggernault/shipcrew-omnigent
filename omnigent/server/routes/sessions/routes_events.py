@@ -1304,6 +1304,10 @@ def register_events_routes(
             await _resolve_elicitation(session_id, body.data, runner_router, conversation_store)
             # Apply any policy writes deferred by the relay tool-call ASK gate
             # (e.g. a cost-budget checkpoint) now that the verdict is in.
+            # shipcrew fork: an accepted owned-paths ASK is remembered by the merge gate.
+            from omnigent.shipcrew.approvals import notify_accepted_relay_ask
+
+            notify_accepted_relay_ask(request.app, session_id, body.data)
             await _apply_pending_policy_ask_writes(
                 session_id, conv, conversation_store, agent_store, body.data
             )

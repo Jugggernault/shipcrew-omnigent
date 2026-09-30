@@ -1151,13 +1151,16 @@ class TestChildWorkspaces:
         assert workspace != wt
         assert workspace == pr_loop.review_worktree_path(repo, task.id, merged.review_sha or "")
         assert head == merged.review_sha
-        assert stopped_before == 0
         root = task.root_session_id
         assert root is not None
-        # The reviewer was stopped before the developer, which was only stopped
-        # by the merge cleanup; the reviewer checkout is gone afterwards.
-        assert sessions.stopped.index(child_id) < sessions.stopped.index(root)
-        assert sessions.stopped.count(root) == 1
+        # The finished developer was parked once when its PR opened
+        # (SHIPCREW_PARK_IDLE_WORKERS), before the reviewer started; stopping
+        # the reviewer never touches it again: its only other stop is the
+        # merge cleanup, after the reviewer's.
+        assert stopped_before == 1 and sessions.stopped[0] == root
+        last_root = len(sessions.stopped) - 1 - sessions.stopped[::-1].index(root)
+        assert sessions.stopped.index(child_id) < last_root
+        assert sessions.stopped.count(root) == 2
         assert not workspace.exists()
         assert str(workspace) not in git(repo, "worktree", "list")
 
@@ -1408,3 +1411,47 @@ class TestVerdictNudge:
         done = await fresh.require_task(task.id)
         assert done.status == "blocked"
         assert [m[1] for m in sessions.messages] == [pr_loop.VERDICT_NUDGE]
+
+
+# ── parking the idle developer (SHIPCREW_PARK_IDLE_WORKERS) ──
+
+
+class TestParkIdleDeveloper:
+    async def test_parked_when_the_pr_opens_and_after_each_fix_push(
+        self,
+        service: ShipcrewService,
+        sessions: LoopSessions,
+        repo: Path,
+        scheduler: ShipcrewScheduler,
+    ) -> None:
+        def developer(wt: Path, message: str) -> str:
+            commit(wt, "ok", "", "fix CI")
+            return "Added the ok file.\nPASS"
+
+        sessions.developer = developer
+        task, _wt = await start(service, sessions, repo)
+        root = task.root_session_id
+        opened = await run_until(scheduler, service, task.id, lambda t: t.pr_number is not None)
+        # PASS read, branch pushed, PR opened: the finished session is stopped.
+        assert opened.status == "review" and sessions.stopped == [root]
+        # CI red: the fix turn goes to the same (relaunched) session...
+        red = await run_until(scheduler, service, task.id, lambda t: t.ci == "red")
+        assert red.status == "running" and sessions.messages[0][0] == root
+        merged = await run_until(scheduler, service, task.id, status_is("merged"))
+        # ...its fix push parks it again; the merge cleanup stops it last.
+        assert merged.ci_attempts == 1
+        assert sessions.stopped.count(root) == 3
+
+    async def test_off_keeps_the_developer_running(
+        self,
+        service: ShipcrewService,
+        sessions: LoopSessions,
+        repo: Path,
+        scheduler: ShipcrewScheduler,
+    ) -> None:
+        service.settings = dataclasses.replace(service.settings, park_idle_workers=False)
+        task, _wt = await start(service, sessions, repo, files={"src/a.txt": "a\n", "ok": ""})
+        opened = await run_until(scheduler, service, task.id, lambda t: t.pr_number is not None)
+        assert opened.status == "review" and task.root_session_id not in sessions.stopped
+        await run_until(scheduler, service, task.id, status_is("merged"))
+        assert sessions.stopped.count(task.root_session_id) == 1

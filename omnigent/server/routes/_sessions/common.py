@@ -749,6 +749,8 @@ class _PendingPolicyAskWrites:
     from_mcp: bool = False
     reviewed_arguments: dict[str, Any] | None = None
     transformed_arguments: dict[str, Any] | None = None
+    # shipcrew fork: the deciding policy's reason, for the board's approval hook.
+    policy_reason: str | None = None
 
 
 # Workspace-scoped: keyed by a harness elicitation id, which can be

@@ -41,6 +41,10 @@ class TestDoctor:
         chromium = _exe(tmp_path / "opt" / "chromium")
         tools.save("CHROMIUM", str(chromium))
         monkeypatch.delenv("CHROMIUM_PATH", raising=False)
+        monkeypatch.delenv("SHIPCREW_CHROMIUM", raising=False)
+        # No chrome-headless-shell anywhere (test_resources covers the preference).
+        monkeypatch.setenv("PLAYWRIGHT_BROWSERS_PATH", str(tmp_path / "no-browsers"))
+        monkeypatch.setenv("PATH", "/usr/bin:/bin")
         env = tools.session_env()
         assert env["PATH"].split(":")[0] == str(chromium.parent)
         assert env["CHROMIUM_PATH"] == str(chromium)

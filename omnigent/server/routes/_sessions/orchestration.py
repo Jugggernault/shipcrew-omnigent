@@ -8441,6 +8441,7 @@ async def _evaluate_tool_call_policy(
     _pending_policy_ask_writes[elicitation_id] = _PendingPolicyAskWrites(
         state_updates=result.state_updates,
         set_labels=result.set_labels,
+        policy_reason=result.reason,  # shipcrew fork
     )
     return {
         "verdict": "pending",
@@ -10737,6 +10738,7 @@ async def _handle_mcp_tools_call(
                 from_mcp=True,
                 reviewed_arguments=arguments,
                 transformed_arguments=cast("dict[str, object] | None", call_result.data),
+                policy_reason=call_result.reason,  # shipcrew fork
             )
             # The client carries identifiers; reviewed arguments stay on the server.
             request_state_payload: dict[str, Any] = {
