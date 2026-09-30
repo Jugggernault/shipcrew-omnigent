@@ -113,7 +113,8 @@ Measured numbers (SPIKE.md, this branch's k3d proof):
 |---|---|
 | claude-native agent session (claude + runner + MCP bridge + tmux), PSS | **~420–470 MB** |
 | omnigent server + host + zygote | ~345 MB (170 + 145 + 30) |
-| k3s + Traefik + ArgoCD core + 3 tiny app pods (k3d node container, measured) | see "k3d proof" below |
+| k3s + containerd + Traefik + metrics-server + ArgoCD core + 3 tiny app pods (k3d node cgroup `anon`, measured) | **~1.3 GB** |
+| of which ArgoCD core (controller 173-265 Mi, appset 35-39 Mi, repo-server 34-36 Mi, redis 10-12 Mi; `kubectl top`, measured) | ~260-350 MB |
 | cert-manager (3 pods) | ~100 MB (upstream figure, not measured here) |
 | one Next.js preview (limit 256 Mi, request 128 Mi) | 100–250 MB |
 
@@ -141,7 +142,36 @@ into `~/.local/bin` through the tools registry). It creates a throwaway cluster,
 installs ArgoCD core the way the installer does, serves the repo (rendered from the
 real templates) with git-daemon inside the cluster, fakes the GitHub PR API for the
 ApplicationSet, drives `ArgoCDTarget` (preflight, apply, wait, teardown) and deletes
-the cluster at the end. Results: see the proof section added below.
+the cluster at the end.
+
+Proven on this machine (k3d v5.9.0, k3s, ArgoCD v3.5.3 core):
+
+- `ArgoCDTarget.preflight()` passes on the installed cluster; `apply(manifests(...))`
+  creates the Application and the ApplicationSet; `wait_healthy()` returns Synced +
+  Healthy on `ghcr.io/acme/demo:<main sha>` (the overlay after the workflow's exact
+  `sed` bump on `gitops/main`).
+- The app answers through Traefik at `http://demo.127.0.0.1.sslip.io:18080/`
+  (sslip.io host, Ingress from the real template).
+- Auto-sync with no kubectl: a push to `gitops/main` (image bump to v2 + `replicas: 2`)
+  was applied by ArgoCD in 28-210 s over the runs (poll 30 s in the proof, 60 s on
+  the VPS, plus the repo-server's revision cache of up to 3 min). `deploy()` does not
+  depend on it: it annotates a refresh every 60 s while it waits.
+- selfHeal: a manual `kubectl scale --replicas=4` is reverted to 2 in ~3 s.
+- The Pull Request generator (fake GitHub API via `github.api`) creates `demo-pr-7`
+  at the PR head SHA with its image; it answers at `pr-7.demo.127.0.0.1.sslip.io`.
+- `teardown()` deletes the ApplicationSet, the Applications (finalizer: their
+  resources) and the labelled namespaces.
+
+Found by the proof and fixed: ArgoCD **core** does not create the `default`
+AppProject (the API server normally does), so every Application failed with
+"project default which does not exist". The installer now creates it (after
+waiting for the CRDs to be Established), and `preflight()` checks it.
+
+Not proven locally: GitHub Actions (`gitops.yml` build + GHCR push + the
+`gitops/main` push with `GITHUB_TOKEN`), GHCR pulls through `registries.yaml`, the
+real GitHub PR API, cert-manager / Let's Encrypt HTTP-01 on sslip.io, the installer
+itself on a fresh Ubuntu 24.04 / Debian 12 VM (only `bash -n` + shellcheck, and its
+Caddyfile validated with caddy 2.6), the board through Traefik -> caddy.
 
 ## Configuration reference
 

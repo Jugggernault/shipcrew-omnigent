@@ -31,6 +31,11 @@ APP=demo
 step() { printf '\n--- %s\n' "$*"; }
 cleanup() {
   local rc=$?
+  if [[ $rc != 0 ]] && [[ -f $KUBECONFIG ]]; then
+    kubectl -n argocd get applications -o wide 2>/dev/null || true
+    git -C "$WORK/git/demo.git" log --oneline -3 gitops/main 2>/dev/null || true
+    kubectl -n argocd get application demo -o jsonpath='{.status.sync}{"\n"}{.status.conditions}{"\n"}' 2>/dev/null || true
+  fi
   if [[ ${KEEP:-0} != 1 ]]; then
     k3d cluster delete "$CLUSTER" >/dev/null 2>&1 || true
     rm -rf "$WORK"
@@ -48,6 +53,8 @@ until_ok() {
 }
 page() { curl -fsS --max-time 5 --resolve "$1:$PORT:127.0.0.1" "http://$1:$PORT/"; }
 page_has() { page "$1" | grep -q "$2"; }
+# Evaluated on every retry (a "$(...)" argument to until_ok would be evaluated once).
+field_is() { test "$(kubectl -n "$APP" get deploy app -o jsonpath="$1")" = "$2"; }
 
 step "tools (installed via omnigent.shipcrew.tools when missing)"
 "$PY" - <<'EOF'
@@ -128,14 +135,19 @@ k3d cluster create "$CLUSTER" --agents 0 -p "$PORT:80@loadbalancer" \
   -v "$WORK/git:/git@server:0" --kubeconfig-update-default=false --wait --timeout 240s >/dev/null
 k3d kubeconfig get "$CLUSTER" >"$KUBECONFIG"
 # One image per import: a failed tarball import can be reported as success.
+in_node() {
+  docker exec "k3d-$CLUSTER-server-0" crictl images | grep -Eq "(^|/)${1%%:*} +${1##*:} "
+}
 import_image() {
-  k3d image import -c "$CLUSTER" "$1" >/dev/null 2>&1
-  docker exec "k3d-$CLUSTER-server-0" crictl images | grep -q "${1%%:*} *${1##*:} " \
-    || docker exec "k3d-$CLUSTER-server-0" crictl images | grep -q "library/${1%%:*} *${1##*:} "
+  k3d image import -c "$CLUSTER" "$1" >/dev/null 2>&1 || true
+  in_node "$1" && return
+  docker save "$1" | docker exec -i "k3d-$CLUSTER-server-0" ctr -n k8s.io images import - >/dev/null 2>&1
+  in_node "$1"
 }
 for img in scproof:v1 "$IMAGE:$MAIN_SHA" "$IMAGE:$PR_SHA"; do import_image "$img" || { echo "import failed: $img"; exit 1; }; done
 # Big ArgoCD images: the cluster pulls them itself when this import fails.
 import_image "quay.io/argoproj/argocd:$ARGOCD_VERSION" || true
+import_image public.ecr.aws/docker/library/redis:8.2.3-alpine || true
 
 step "git-daemon + fake GitHub API in namespace git"
 PULLS="$(printf '[{"number":7,"title":"a PR","state":"open","head":{"ref":"feat","sha":"%s","repo":{"full_name":"acme/demo"}},"base":{"ref":"main"},"labels":[],"user":{"login":"proof"}}]' "$PR_SHA")"
@@ -157,6 +169,8 @@ spec:
           image: scproof:v1
           imagePullPolicy: Never
           command: [git, daemon, --reuseaddr, --export-all, --base-path=/git, /git]
+          # The repo owner: git refuses a repo owned by another uid ("dubious ownership").
+          securityContext: { runAsUser: $(id -u) }
           ports: [{ containerPort: 9418 }]
           volumeMounts: [{ name: git, mountPath: /git }]
         - name: github
@@ -182,6 +196,8 @@ step "ArgoCD core $ARGOCD_VERSION (as the VPS installer does)"
 kubectl create namespace argocd --dry-run=client -o yaml | kubectl apply -f - >/dev/null
 kubectl apply -n argocd --server-side --force-conflicts \
   -f "https://raw.githubusercontent.com/argoproj/argo-cd/$ARGOCD_VERSION/manifests/core-install.yaml" >/dev/null
+until_ok 120 kubectl wait --for=condition=Established --timeout=10s crd/appprojects.argoproj.io \
+  crd/applications.argoproj.io crd/applicationsets.argoproj.io
 kubectl apply -f - >/dev/null <<'EOF'
 apiVersion: argoproj.io/v1alpha1
 kind: AppProject
@@ -193,9 +209,9 @@ spec:
 EOF
 kubectl -n argocd patch cm argocd-cm --type merge -p '{"data":{"timeout.reconciliation":"30s"}}' >/dev/null
 kubectl -n argocd rollout restart statefulset argocd-application-controller >/dev/null
-kubectl -n argocd rollout status statefulset argocd-application-controller --timeout=300s >/dev/null
-kubectl -n argocd rollout status deploy argocd-applicationset-controller --timeout=300s >/dev/null
-kubectl -n argocd rollout status deploy argocd-repo-server --timeout=300s >/dev/null
+kubectl -n argocd rollout status statefulset argocd-application-controller --timeout=600s >/dev/null
+kubectl -n argocd rollout status deploy argocd-applicationset-controller --timeout=600s >/dev/null
+kubectl -n argocd rollout status deploy argocd-repo-server --timeout=600s >/dev/null
 kubectl -n argocd create secret generic shipcrew-github --from-literal=token=fake \
   --dry-run=client -o yaml | kubectl apply -f - >/dev/null
 
@@ -227,7 +243,9 @@ EOF
 }
 run_target apply
 run_target wait demo "$IMAGE:$MAIN_SHA"
-page_has "$APP.$DOMAIN" "demo v1" && echo "ingress: $(page "$APP.$DOMAIN")"
+# Healthy can precede Traefik picking up the Ingress by a few seconds.
+until_ok 60 page_has "$APP.$DOMAIN" "demo v1"
+echo "ingress: $(page "$APP.$DOMAIN")"
 
 step "auto-sync: push an image bump (v2) + replicas 2 to gitops/main, no kubectl"
 docker tag scproof:v2 "$IMAGE:v2-proof"
@@ -240,14 +258,17 @@ EOF
 g commit -qam "replicas 2"
 bump v2-proof
 t0=$SECONDS
-until_ok 240 page_has "$APP.$DOMAIN" "demo v2"
-until_ok 120 test "$(kubectl -n $APP get deploy app -o jsonpath='{.status.readyReplicas}')" = 2
+until_ok 480 field_is '{.spec.template.spec.containers[0].image}' "$IMAGE:v2-proof"
+kubectl -n $APP rollout status deploy app --timeout=120s >/dev/null
+until_ok 120 field_is '{.status.readyReplicas}' 2
+until_ok 60 page_has "$APP.$DOMAIN" "demo v2"
 echo "applied by ArgoCD in $((SECONDS - t0)) s: $(page "$APP.$DOMAIN"), readyReplicas=2"
 
 step "selfHeal: a manual scale to 4 is reverted to 2"
 kubectl -n $APP scale deploy app --replicas=4 >/dev/null
-until_ok 120 test "$(kubectl -n $APP get deploy app -o jsonpath='{.spec.replicas}')" = 2
-echo "reverted to $(kubectl -n $APP get deploy app -o jsonpath='{.spec.replicas}')"
+t0=$SECONDS
+until_ok 300 field_is '{.spec.replicas}' 2
+echo "after $((SECONDS - t0)) s reverted to $(kubectl -n $APP get deploy app -o jsonpath='{.spec.replicas}')"
 
 step "PR preview from the ApplicationSet (fake GitHub API: PR #7)"
 until_ok 180 kubectl -n argocd get application demo-pr-7

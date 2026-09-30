@@ -194,6 +194,12 @@ argocd_core() {
   kc apply -n argocd --server-side --force-conflicts \
     -f "https://raw.githubusercontent.com/argoproj/argo-cd/$ARGOCD_VERSION/manifests/core-install.yaml" >/dev/null
   # The API server (not in core) is what normally creates the `default` project.
+  # Right after the apply a CRD may have no status yet: `wait` errors, so retry.
+  for _ in $(seq 1 60); do
+    kc wait --for=condition=Established --timeout=10s crd/appprojects.argoproj.io \
+      crd/applications.argoproj.io crd/applicationsets.argoproj.io >/dev/null 2>&1 && break
+    sleep 2
+  done
   kc apply -f - >/dev/null <<EOF
 apiVersion: argoproj.io/v1alpha1
 kind: AppProject
