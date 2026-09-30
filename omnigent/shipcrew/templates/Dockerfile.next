@@ -1,6 +1,6 @@
-# Production image, Next.js `output: "standalone"` (shipcrew). Multi-stage: the
-# runtime is bare Alpine + the node binary + the traced server: no npm, no dev
-# dependencies, no source maps, non-root. Budget: < 150 MB.
+# Production image: Next.js standalone on bare Alpine + the node binary
+# (no npm, no dev dependencies, no source maps, non-root). Budget < 200 MB.
+# Same file as the scaffolder bundle writes (shipcrew agents/scaffolder/ROLE.md).
 FROM node:22-alpine AS build
 WORKDIR /app
 ENV CI=1 NEXT_TELEMETRY_DISABLED=1

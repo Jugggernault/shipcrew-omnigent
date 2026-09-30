@@ -11,6 +11,171 @@ live end-to-end run: 2026-09-29.
 ![Card held for a human merge approval (APPROVALS.md)](board-approval.png)
 ![Drawer with the Approve merge action](drawer-approval.png)
 
+## Deploy without Vercel: docker target, live URL from the first merge (2026-09-30)
+
+Branch `shipcrew-deploy` (bundles: shipcrew `v3-deploy`). The app is
+containerized and run by the server itself, deterministically (no agent, no
+approval), and gets a public HTTPS URL with no account and no key. The URL
+exists as soon as Foundation merges and follows every later merge.
+
+- **Deploy targets** (`omnigent/shipcrew/deploy_targets/`): `base.py` is the
+  interface (`DeployTarget`: `name`, `server_side`, `preflight() -> str|None`,
+  `deploy(DeployContext) -> DeployResult(url, note, detail)`, `refresh(mission)
+  -> url|None`, `teardown(mission)`; `DeployContext` = mission id, slug,
+  title, repo path/url, commit sha, clean detached worktree of `origin/main`,
+  `final`; `DeployError(kept_previous=)`), `__init__.py` the registry
+  (`TARGETS` name -> `module:Class`, lazily imported, so `argocd.py` only has
+  to exist). `SHIPCREW_DEPLOY_TARGET` = `auto` (default from the env: docker
+  when `docker info` answers, else vercel when logged in, else docker, whose
+  preflight says what is missing) | `docker` | `vercel` | `argocd`. A
+  directly built `ShipcrewSettings` keeps `vercel` (tests, embedders: no side
+  effect). The `vercel` target is the round 4 ship moved as is (agent target:
+  `agent_role = devops`, `agent_prompt`, same preflight, prompt, reply parser;
+  `ship.py` re-exports the old names).
+- **docker target** (`docker.py`, server-side): builds
+  `shipcrew/<slug>:<sha12>` (slug = `<repo-name>-<mission id 6>`, one DNS
+  label) from the worktree with the repo's `Dockerfile` (a repo without one
+  gets `templates/Dockerfile.node` + `templates/dockerignore`, with a note);
+  runs `shipcrew-<slug>-next` with `--restart unless-stopped --memory 384m
+  --cpus 1 --pids-limit 256` on a free `127.0.0.1` port; waits for `GET /` <
+  400 (`SHIPCREW_DEPLOY_HEALTH_TIMEOUT_S`, 90); then routes the public URL to
+  it, removes the old `shipcrew-<slug>` and renames the new one to it. An
+  unhealthy or failed build is removed and the old container keeps serving.
+  Keeps 2 images per mission. The same commit already running and healthy
+  skips the build. State in `SHIPCREW_DEPLOY_STATE_DIR`
+  (`~/.local/state/shipcrew/deploy/<slug>/`).
+- **Public URL, tunnel mode (default)** (`expose.py`, `forward.py`): per
+  mission a detached stdlib TCP forwarder on a stable front port (reads the
+  current container port from a file on every connection) and one Cloudflare
+  quick tunnel `cloudflared tunnel --no-autoupdate --url
+  http://127.0.0.1:<front>` (no account, no key) whose
+  `https://<random>.trycloudflare.com` is parsed from its log. A swap only
+  rewrites the upstream file: the URL lives as long as the tunnel process.
+  Both run in their own session (they outlive a server restart and are
+  adopted again by pid + command line from their state file) and are
+  supervised: `refresh` (every 15 s per live mission) restarts a dead one; a
+  restarted tunnel gets a new URL, stored and pushed to the board.
+- **Public URL, VPS mode**: `SHIPCREW_PUBLIC_BASE_DOMAIN=<vps-ip>.sslip.io`
+  (sslip.io / nip.io: free wildcard DNS by IP, no account) serves
+  `https://<slug>.<domain>` through Caddy (automatic Let's Encrypt): one
+  snippet per mission `<SHIPCREW_CADDY_SITES_DIR>/<slug>.caddy`
+  (`reverse_proxy 127.0.0.1:<container port>`, rewritten on each swap), then
+  `caddy reload --config $SHIPCREW_CADDYFILE --adapter caddyfile`. Caddy is
+  installed by the VPS script, not by shipcrew; its Caddyfile must
+  `import <sites dir>/*.caddy` (use a sites dir the caddy user can read,
+  e.g. `SHIPCREW_CADDY_SITES_DIR=/etc/caddy/shipcrew` owned by the server
+  user). Without a caddy binary the target falls back to quick tunnels (logged).
+- **Mission preview** (`omnigent/shipcrew/preview.py`, migration `sc0008pv`,
+  `Mission.preview` JSON, API `preview {status idle|deploying|live|failed,
+  url, sha, updated_at, live_since, error, target, deploying_sha}`): each
+  scheduler tick (after the merges, before the ship) a server-side target
+  deploys `main` when the set of merged tasks changed: the FIRST merge
+  (Foundation) deploys at once, later ones after `SHIPCREW_PREVIEW_DEBOUNCE_S`
+  (20 s, restarted by each merge: a burst deploys once). One deploy at a
+  time per mission (lock + in-flight task), `SHIPCREW_DEPLOY_PARALLEL` (2)
+  builds across missions. The public URL is verified by the server
+  (`verify_url`, same rules as the ship) before `live`. A failed redeploy
+  stays `live` on the old version with `error` set; no retry loop (the next
+  merge, `POST /missions/{id}/preview` or the ship retries).
+  `DELETE /missions/{id}/preview` tears everything down (containers, images,
+  tunnel, forwarder, Caddy snippet) and stops redeploys; `POST` resumes.
+  Restart-safe: `merged_key` is written only when a deploy ends, so a deploy
+  cut off by a restart runs again. `SHIPCREW_PREVIEW=0` turns it off.
+- **Ship stage**: for a server-side target no devops session and no devops
+  bundle: `ship.start` -> `preview.deploy_now(final=True)` (the last
+  redeploy) -> `verifying` -> report. A restart with `ship.status=deploying`
+  simply runs it again. The report adds `Live since: <first deploy>`, and
+  `Last deploy: <target>, commit, build/start/deploy time, image MB`. The
+  vercel target is unchanged.
+- **Board**: `LivePreviewChip` under the mission title: `Live: <host>` (new
+  tab), deployed sha, "4m ago" (title: live since, deploy time, target);
+  spinner + `deploying <sha>…` during a redeploy; "last deploy failed" when
+  the old version still serves; "Deploying the first version…" before the
+  first URL. Missions poll while a preview deploys (SSE `mission.updated`
+  otherwise).
+- **Tools** (`tools.py`): `CLOUDFLARED` (`python -m omnigent.shipcrew.tools
+  --fix` downloads the official static binary from GitHub releases
+  (`cloudflared-linux-<arch>`, ELF-checked) to `~/.local/bin`, like gh),
+  `CADDY` (optional, resolved only), `DOCKER` (required for the docker
+  target), `VERCEL` required only for `SHIPCREW_DEPLOY_TARGET=vercel`. Env
+  overrides `SHIPCREW_DOCKER`, `SHIPCREW_CLOUDFLARED`, `SHIPCREW_CADDY`.
+- **Bundles** (shipcrew `v3-deploy`): scaffolder step 8 writes exactly two
+  deploy files, `Dockerfile` (verbatim: multi-stage, Next.js standalone on
+  bare `alpine:3.22` + the node binary + libstdc++, non-root uid 10001, no
+  npm / dev dependencies / source maps, HEALTHCHECK) and `.dockerignore`, and
+  sets `output: "standalone"`; runtime deps only in `dependencies`; never
+  runs docker. Planner: Foundation is the first deploy (build passes, `/`
+  renders the real shell, no env var needed; owns `Dockerfile`,
+  `.dockerignore`); no deploy task. devops: only for agent targets.
+- **CI template** (`templates/ci.yml`): the build step appends the Next.js
+  first-load JS shared by all routes (gzip of `rootMainFiles` in
+  `.next/build-manifest.json`) to the job summary; a `docker build + image
+  size budget` step (when a Dockerfile exists) builds the production image,
+  reports its size and WARNS above `vars.SHIPCREW_IMAGE_BUDGET_MB` (200).
+  Warn, not fail, by default: a red check spends the task's 3 CI-fix
+  attempts and parks the card on a human for a weight regression, the
+  opposite of zero-human; `vars.SHIPCREW_IMAGE_BUDGET_ENFORCE=1` fails
+  instead.
+
+### Verified for real (docker 29 + a real quick tunnel, this machine)
+
+The built demo `shipcrew-demo-web-4` (Next.js 16 polls app, pnpm) copied to a
+scratch dir, the scaffolder's Dockerfile + .dockerignore added,
+`output: "standalone"`; a script calls `DockerTarget.deploy` twice (two
+commits) then `teardown`:
+
+- first deploy: `https://closure-schools-rentals-evaluation.trycloudflare.com`,
+  public `GET /` 200 (13 kB, title "Mini-sondages"), public `GET /api/polls`
+  200 `application/json` with the seeded polls. Build 1.1 s (layer cache of
+  an earlier build of the same Dockerfile), container healthy 0.8 s after
+  `docker run`, tunnel URL printed 6.7 s after start, first public 200 19.9 s
+  after that (edge DNS).
+- second deploy (source changed, install layer cached): build 73.6 s, start
+  0.8 s, **same URL** after the swap, public `/` 200 on the new commit, one
+  container left.
+- cold build (nothing cached, npm registry at ~40 kB/s here): 8 min 13 s,
+  almost all `pnpm install`.
+- image: 66.1 MB compressed (containerd store `Size`), ~185 MB unpacked
+  (`docker images`: 251 MB incl. content): alpine 9 MB + libstdc++ 3 MB +
+  node binary 129 MB + traced app 43 MB (next 17 MB, sharp/libvips 18 MB).
+  The node binary is the floor: < 150 MB unpacked is not reachable with
+  Node; the budget is 200 MB.
+- idle container: 42.5 MiB of the 384 MiB limit, 0 % CPU.
+- teardown: no container, image, tunnel or forwarder left.
+
+On this machine the docker bridge network timed out on registry.npmjs.org
+during `docker build` (ETIMEDOUT) while the host network worked:
+`SHIPCREW_DOCKER_BUILD_NETWORK=host` passes `--network host` to the build.
+Docker 29 here has no buildx: the legacy builder builds the multi-stage file.
+
+### Checks (deploy)
+
+`uv run ruff check omnigent/shipcrew tests/shipcrew` and `ruff format`,
+`uv run pyrefly check` (0 errors), `uv run pytest tests/shipcrew
+tests/server/test_shipcrew_mount.py tests/server/test_shipcrew_child_runner.py
+tests/test_native_policy_hook.py tests/test_claude_native_bridge.py`: 1494
+passed (new: `test_deploy_docker.py` 21 with fake docker / cloudflared /
+caddy executables whose containers are real HTTP servers, `test_preview.py`
+13). Web: `npm run lint`, `type-check`, `build` green; `vitest run
+src/board src/pages/Board*` 14 files green (new `MissionPreview.test.tsx`,
+9); `src/pages/CanvasPage.test.tsx` fails the same 18 tests on the base
+commit (environment, not this change). Bundles: `build_agents.py --check`,
+`validate_agents.py`: 10 bundles valid.
+
+### Known gaps (deploy)
+
+- Quick tunnels are Cloudflare's no-SLA testing tunnels: a restarted tunnel
+  (reboot, crash) gets a new random URL (stored and shown, but links shared
+  earlier die). VPS mode with a domain gives a stable URL.
+- The ship stage's `ship_url` follows a new tunnel URL only for a finished
+  ship (`done`); the preview is the source of truth.
+- A restart during a build leaves a half-built image layer cache and a
+  `-next` container at most (removed by the next deploy).
+- Several missions share the host's Docker: CPU/memory limits are per
+  container, builds are capped by `SHIPCREW_DEPLOY_PARALLEL`.
+- A new `sc0008pv` head: parallel rounds adding their own revision must
+  rechain `down_revision`.
+
 ## Round 7: refuse with a hint, ask only for real decisions (2026-09-30)
 
 Branch `shipcrew-round7` (bundles: shipcrew `v3-round7`). Live run 3 shipped
