@@ -242,7 +242,9 @@ class TestExpansionScanner:
             ("echo '$HOME'", False),
             ("echo $HOME", True),
             ('echo "${PORT:-3000}"', True),
-            ("echo $'\\x41'", True),
+            # a decodable ANSI-C string is a literal (round 8); \c is not modelled
+            ("echo $'\\x41'", False),
+            ("echo $'\\cA'", True),
             ("git reset --{ha,}rd", True),
         ],
     )

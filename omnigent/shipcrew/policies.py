@@ -366,6 +366,49 @@ def _normalize_program(argv: list[str]) -> list[str]:
 
 
 _GLOB_CHARS = frozenset("*?[")
+_ANSI_C_SIMPLE = {
+    "n": "\n", "t": "\t", "r": "\r", "a": "\a", "b": "\b", "f": "\f", "v": "\v",
+    "e": "\x1b", "E": "\x1b", "\\": "\\", "'": "'", '"': '"', "?": "?",
+}  # fmt: skip
+_ANSI_C_HEX = {"x": 2, "u": 4, "U": 8}
+
+
+def _ansi_c_literal(text: str, start: int) -> tuple[str, int] | None:
+    """Decode the ANSI-C string ``$'..'`` whose ``'`` is at *start*.
+
+    :returns: ``(value, end)`` (*end* just past the closing quote), or
+        ``None`` for an escape not modelled here (``\\c``), a NUL, a value
+        holding a ``'`` (it could not be re-quoted) or no closing quote.
+    """
+    out: list[str] = []
+    i = start + 1
+    while i < len(text):
+        c = text[i]
+        if c == "'":
+            value = "".join(out)
+            return None if "'" in value or "\0" in value else (value, i + 1)
+        if c != "\\":
+            out.append(c)
+            i += 1
+            continue
+        esc = text[i + 1 : i + 2]
+        if esc in _ANSI_C_SIMPLE:
+            out.append(_ANSI_C_SIMPLE[esc])
+            i += 2
+        elif esc in _ANSI_C_HEX:
+            m = re.match(rf"[0-9a-fA-F]{{1,{_ANSI_C_HEX[esc]}}}", text[i + 2 :])
+            if m is None:
+                return None
+            out.append(chr(int(m.group(0), 16)))
+            i += 2 + m.end()
+        elif esc and esc in "01234567":
+            m = re.match(r"[0-7]{1,3}", text[i + 1 :])
+            assert m is not None
+            out.append(chr(int(m.group(0), 8)))
+            i += 1 + m.end()
+        else:
+            return None
+    return None
 
 
 def _scan_expansions(text: str) -> tuple[str, str]:
@@ -374,7 +417,7 @@ def _scan_expansions(text: str) -> tuple[str, str]:
     :returns: ``(marked, kind)``. *kind* is ``""`` (no expansion), ``"param"``
         (only ``$NAME`` / ``${NAME}`` / ``${NAME:-literal}`` outside single
         quotes; in *marked* each such ``$`` is :data:`EXPANSION_MARK`) or
-        ``"other"``: ANSI-C quoting (``$'..'``), a complex ``${..}``, a
+        ``"other"``: an ANSI-C string (``$'..'``) this cannot decode, a complex ``${..}``, a
         positional parameter, unquoted brace expansion (``--{ha,}rd``) or an
         unquoted glob in an option word (``--ha?d``), which turn a word the
         allowlist saw into another one. The special parameters ``$?``,
@@ -399,6 +442,16 @@ def _scan_expansions(text: str) -> tuple[str, str]:
         if c == "\\":
             out.append(text[i : i + 2])
             i += 2
+            word_start = False
+            continue
+        if c == "$" and quote is None and text[i + 1 : i + 2] == "'":
+            # ANSI-C quoting (``grep -c $'\\u00a0' f``) is a literal: re-quote
+            # its decoded value so the allowlist sees the word the shell runs.
+            decoded = _ansi_c_literal(text, i + 1)
+            if decoded is None:
+                return text, "other"
+            out.append("'" + decoded[0] + "'")
+            i = decoded[1]
             word_start = False
             continue
         if c == "$" and i + 1 < len(text) and not text[i + 1].isspace() and text[i + 1] != '"':
