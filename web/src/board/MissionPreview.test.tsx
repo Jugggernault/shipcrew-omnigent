@@ -67,9 +67,7 @@ describe("LivePreviewChip", () => {
   });
 
   it("says when the last redeploy failed but the old version still serves", () => {
-    render(
-      <LivePreviewChip mission={withPreview({ error: "docker build failed" })} nowS={NOW} />,
-    );
+    render(<LivePreviewChip mission={withPreview({ error: "docker build failed" })} nowS={NOW} />);
     const chip = screen.getByTestId("live-preview-chip");
     expect(chip).toHaveAttribute("data-state", "stale");
     expect(chip).toHaveTextContent("last deploy failed");
