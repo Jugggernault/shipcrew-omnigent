@@ -3,11 +3,13 @@
 * a read-only grep chain with an ANSI-C string (``grep -c $'\\u00a0' f``) is
   ALLOW for read-only roles (it asked "substitutions, heredocs ...");
 * a first turn the runner rejects (``runner_error``) before any agent output
-  is re-sent once, and the session keeps reading as ``running``.
+  is re-sent (up to three times, round 10), and the session keeps reading as
+  ``running``.
 """
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -82,7 +84,7 @@ Started = tuple[_StubApp, OmnigentSessionService, RootSessionRequest]
 def started(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> tuple[_StubApp, OmnigentSessionService, RootSessionRequest]:
-    monkeypatch.setattr(sessions_mod, "_FIRST_TURN_RETRY_BACKOFF_S", 0.0)
+    monkeypatch.setattr(sessions_mod, "_FIRST_TURN_RETRY_BACKOFFS_S", (0.0, 0.0, 0.0))
     bundle = tmp_path / "planner"
     bundle.mkdir()
     (bundle / "config.yaml").write_text("name: planner\n")
@@ -98,7 +100,7 @@ def _prompts(stub: _StubApp) -> list[str]:
 
 
 class TestFirstTurnRetry:
-    async def test_runner_error_before_output_is_resent_once(
+    async def test_runner_error_before_output_is_resent(
         self, started: Started, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         stub, service, request = started
@@ -111,11 +113,52 @@ class TestFirstTurnRetry:
         snap = await service.snapshot(session_id, acting_user=None)
         assert snap is not None and snap.status == "running"
         assert len(_prompts(stub)) == 2
-        # a failure that outlives the grace is real: reported, not re-sent again
+        # the re-sent turn reached the runner, then failed again: a new re-send
+        stub.session_body = {"status": "running"}
+        await service.snapshot(session_id, acting_user=None)
+        stub.session_body = dict(RUNNER_204)
+        snap = await service.snapshot(session_id, acting_user=None)
+        assert snap is not None and snap.status == "running"
+        assert len(_prompts(stub)) == 3
+        # a failure that outlives the grace is new too, until the budget is spent
         monkeypatch.setattr(sessions_mod, "_FIRST_TURN_RETRY_GRACE_S", 0.0)
         snap = await service.snapshot(session_id, acting_user=None)
+        assert snap is not None and snap.status == "running"
+        assert len(_prompts(stub)) == 4
+        snap = await service.snapshot(session_id, acting_user=None)
         assert snap is not None and (snap.status, snap.error_code) == ("failed", "runner_error")
-        assert len(_prompts(stub)) == 2
+        assert len(_prompts(stub)) == 4
+        snap = await service.snapshot(session_id, acting_user=None)
+        assert snap is not None and snap.status == "failed" and len(_prompts(stub)) == 4
+
+    async def test_resends_wait_their_backoff(
+        self, started: Started, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        stub, service, request = started
+        monkeypatch.setattr(sessions_mod, "_FIRST_TURN_RETRY_BACKOFFS_S", (2.0, 5.0, 10.0))
+        monkeypatch.setattr(sessions_mod, "_FIRST_TURN_RETRY_GRACE_S", 0.0)
+        clock = [100.0]
+        monkeypatch.setattr(sessions_mod, "_clock", lambda: clock[0])
+        session_id = await service.create_root_session(request)
+        stub.session_body, stub.latest_items = dict(RUNNER_204), [USER_ITEM]
+        caplog.set_level(logging.INFO, logger="omnigent.shipcrew.sessions")
+        sent_at: list[float] = []
+        for _ in range(40):
+            before = len(_prompts(stub))
+            snap = await service.snapshot(session_id, acting_user=None)
+            assert snap is not None
+            if len(_prompts(stub)) > before:
+                sent_at.append(clock[0])
+            if snap.status == "failed":
+                break
+            assert snap.status == "running"
+            clock[0] += 1.0
+        # each re-send 2, 5, then 10 s after its failure was seen; then reported
+        assert sent_at == [102.0, 108.0, 119.0]
+        assert snap.status == "failed"
+        infos = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO]
+        assert any("re-send 1/3 in 2s" in m for m in infos)
+        assert any("re-sent (3/3)" in m for m in infos)
 
     @pytest.mark.parametrize(
         ("error", "items"),

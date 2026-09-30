@@ -4,6 +4,52 @@ Fork branch `shipcrew-r9` (bundles: shipcrew `v3-r9`). Design:
 `shipcrew/PROPOSAL-v3.md`. Last live end-to-end run: 2026-09-30 (r9 smoke,
 below). The dated sections after this one are the history of each round.
 
+## Round 10: the planner's first turn after a restart (2026-09-30)
+
+Live runs 5 and 6 lost every planner start after a server restart: runner log
+`POST http://harness.local/.../events "204 No Content"`, then `harness
+rejected turn delivery ... status 204` and `turn failed (status 204)`.
+
+- **Root cause (runner, upstream code).** Two turns were started for the one
+  first prompt. shipcrew waits for the runner to read `online`, which happens
+  when its tunnel connects, before the server's connect-hook session init
+  (no `suppress_recovery_turn`) has finished. The server then forwards the
+  prompt at once (no init wait: the runner is connected). Init's history load
+  saw the already persisted prompt and started a `history_resume` turn while
+  the forward, still loading its own history, had not yet taken the turn slot,
+  so it started a second turn. The claude-sdk harness scaffold folds a second
+  `message` POST into the active turn as an injection and answers 204
+  (`_scaffold._start_or_inject_turn`); the runner's `proxy_stream` treats any
+  non-200 as a failed turn and published `failed` while the first turn was
+  actually running. The three "gateway routing" lines were init's harness
+  spawn plus the two turns.
+- **Fix** (`omnigent/runner/app.py`, `_initialize_session`, 9 lines): a message
+  delivery that arrived during init, or is still being ingested
+  (`_ingest_next_seq` vs `_ingest_now_serving`), counts as `execution_seen`,
+  so the history heuristic starts nothing and the forward is the only trigger
+  (the same contract as `suppress_recovery_turn`). Test:
+  `tests/runner/test_suppress_recovery_turn.py::test_forward_in_flight_during_initialization_suppresses_history_resume`
+  (fails without the fix: two harness turns).
+- **First-turn retry, more robust** (`OmnigentSessionService._retry_first_turn`):
+  up to three re-sends, after 2, 5 and 10 s (non-blocking: the snapshot reads
+  `running` until the next one is due), logged at INFO (`re-send 1/3 in 2s`,
+  `re-sent (1/3)`). A failure after the session read non-failed again, or
+  after the 30 s grace, is a new one and schedules the next re-send. The
+  planner uses it (`planner.start` -> `create_root_session`, `sync` ->
+  `snapshot`). Why round 8's retry never fired live: the real (first) turn
+  kept running and produced agent items, so `_has_output` was true and the
+  failure was reported as is.
+- **Proof** (own stack, port 16791, fresh `shipcrew_stack.sh start` before each
+  planner start): without the runner fix 2 of 3 starts got the 204 and a
+  `failed` session; with it 3 of 3 started one harness turn (`200 OK`, no 204
+  turn, session `running`), two of them in the racing order (init finished
+  before the forward's turn start); the third run's plan went on to
+  `imported` (1 task).
+- Checks: ruff, pyrefly (0 errors); tests/shipcrew, shipcrew mount/child
+  runner, runner session-init tests green. `tests/runner` has 19 failures that
+  fail the same way without this change (native model options, sub-agent
+  bundle env, native tool metadata).
+
 ## Current state (round 9 integration, 2026-09-30)
 
 `shipcrew-r9` = round 8 + deploy + headless + gitops; `v3-r9` = the matching

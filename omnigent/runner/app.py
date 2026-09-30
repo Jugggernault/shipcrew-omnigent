@@ -4125,6 +4125,13 @@ def create_runner_app(
         initially_active = session_id in _active_turns or resource_registry.session_turn_is_active(
             session_id
         )
+        # A message delivery arriving while init runs is execution too: the
+        # connect hook's init (no suppress flag) and a server forward can race
+        # when the runner reads online before init finishes. Without this the
+        # history heuristic starts a turn for the forward's persisted message
+        # while the forward starts its own; the second harness POST is folded
+        # into the first as an injection (204) and fails its turn.
+        initial_ingest_seq = _ingest_next_seq.get(session_id, 0)
 
         # Captured before init's first await: the legacy (no-envelope) context
         # load below probes the server's version over the network, so a reset
@@ -4738,6 +4745,8 @@ def create_runner_app(
             initially_active
             or _turn_bind_epoch.get(session_id) != initial_turn_epoch
             or resource_registry.session_activity_epoch(session_id) != initial_native_activity
+            or _ingest_next_seq.get(session_id, 0) != initial_ingest_seq
+            or _ingest_next_seq.get(session_id, 0) > _ingest_now_serving.get(session_id, 0)
         )
         recovery_turn = "none"
         if history and not execution_seen and session_id not in _active_turns:

@@ -537,3 +537,67 @@ async def test_native_activity_during_initialization_distinguishes_turns_from_re
         assert len(harness.posted_bodies) == int(startup_repaint is not None)
         assert (await client.post("/v1/sessions", json=payload)).status_code == 201
         assert len(harness.posted_bodies) == int(startup_repaint is not None)
+
+
+@pytest.mark.asyncio
+async def test_forward_in_flight_during_initialization_suppresses_history_resume(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A message forward still being ingested when init checks history wins.
+
+    Live (shipcrew planner, claude-sdk): the runner read online before the
+    connect hook's init (no suppress flag) finished, so the server forwarded
+    the first prompt at once. Init's history load saw the persisted prompt and
+    started a ``history_resume`` turn while the forward, still loading its own
+    history, started a second one; the harness folded that second POST into
+    the first turn as an injection (204) and the runner failed the turn.
+    """
+    from omnigent.runner.app import _session_histories_ref
+
+    _session_histories_ref.pop(SESSION_ID, None)  # the forward loads its own history
+    init_paused, init_release = asyncio.Event(), asyncio.Event()
+    forward_paused, forward_release = asyncio.Event(), asyncio.Event()
+
+    class PausedHistoryServer(_HistoryServerClient):
+        calls = 0
+
+        async def get(self, url: str, **kwargs: Any) -> Any:
+            response = await super().get(url, **kwargs)
+            if url.endswith(f"/{SESSION_ID}/items"):
+                PausedHistoryServer.calls += 1
+                if PausedHistoryServer.calls == 1:
+                    init_paused.set()
+                    await init_release.wait()
+                elif PausedHistoryServer.calls == 2:
+                    forward_paused.set()
+                    await forward_release.wait()
+            return response
+
+    app, _pm, harness = _build_sdk_app(PausedHistoryServer())
+    caplog.set_level(logging.INFO, logger="omnigent.runner.app")
+    async with _runner_client(app) as client:
+        init = asyncio.create_task(
+            client.post("/v1/sessions", json=_session_init_payload(suppress_recovery_turn=False))
+        )
+        await asyncio.wait_for(init_paused.wait(), timeout=5)
+        forward = asyncio.create_task(
+            client.post(
+                f"/v1/sessions/{SESSION_ID}/events",
+                json={
+                    "type": "message",
+                    "agent_id": AGENT_ID,
+                    "content": [{"type": "input_text", "text": "hello from history"}],
+                    "persisted_item_id": "msg_001",
+                },
+            )
+        )
+        await asyncio.wait_for(forward_paused.wait(), timeout=5)
+        init_release.set()
+        assert (await init).status_code == 201
+        assert _init_rows(caplog)[0]["recovery_turn"] == "none"
+        forward_release.set()
+        assert (await forward).status_code == 202
+        turn = app.state.active_turns.get(SESSION_ID)
+        if turn is not None:
+            await asyncio.wait_for(turn, timeout=5)
+    assert len(harness.posted_bodies) == 1, "init and the forward both started a turn"

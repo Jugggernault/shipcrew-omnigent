@@ -20,6 +20,7 @@ import re
 import tarfile
 import tempfile
 import threading
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -40,13 +41,20 @@ _RUNNER_ONLINE_TIMEOUT_S = 60.0
 _RUNNER_POLL_S = 0.25
 # A first turn the runner rejects before any agent output (live: claude-sdk's
 # "turn failed (status 204)", code runner_error, a duplicate-delivery race
-# right after session create) is re-sent once after this pause.
+# right after session create) is re-sent, after each of these pauses in turn
+# (non-blocking: the snapshot reads "running" until the next re-send is due).
 _FIRST_TURN_RETRY_CODE = "runner_error"
-_FIRST_TURN_RETRY_BACKOFF_S = 2.0
-# After the re-send, a still-"failed" snapshot is the stale first failure for
-# this long (the retried turn has not reached the runner yet).
+_FIRST_TURN_RETRY_BACKOFFS_S = (2.0, 5.0, 10.0)
+# After a re-send, a still-"failed" snapshot is the stale previous failure for
+# this long, unless the session was seen non-failed since (the retried turn
+# reached the runner): a failure after that is a new one.
 _FIRST_TURN_RETRY_GRACE_S = 30.0
 _TRUST_LOCK = threading.Lock()
+
+
+def _clock() -> float:
+    """Monotonic seconds for the first-turn re-send schedule (patched in tests)."""
+    return time.monotonic()
 
 
 class SessionServiceError(RuntimeError):
@@ -676,9 +684,12 @@ class OmnigentSessionService:
             if response.status_code >= 400:
                 raise SessionServiceError(f"session read failed: {_error_detail(response)}")
             snap = snapshot_from_payload(response.json())
-            if snap.status == "failed" and session_id in self._first_prompts:
+            first = self._first_prompts.get(session_id)
+            if first is not None and snap.status == "failed":
                 headers = self._auth_headers(acting_user)
                 return await self._retry_first_turn(client, session_id, snap, headers)
+            if first is not None:
+                first.sent_at = None  # a re-sent turn reached the runner
             if snap.status != "idle":
                 return snap
             # An idle root may still be waiting on background agents / shells.
@@ -710,39 +721,66 @@ class OmnigentSessionService:
         snap: SessionSnapshot,
         headers: dict[str, str],
     ) -> SessionSnapshot:
-        """Re-send a first prompt the runner rejected before any agent output, once.
+        """Re-send a first prompt the runner rejected before any agent output.
 
-        The session then reads as ``running`` (a plan stays ``running``, a card
-        is not failed); a failure after the retry is reported as is.
+        Up to ``len(_FIRST_TURN_RETRY_BACKOFFS_S)`` re-sends, each after its
+        pause. Meanwhile the session reads as ``running`` (a plan stays
+        ``running``, a card is not failed); the failure after the last re-send
+        is reported as is.
         """
         first = self._first_prompts[session_id]
-        now = asyncio.get_running_loop().time()
-        if first.retried_at is not None:
-            if now - first.retried_at < _FIRST_TURN_RETRY_GRACE_S and not await self._has_output(
-                client, session_id, headers
-            ):
-                return dataclasses.replace(snap, status="running", error=None, error_code=None)
-            self._first_prompts.pop(session_id, None)
-            return snap
+        now = _clock()
+        running = dataclasses.replace(snap, status="running", error=None, error_code=None)
+        if (
+            first.sent_at is not None
+            and now - first.sent_at < _FIRST_TURN_RETRY_GRACE_S
+            and not await self._has_output(client, session_id, headers)
+        ):
+            return running  # the stale failure; the re-sent turn is on its way
+        first.sent_at = None
         if snap.error_code != _FIRST_TURN_RETRY_CODE or await self._has_output(
             client, session_id, headers
         ):
             self._first_prompts.pop(session_id, None)
             return snap
-        _logger.warning(
-            "shipcrew: first turn of session %s failed (%s); re-sending it once",
-            session_id,
-            snap.error,
-        )
-        await asyncio.sleep(_FIRST_TURN_RETRY_BACKOFF_S)
+        if first.attempts >= len(_FIRST_TURN_RETRY_BACKOFFS_S):
+            _logger.warning(
+                "shipcrew: first turn of session %s still failing after %d re-sends (%s)",
+                session_id,
+                first.attempts,
+                snap.error,
+            )
+            self._first_prompts.pop(session_id, None)
+            return snap
+        if first.due_at is None:
+            delay = _FIRST_TURN_RETRY_BACKOFFS_S[first.attempts]
+            first.due_at = now + delay
+            _logger.info(
+                "shipcrew: first turn of session %s failed (%s); re-send %d/%d in %.0fs",
+                session_id,
+                snap.error,
+                first.attempts + 1,
+                len(_FIRST_TURN_RETRY_BACKOFFS_S),
+                delay,
+            )
+        if now < first.due_at:
+            return running
+        first.attempts += 1
+        first.due_at = None
         try:
             await self._post_message(client, session_id, first.text, headers)
         except SessionServiceError as exc:
-            _logger.warning("shipcrew: first-turn retry of %s failed: %s", session_id, exc)
+            _logger.warning("shipcrew: first-turn re-send of %s failed: %s", session_id, exc)
             self._first_prompts.pop(session_id, None)
             return snap
-        first.retried_at = asyncio.get_running_loop().time()
-        return dataclasses.replace(snap, status="running", error=None, error_code=None)
+        first.sent_at = _clock()
+        _logger.info(
+            "shipcrew: first prompt of session %s re-sent (%d/%d)",
+            session_id,
+            first.attempts,
+            len(_FIRST_TURN_RETRY_BACKOFFS_S),
+        )
+        return running
 
     async def _has_output(
         self, client: httpx.AsyncClient, session_id: str, headers: dict[str, str]
@@ -760,10 +798,12 @@ class OmnigentSessionService:
 
 @dataclass
 class _FirstPrompt:
-    """A session's first prompt, kept for one automatic re-send."""
+    """A session's first prompt, kept for the automatic re-sends."""
 
     text: str
-    retried_at: float | None = None
+    attempts: int = 0
+    due_at: float | None = None  # when the next re-send is due (_clock)
+    sent_at: float | None = None  # last re-send, until the session reads non-failed
 
 
 def _pretrust_claude_workspace(workspace: str) -> None:
