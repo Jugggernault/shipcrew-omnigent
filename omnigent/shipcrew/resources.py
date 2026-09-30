@@ -22,8 +22,8 @@ import os
 from pathlib import Path
 
 #: Measured PSS per session with several running in parallel (RESOURCES.md):
-#: claude-sdk developer ~300 MB; claude-native ~400 MB, ~660 MB with the
-#: shadcn MCP server most native roles load. Rounded up.
+#: claude-sdk developer ~300 MB; claude-native ~400 MB (qa / security, plus
+#: the chrome-devtools MCP and its browser while they test). Rounded up.
 SESSION_MB_SDK = 350
 SESSION_MB_NATIVE = 700
 DEFAULT_RESERVE_MB = 2048

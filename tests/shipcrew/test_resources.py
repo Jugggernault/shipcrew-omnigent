@@ -206,10 +206,11 @@ class TestWorkerHarness:
     def test_auto_default(self) -> None:
         choice = parse_worker_harness(None)
         assert choice == WorkerHarness()
-        assert {"developer", "reviewer", "integrator", "devops"} == SDK_DEFAULT_ROLES
+        builders = {"designer", "scaffolder", "developer"}
+        assert builders | {"reviewer", "integrator", "devops"} == SDK_DEFAULT_ROLES
         for role in SDK_DEFAULT_ROLES:
             assert choice.for_role(role) == SDK
-        for role in ("designer", "scaffolder", "qa", "security"):
+        for role in ("qa", "security"):
             assert choice.for_role(role) == NATIVE
 
     @pytest.mark.parametrize(
@@ -224,7 +225,8 @@ class TestWorkerHarness:
         assert choice.for_role("qa") == SDK
         assert choice.for_role("developer") == NATIVE
         assert choice.for_role("reviewer") == SDK
-        assert choice.for_role("designer") == NATIVE
+        assert choice.for_role("designer") == SDK
+        assert choice.for_role("security") == NATIVE
         assert "qa=claude-sdk" in choice.describe()
 
     @pytest.mark.parametrize("raw", ["fast", "qa=auto", "QA!=sdk", "developer=tmux"])

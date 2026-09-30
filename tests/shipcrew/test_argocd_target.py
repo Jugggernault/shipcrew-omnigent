@@ -20,8 +20,8 @@ import yaml
 
 from omnigent.shipcrew import tools
 from omnigent.shipcrew.deploy_targets import TARGETS, make_target
-from omnigent.shipcrew.deploy_targets.base import DeployContext, DeployError
 from omnigent.shipcrew.deploy_targets.argocd import ArgoCDTarget, ArgoConfig, manifests
+from omnigent.shipcrew.deploy_targets.base import DeployContext, DeployError
 from omnigent.shipcrew.gitops_install import (
     GITOPS_COMMIT_MESSAGE,
     app_name,

@@ -27,7 +27,7 @@ What the rewrite keeps and what it cannot (see RESOURCES.md, "Guarantees"):
   ``--setting-sources project,local``, the bundle's skills (``--plugin-dir``),
   cost reporting, interrupt and stop (a stopped session relaunches with its
   conversation on the next message);
-- dropped: the bundle's own ``mcp_config`` servers (shadcn, chrome-devtools):
+- dropped: the bundle's own ``mcp_config`` servers (chrome-devtools):
   the SDK path does not load them, so roles whose instructions rely on one
   stay on native under ``auto``; Claude's Task sub-agents (the SDK harness
   exposes no Task tool, so no hidden sub-agent can run outside the board
@@ -57,12 +57,13 @@ _ALIASES = {
 }
 AUTO = "auto"
 
-#: Roles that run headless under ``auto``: no MCP server of their own, no
-#: human expected in their terminal, and the most parallel ones (a developer
-#: per feature task, a reviewer / integrator per PR, devops once).
-#: designer / scaffolder (shadcn MCP) and qa / security (chrome-devtools MCP)
-#: stay on native because their instructions use those tools.
-SDK_DEFAULT_ROLES: frozenset[str] = frozenset({"developer", "reviewer", "integrator", "devops"})
+#: Roles that run headless under ``auto``: no MCP server of their own and no
+#: human expected in their terminal (the builders add shadcn components with
+#: the CLI, not the shadcn MCP). qa / security stay on native because their
+#: instructions use the chrome-devtools MCP.
+SDK_DEFAULT_ROLES: frozenset[str] = frozenset(
+    {"designer", "scaffolder", "developer", "reviewer", "integrator", "devops"}
+)
 
 _HARNESS_LINE = re.compile(r"^(?P<indent>[ \t]+)harness:[ \t]*claude-native[ \t]*(?:#.*)?$", re.M)
 _PERMISSION_LINE = re.compile(r"^(?P<indent>[ \t]+)permission_mode:[ \t]*\S+[ \t]*(?:#.*)?$", re.M)

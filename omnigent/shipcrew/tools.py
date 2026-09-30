@@ -175,15 +175,6 @@ def registry() -> list[Tool]:
             install=_CHROME_MCP_ADD,
         ),
         Tool(
-            "SHADCN_MCP",
-            "shadcn MCP (web UI components)",
-            ("shadcn",),
-            (),
-            "claude mcp add --scope user shadcn -- npx -y shadcn@latest mcp",
-            mcp=True,
-            install="claude mcp add --scope user shadcn -- npx -y shadcn@latest mcp",
-        ),
-        Tool(
             "DOCKER",
             "docker (deploy target + strix)",
             ("docker",),

@@ -103,7 +103,7 @@ trip through the server's policy path. That is small next to the model's time.
 | Same verdicts as native | **kept** | `validate_agents.py` renders each worker bundle the way the server does and runs 250 guardrail cases per bundle as `sys_os_shell` / `sys_os_write` / `sys_os_edit` / `sys_os_read`: every verdict equals native. |
 | Owned-paths contract injection | **kept** | the same `# @task.*` slots, injected before the harness rewrite (unit test + live). |
 | Merge-gate memory of an accepted ASK | **kept (new)** | the relay-path approval now calls the board hook (`approvals.notify_accepted_relay_ask`). Live on the board path: `approved_paths == ["README.md"]`. |
-| Strict MCP per role | **strict kept; role servers dropped** | the `claude` argv has `--strict-mcp-config`, so no host-user or claude.ai servers load. But the bundle's `mcp_config` (shadcn, chrome-devtools) is **not** loaded by the SDK path, so under `auto` the roles that use one stay native. The developer on sdk uses `npx shadcn add` / the Foundation's components instead of the shadcn MCP. |
+| Strict MCP per role | **strict kept; role servers dropped** | the `claude` argv has `--strict-mcp-config`, so no host-user or claude.ai servers load. But the bundle's `mcp_config` (chrome-devtools) is **not** loaded by the SDK path, so under `auto` qa and security stay native. No bundle loads the shadcn MCP any more (r9): the builders add components with `pnpm dlx shadcn@latest add <c> --yes`. |
 | Setting-sources isolation | **kept** | argv has `--setting-sources=project,local`. The skills are the bundle's own (`reviewer:design-lock`) plus Claude's built-ins (`code-review`, …), with no user plugins. |
 | Board tree / child visibility | **kept** | loop children (reviewer, integrator) are created through the API and listed in `child_sessions` on either harness. |
 | Claude Task sub-agents | **not available** | the SDK harness exposes no Task / Agent tool, so a worker cannot fan out. That is a capability loss, not a hidden-agent risk. |
@@ -260,7 +260,7 @@ recommendations; the bundle rules are owned elsewhere.
 | lever | status |
 |---|---|
 | headless worker harness (`SHIPCREW_WORKER_HARNESS`) | new, default `auto` |
-| no shadcn MCP in developer sessions (265 MB each) | new, a side effect of sdk for the developer |
+| no shadcn MCP in any session (265 MB each) | r9: removed from designer / scaffolder / developer, the CLI instead; designer and scaffolder on sdk too |
 | auto capacity gate | new (`SHIPCREW_MAX_PARALLEL=auto`) |
 | park the idle developer during CI and review | new (`SHIPCREW_PARK_IDLE_WORKERS=1`) |
 | headless-only Chromium when present | new (stack script, `session_env`, CI template) |
@@ -278,8 +278,8 @@ What costs memory:
 
 - the stack: 0.5 GB fixed;
 - claude-sdk workers: ~0.3-0.35 GB each;
-- native qa / security / designer / scaffolder sessions: ~0.66 GB each, with
-  their MCP server;
+- native qa / security sessions: ~0.4 GB each, plus the chrome-devtools MCP
+  and its browser while they test;
 - spikes on top: a `next build` (~1.4 GB, less with fewer CPUs) or an e2e run
   (~0.65-0.9 GB with the headless shell).
 
