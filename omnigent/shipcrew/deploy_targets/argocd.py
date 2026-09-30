@@ -262,6 +262,12 @@ class ArgoCDTarget:
         )
         if ctrl.returncode:
             return f"the ArgoCD application controller is missing in {ns}: {self._err(ctrl)}"
+        project = self._kubectl(["-n", ns, "get", "appproject", "default", "-o", "name"])
+        if project.returncode:
+            return (
+                f"ArgoCD project {ns}/default is missing (ArgoCD core does not create it): "
+                "re-run deploy/vps/install.sh"
+            )
         if self.config.pr_previews:
             secret = self._kubectl(["-n", ns, "get", "secret", self.config.github_secret])
             if secret.returncode:

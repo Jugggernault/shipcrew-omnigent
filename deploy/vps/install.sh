@@ -193,6 +193,16 @@ argocd_core() {
   # Server-side: the ApplicationSet CRD is too big for a client-side apply annotation.
   kc apply -n argocd --server-side --force-conflicts \
     -f "https://raw.githubusercontent.com/argoproj/argo-cd/$ARGOCD_VERSION/manifests/core-install.yaml" >/dev/null
+  # The API server (not in core) is what normally creates the `default` project.
+  kc apply -f - >/dev/null <<EOF
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata: { name: default, namespace: argocd }
+spec:
+  sourceRepos: ["*"]
+  destinations: [{ namespace: "*", server: "*" }]
+  clusterResourceWhitelist: [{ group: "*", kind: "*" }]
+EOF
   # No webhook without the API server: poll git every 60 s instead of 180 s.
   if [[ "$(kc -n argocd get cm argocd-cm -o jsonpath='{.data.timeout\.reconciliation}' 2>/dev/null)" != 60s ]]; then
     kc -n argocd patch cm argocd-cm --type merge -p '{"data":{"timeout.reconciliation":"60s"}}' >/dev/null
@@ -298,13 +308,14 @@ board() {
   local hash
   hash="$(caddy hash-password --plaintext "$(cat "$pass_file")")"
   # Caddy never takes 80/443 (Traefik has them): a plain listener that only pods reach.
+  # `basicauth`: the spelling of the apt caddy 2.6, still accepted by 2.8+.
   cat >/etc/caddy/Caddyfile <<EOF
 {
 	auto_https off
 	admin off
 }
 http://:$BOARD_PORT {
-	basic_auth {
+	basicauth {
 		$SC_USER $hash
 	}
 	reverse_proxy 127.0.0.1:$SERVER_PORT

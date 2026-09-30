@@ -317,6 +317,8 @@ if has("get", "crd"):
     sys.exit(0 if state.get("crds", True) else (print("NotFound", file=sys.stderr) or 1))
 if has("get", "statefulset"):
     sys.exit(0 if state.get("controller", True) else 1)
+if has("get", "appproject"):
+    sys.exit(0 if state.get("project", True) else 1)
 if has("get", "secret"):
     sys.exit(0 if state.get("secret", True) else (print("secret not found", file=sys.stderr) or 1))
 if has("get", "application"):
@@ -377,6 +379,7 @@ def test_preflight_ok(kube: Kube) -> None:
     [
         ({"crds": False}, {}, "ArgoCD is not installed"),
         ({"controller": False}, {}, "application controller"),
+        ({"project": False}, {}, "project argocd/default"),
         ({"secret": False}, {}, "shipcrew-github"),
         ({}, {"base_domain": ""}, "SHIPCREW_BASE_DOMAIN"),
     ],

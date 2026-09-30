@@ -127,9 +127,15 @@ k3d cluster delete "$CLUSTER" >/dev/null 2>&1 || true
 k3d cluster create "$CLUSTER" --agents 0 -p "$PORT:80@loadbalancer" \
   -v "$WORK/git:/git@server:0" --kubeconfig-update-default=false --wait --timeout 240s >/dev/null
 k3d kubeconfig get "$CLUSTER" >"$KUBECONFIG"
-k3d image import -c "$CLUSTER" scproof:v1 "$IMAGE:$MAIN_SHA" "$IMAGE:$PR_SHA" \
-  "quay.io/argoproj/argocd:$ARGOCD_VERSION" public.ecr.aws/docker/library/redis:8.2.3-alpine >/dev/null 2>&1 \
-  || k3d image import -c "$CLUSTER" scproof:v1 "$IMAGE:$MAIN_SHA" "$IMAGE:$PR_SHA" >/dev/null
+# One image per import: a failed tarball import can be reported as success.
+import_image() {
+  k3d image import -c "$CLUSTER" "$1" >/dev/null 2>&1
+  docker exec "k3d-$CLUSTER-server-0" crictl images | grep -q "${1%%:*} *${1##*:} " \
+    || docker exec "k3d-$CLUSTER-server-0" crictl images | grep -q "library/${1%%:*} *${1##*:} "
+}
+for img in scproof:v1 "$IMAGE:$MAIN_SHA" "$IMAGE:$PR_SHA"; do import_image "$img" || { echo "import failed: $img"; exit 1; }; done
+# Big ArgoCD images: the cluster pulls them itself when this import fails.
+import_image "quay.io/argoproj/argocd:$ARGOCD_VERSION" || true
 
 step "git-daemon + fake GitHub API in namespace git"
 PULLS="$(printf '[{"number":7,"title":"a PR","state":"open","head":{"ref":"feat","sha":"%s","repo":{"full_name":"acme/demo"}},"base":{"ref":"main"},"labels":[],"user":{"login":"proof"}}]' "$PR_SHA")"
@@ -176,6 +182,15 @@ step "ArgoCD core $ARGOCD_VERSION (as the VPS installer does)"
 kubectl create namespace argocd --dry-run=client -o yaml | kubectl apply -f - >/dev/null
 kubectl apply -n argocd --server-side --force-conflicts \
   -f "https://raw.githubusercontent.com/argoproj/argo-cd/$ARGOCD_VERSION/manifests/core-install.yaml" >/dev/null
+kubectl apply -f - >/dev/null <<'EOF'
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata: { name: default, namespace: argocd }
+spec:
+  sourceRepos: ["*"]
+  destinations: [{ namespace: "*", server: "*" }]
+  clusterResourceWhitelist: [{ group: "*", kind: "*" }]
+EOF
 kubectl -n argocd patch cm argocd-cm --type merge -p '{"data":{"timeout.reconciliation":"30s"}}' >/dev/null
 kubectl -n argocd rollout restart statefulset argocd-application-controller >/dev/null
 kubectl -n argocd rollout status statefulset argocd-application-controller --timeout=300s >/dev/null
@@ -216,7 +231,7 @@ page_has "$APP.$DOMAIN" "demo v1" && echo "ingress: $(page "$APP.$DOMAIN")"
 
 step "auto-sync: push an image bump (v2) + replicas 2 to gitops/main, no kubectl"
 docker tag scproof:v2 "$IMAGE:v2-proof"
-k3d image import -c "$CLUSTER" "$IMAGE:v2-proof" >/dev/null
+import_image "$IMAGE:v2-proof"
 g checkout -q gitops/main
 cat >>"$WORK/repo/deploy/k8s/overlays/main/kustomization.yaml" <<'EOF'
 replicas:
