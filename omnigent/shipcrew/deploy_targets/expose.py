@@ -38,6 +38,9 @@ from omnigent.shipcrew import tools
 _logger = logging.getLogger(__name__)
 
 TUNNEL_URL = re.compile(r"https://[a-z0-9-]+\.trycloudflare\.com")
+# Local e2e only (SHIPCREW_SHIP_ALLOW_PRIVATE_URLS=1): a fake cloudflared may
+# print a loopback URL, so nothing public is created.
+LOCAL_TUNNEL_URL = re.compile(r"https?://(?:127\.0\.0\.1|localhost):[0-9]+/?(?=\s|$)")
 _STOP_WAIT_S = 5.0
 _CADDY_TIMEOUT_S = 30.0
 
@@ -204,10 +207,12 @@ class TunnelExposure:
         cloudflared: Callable[[], str | None],
         url_timeout_s: float = 45.0,
         python: str = sys.executable,
+        allow_local_url: bool = False,
     ) -> None:
         self.state_dir = state_dir
         self._cloudflared = cloudflared
         self.url_timeout_s = url_timeout_s
+        self._url_patterns = [TUNNEL_URL, *([LOCAL_TUNNEL_URL] if allow_local_url else [])]
         self.python = python
 
     def _dir(self, slug: str) -> Path:
@@ -285,7 +290,8 @@ class TunnelExposure:
         tunnel.start(argv, front=front)
         deadline = time.monotonic() + self.url_timeout_s
         while time.monotonic() < deadline:
-            found = TUNNEL_URL.findall(tunnel.log_text())
+            text = tunnel.log_text()
+            found = next((f for rx in self._url_patterns if (f := rx.findall(text))), None)
             if found:
                 tunnel.save(url=found[-1], front=front)
                 if old_front is not None and old_front != front:

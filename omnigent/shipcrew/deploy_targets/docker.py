@@ -102,6 +102,7 @@ class DockerTarget:
             self.state_dir,
             cloudflared=lambda: tools.resolve(_tool("CLOUDFLARED")),
             url_timeout_s=self.settings.tunnel_url_timeout_s,
+            allow_local_url=self.settings.ship_allow_private_urls,
         )
 
     def _docker_path(self) -> str | None:

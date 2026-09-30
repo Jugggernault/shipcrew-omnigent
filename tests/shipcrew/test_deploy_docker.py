@@ -27,7 +27,12 @@ from omnigent.shipcrew.deploy_targets import (
     select_target,
 )
 from omnigent.shipcrew.deploy_targets.docker import DockerTarget
-from omnigent.shipcrew.deploy_targets.expose import Supervised
+from omnigent.shipcrew.deploy_targets.expose import (
+    LOCAL_TUNNEL_URL,
+    TUNNEL_URL,
+    Supervised,
+    TunnelExposure,
+)
 from omnigent.shipcrew.preview import _add_worktree, _remove_worktree
 from omnigent.shipcrew.settings import ShipcrewSettings
 from omnigent.shipcrew.store import Mission
@@ -439,3 +444,14 @@ class TestTools:
         dest = tmp_path / "bin" / "cloudflared"
         assert dest.read_bytes().startswith(b"\x7fELF") and os.access(dest, os.X_OK)
         assert json.loads((tmp_path / "tools.json").read_text())["CLOUDFLARED"] == str(dest)
+
+
+def test_a_loopback_tunnel_url_only_counts_in_local_e2e_mode(tmp_path: Path) -> None:
+    log = "INF |  http://127.0.0.1:40123  |\n"
+    assert LOCAL_TUNNEL_URL.findall(log) == ["http://127.0.0.1:40123"]
+    assert not TUNNEL_URL.findall(log)
+    assert not LOCAL_TUNNEL_URL.findall("http://127.0.0.1:40123.evil.example\n")
+    strict = TunnelExposure(tmp_path, cloudflared=lambda: None)
+    local = TunnelExposure(tmp_path, cloudflared=lambda: None, allow_local_url=True)
+    assert strict._url_patterns == [TUNNEL_URL]
+    assert local._url_patterns == [TUNNEL_URL, LOCAL_TUNNEL_URL]
