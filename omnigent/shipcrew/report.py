@@ -77,6 +77,27 @@ def wall_time_s(mission: Mission, tasks: Sequence[Task]) -> float | None:
     return max(0.0, end - min(starts))
 
 
+_BUILD_STEPS = (
+    ("install_s", "install"),
+    ("app_build_s", "app build"),
+    ("prepare_s", "context"),
+    ("package_s", "image"),
+)
+
+
+def _build_steps(detail: dict[str, object]) -> str:
+    """``host-standalone: install 2 s, app build 12 s, image 5 s`` (empty when unknown)."""
+    steps = [
+        f"{label} {format_duration(float(value))}"
+        for key, label in _BUILD_STEPS
+        if isinstance(value := detail.get(key), int | float)
+    ]
+    mode = detail.get("build_mode")
+    if isinstance(mode, str) and steps:
+        return f"{mode}: {', '.join(steps)}"
+    return ", ".join(steps)
+
+
 def build_report(mission: Mission, tasks: Sequence[Task]) -> str:
     """The Markdown ship report of ``mission`` (see the module docstring)."""
     lines: list[str] = [f"# Ship report: {_inline(mission.title)}", ""]
@@ -99,6 +120,8 @@ def build_report(mission: Mission, tasks: Sequence[Task]) -> str:
         for key, label in (("build_s", "build"), ("start_s", "start"), ("deploy_s", "deploy")):
             if isinstance(detail.get(key), int | float):
                 facts.append(f"{label} {format_duration(float(detail[key]))}")
+            if key == "build_s" and (steps := _build_steps(detail)):
+                facts[-1] += f" ({steps})"
         if isinstance(detail.get("image_mb"), int | float):
             facts.append(f"image {detail['image_mb']} MB")
         lines.append(

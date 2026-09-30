@@ -9,6 +9,12 @@ the real binaries. The fake docker keeps its world in a JSON file:
 * ``run`` starts a real detached HTTP server on the published host port, so the
   target's health check, the forwarder and the swap are exercised for real;
 * ``rm`` kills it. Every call is logged in ``calls``.
+
+The fake ``pnpm`` / ``npm`` (``SHIPCREW_PNPM`` / ``SHIPCREW_NPM``) log every
+call with its cwd and a few env vars (to ``pm.log`` next to them: the host
+build scrubs the environment); files in the worktree steer them:
+``fake-install-fail``, ``fake-build-fail``, ``fake-*-sleep`` (seconds),
+``fake-standalone`` (the build writes ``.next/standalone/server.js``).
 """
 
 from __future__ import annotations
@@ -85,13 +91,21 @@ def main(argv):
             out, rc = "npm ERR! build failed", 1
         else:
             health = 200
-            hf = os.path.join(ctx, "fake-health")
-            if os.path.exists(hf):
-                health = int(open(hf).read().strip() or 200)
+            for sub in ("", "app", "standalone"):
+                hf = os.path.join(ctx, sub, "fake-health")
+                if os.path.exists(hf):
+                    health = int(open(hf).read().strip() or 200)
             labels = labels_of(argv)
             st["seq"] += 1
+            df = os.path.join(ctx, "Dockerfile")
+            files = sorted(
+                os.path.relpath(os.path.join(root, n), ctx)
+                for root, dirs, names in os.walk(ctx) for n in names + dirs
+            )
             st["images"][tag] = {"health": health, "labels": labels, "seq": st["seq"],
-                                 "file": opt(argv, "--file"), "network": opt(argv, "--network")}
+                                 "file": opt(argv, "--file"), "network": opt(argv, "--network"),
+                                 "context": ctx, "files": files,
+                                 "dockerfile": open(df).read() if os.path.isfile(df) else None}
             out = "Successfully built"
     elif cmd == "image" and argv[1] == "inspect":
         img = st["images"].get(argv[-1])
@@ -107,6 +121,8 @@ def main(argv):
                 if k.split(":", 1)[0] == repo]
         tags = sorted(mine)
         out = "\n".join(t for _, t in reversed(tags))
+    elif cmd == "image" and argv[1] == "prune":
+        out = "Total reclaimed space: 0B"
     elif cmd == "rmi":
         st["images"].pop(argv[-1], None)
     elif cmd == "run":
@@ -195,6 +211,62 @@ with open(log, "a") as f:
 """
 
 
+FAKE_PM = r"""
+import json, os, pathlib, sys, time
+name = os.path.basename(sys.argv[0])
+args = sys.argv[1:]
+cwd = pathlib.Path.cwd()
+env_keys = ("CI", "NEXT_TELEMETRY_DISABLED", "NODE_OPTIONS", "FAKE_SECRET", "PATH", "HOME")
+with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "pm.log"), "a") as f:
+    f.write(json.dumps({"pm": name, "args": args, "cwd": str(cwd),
+                        "env": {k: os.environ.get(k) for k in env_keys}}) + "\n")
+def flag(n):
+    p = cwd / n
+    return p.read_text().strip() if p.exists() else None
+def sleep_for(n):
+    s = flag(n)
+    if s:
+        (cwd.parent / (cwd.name + ".pid")).write_text(str(os.getpid()))
+        time.sleep(float(s))
+if args[:1] == ["--version"]:
+    print("11.0.0-fake"); sys.exit(0)
+if args[:1] in (["install"], ["ci"]):
+    sleep_for("fake-install-sleep")
+    if flag("fake-install-fail"):
+        print("ERR_PNPM_FETCH_FAIL fake registry down"); sys.exit(1)
+    nm = cwd / "node_modules"
+    (nm / "dep").mkdir(parents=True, exist_ok=True)
+    (nm / "devdep").mkdir(parents=True, exist_ok=True)
+    (nm / "dep" / "index.js").write_text("module.exports = 1")
+    count = int((nm / ".installs").read_text()) if (nm / ".installs").exists() else 0
+    (nm / ".installs").write_text(str(count + 1))
+    sys.exit(0)
+if args[:2] == ["run", "build"]:
+    sleep_for("fake-build-sleep")
+    if flag("fake-build-fail"):
+        print("Error: fake next build failed: Type error in app/page.tsx"); sys.exit(1)
+    nxt = cwd / ".next"
+    (nxt / "cache").mkdir(parents=True, exist_ok=True)
+    runs = int((nxt / "cache" / "runs").read_text()) if (nxt / "cache" / "runs").exists() else 0
+    (nxt / "cache" / "runs").write_text(str(runs + 1))
+    (nxt / "BUILD_ID").write_text("fake")
+    if flag("fake-standalone"):
+        sa = nxt / "standalone"
+        sa.mkdir(parents=True, exist_ok=True)
+        (sa / "server.js").write_text("// fake standalone server")
+        if (cwd / "fake-health").exists():
+            (sa / "fake-health").write_text((cwd / "fake-health").read_text())
+        (nxt / "static" / "chunks").mkdir(parents=True, exist_ok=True)
+        (nxt / "static" / "chunks" / "app.js").write_text("//")
+    sys.exit(0)
+if args[:1] == ["prune"]:
+    import shutil
+    shutil.rmtree(cwd / "node_modules" / "devdep", ignore_errors=True)
+    sys.exit(0)
+print(f"fake {name}: unsupported {args}", file=sys.stderr); sys.exit(2)
+"""
+
+
 def _script(path: Path, body: str) -> Path:
     path.write_text(f"#!{sys.executable}\n{body}")
     path.chmod(0o755)
@@ -213,6 +285,11 @@ class DeployFakes:
         self.docker = _script(root / "docker", FAKE_DOCKER)
         self.cloudflared = _script(root / "cloudflared", FAKE_CLOUDFLARED)
         self.caddy = _script(root / "caddy", FAKE_CADDY)
+        self.pm_log = root / "pm.log"
+        self.pnpm = _script(root / "pnpm", FAKE_PM)
+        self.npm = _script(root / "npm", FAKE_PM)
+        monkeypatch.setenv("SHIPCREW_PNPM", str(self.pnpm))
+        monkeypatch.setenv("SHIPCREW_NPM", str(self.npm))
         monkeypatch.setenv("FAKE_DOCKER_STATE", str(self.state))
         monkeypatch.setenv("FAKE_CLOUDFLARED_COUNTER", str(self.counter))
         monkeypatch.setenv("FAKE_CADDY_LOG", str(self.caddy_log))
@@ -230,6 +307,12 @@ class DeployFakes:
 
     def calls(self, command: str) -> list[list[str]]:
         return [c for c in self.world().get("calls", []) if c and c[0] == command]
+
+    def pm_calls(self) -> list[dict[str, Any]]:
+        """Every fake pnpm / npm call: ``{pm, args, cwd, env}``."""
+        if not self.pm_log.is_file():
+            return []
+        return [json.loads(line) for line in self.pm_log.read_text().splitlines()]
 
     def set_down(self, down: bool = True) -> None:
         world = self.world()

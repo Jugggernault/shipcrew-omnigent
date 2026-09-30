@@ -1,8 +1,89 @@
 # shipcrew on omnigent: status
 
-Fork branch `shipcrew-r9` (bundles: shipcrew `v3-r9`). Design:
+Fork branch `shipcrew-r11` (bundles: shipcrew `v3-r11`). Design:
 `shipcrew/PROPOSAL-v3.md`. Last live end-to-end run: 2026-09-30 (r9 smoke,
 below). The dated sections after this one are the history of each round.
+
+## Round 11: host build for the docker target (2026-09-30)
+
+Live blocker: the docker target built the app image with the repo
+`Dockerfile`, whose `pnpm install` ran inside docker with a cold cache (legacy
+builder, no buildx, no cache mounts): ~650 packages, "reused 0", ~100 s per
+request on this network, then `error (23)`, and the preview deploy failed.
+
+- **`SHIPCREW_DOCKER_BUILD=host` (default)**, `deploy_targets/host_build.py`:
+  in the clean deploy worktree, `node_modules` + `.next/cache` of the
+  mission's previous deploy are moved back in (`<deploy_state_dir>/<slug>/cache/`),
+  else seeded from the main checkout (`deps_seed`); then the lockfile's
+  install, offline first (`pnpm install --frozen-lockfile --prefer-offline`,
+  `npm ci --prefer-offline`, yarn, bun), and `<pm> run build`. The steps get
+  `CI=1`, `NEXT_TELEMETRY_DISABLED=1`, `NODE_OPTIONS=--max-old-space-size`
+  from `SHIPCREW_NODE_HEAP_MB`, and a scrubbed env (PATH, HOME, locale,
+  proxies, `npm_config_*`: no server secrets). They share one budget
+  (`SHIPCREW_DEPLOY_BUILD_TIMEOUT_S`), and a timeout kills the whole process
+  group. The output goes to `<deploy_state_dir>/<slug>/build.log`, and its
+  tail is in the error.
+- **Packaging**: a temp context outside the repo with a server-generated,
+  copy-only Dockerfile, built with `docker build --network none`. The Next.js
+  standalone path (`.next/standalone`, `.next/static`, `public/`) runs on
+  `SHIPCREW_DOCKER_RUNTIME_IMAGE`, default
+  `gcr.io/distroless/nodejs22-debian12:nonroot` (glibc, no shell, uid 10001,
+  HEALTHCHECK via node, `node server.js`). It was tested against
+  `node:22-bookworm-slim`: both run the standalone server, and distroless is
+  the smaller one (204 vs 329 MB base). Without standalone output, the built
+  app plus production deps (`pnpm prune --prod` / `npm prune --omit=dev` on
+  a hardlinked copy) runs on `node:22-bookworm-slim` with `npm start` as
+  `node`, and the note says to set `output: "standalone"`.
+- **Fallback to the Dockerfile**: a repo with no `package.json`, or whose
+  package manager is missing on the host (`SHIPCREW_PNPM`/`SHIPCREW_NPM`
+  overrides via `tools.resolve`), is built from its Dockerfile, with a note.
+  `SHIPCREW_DOCKER_BUILD=dockerfile` always uses the Dockerfile.
+  `SHIPCREW_DOCKER_BUILD_NETWORK` only applies to that mode. The CI template
+  is unchanged (GitHub builds the repo Dockerfile).
+- **Timings**: `Mission.preview.detail` holds `build_mode`
+  (`host-standalone` / `host-generic` / `dockerfile`), `install_s`,
+  `app_build_s`, `prepare_s`, `package_s`, `build_s` (the total), `image_mb`
+  and `deps_from`. The report reads `build 11s (host-standalone: install 1s,
+  app build 5s, context 0s, image 5s)`.
+- **Leftovers**: prune and teardown also remove the mission's untagged images
+  (`docker image prune --filter label=shipcrew.mission=<id>`).
+- Scaffolder ROLE (v3-r11): the server builds on its host from
+  `.next/standalone`, and CI builds the Dockerfile. Without standalone the
+  image is ~1 GB instead of ~260 MB.
+
+### Real proof (this machine, real docker 29 legacy builder, fake cloudflared printing the local URL)
+
+`shipcrew-demo-web-4` (Next.js 16 polls, pnpm) was copied to a scratch dir
+and deployed through `DockerTarget.deploy` (preview's worktree add/remove).
+Each run was a cold deploy (first deploy of the mission: no `node_modules`
+anywhere, no build cache) and then a warm one (after a one-line change in
+`app/page.tsx`). `GET /` and `GET /api/polls` returned 200 each time (3
+polls), and the warm page had the new line.
+
+| variant | cold total | warm total | warm steps (install / app build / image) | image |
+|---|---|---|---|---|
+| `output: "standalone"` (what the scaffolder writes) | 32.5 s | **12.3 s** | 0.9 / 5.3 / 4.9 s | 261 MB on disk (65.5 MB content), healthy |
+| demo as is (no standalone: generic fallback) | 74.3 s | 59.0 s | 1.1 / 5.6 / 48.9 s | 1 GB |
+
+Caveats: the host pnpm store was warm when these ran. The very first install
+of this project on this machine took 7 min 14 s on the host, because the
+store lacked the packages. That is paid once per machine, it is shared by
+every later mission, and it happens outside docker, so a failed fetch is
+retried by the next deploy instead of rebuilding a cold layer. The runtime
+base images were pulled beforehand: node:22-bookworm-slim took 11 min 46 s
+on this network and distroless 58 s. A first deploy on a fresh machine pays
+that pull once. Afterwards the containers, images, tunnel and forwarder were
+torn down and the scratch dirs removed; the two base images were kept.
+
+Checks: ruff + format, `pyrefly check` (0 errors), `pytest tests/shipcrew
+tests/server/test_shipcrew_mount.py`: 1120 passed. New:
+`tests/shipcrew/test_deploy_host_build.py` (14 tests: standalone happy path
+with `--network none` and a scrubbed env, cache reuse, the generic fallback
+with a pruned copy, npm, a build failure that keeps the old container, an
+install failure, a build timeout that kills the process group, dockerfile
+mode, fallbacks for a missing package manager or `package.json`, settings,
+report). Bundles: `build_agents.py --check` and `validate_agents.py` (all 10
+valid).
 
 ## Round 10: the planner's first turn after a restart (2026-09-30)
 

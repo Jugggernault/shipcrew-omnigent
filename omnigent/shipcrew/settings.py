@@ -12,6 +12,10 @@ from omnigent.shipcrew.harness import SDK, WorkerHarness, parse_worker_harness
 DEFAULT_AGENTS_DIR = "/home/jugggernault/Work/Projects/shipcrew/agents"
 DEFAULT_DEPLOY_STATE_DIR = Path.home() / ".local" / "state" / "shipcrew" / "deploy"
 _FALSEY = {"0", "false", "no", "off"}
+# The docker target's runtime base for a host-built Next.js standalone app:
+# glibc (native modules built on a glibc host keep working), no shell, nonroot.
+DEFAULT_RUNTIME_IMAGE = "gcr.io/distroless/nodejs22-debian12:nonroot"
+DOCKER_BUILD_MODES = ("host", "dockerfile")
 
 
 def _env_float(name: str, default: float | None) -> float | None:
@@ -21,6 +25,21 @@ def _env_float(name: str, default: float | None) -> float | None:
     if raw.lower() in {"none", "off", "unlimited"}:
         return None
     return float(raw)
+
+
+def _env_positive_int(name: str) -> int | None:
+    raw = os.environ.get(name, "").strip()
+    try:
+        value = int(raw) if raw else 0
+    except ValueError:
+        return None
+    return value if value > 0 else None
+
+
+def _docker_build_mode(raw: str | None) -> str:
+    """``SHIPCREW_DOCKER_BUILD``: ``host`` (default) or ``dockerfile``."""
+    mode = (raw or "host").strip().lower()
+    return mode if mode in DOCKER_BUILD_MODES else "host"
 
 
 @dataclass(frozen=True)
@@ -84,7 +103,16 @@ class ShipcrewSettings:
     :param deploy_health_timeout_s: How long a new container may take to answer
         ``GET /`` before the swap is abandoned (the old one keeps serving).
     :param docker_build_network: ``docker build --network`` (e.g. ``host`` when
-        the bridge network cannot reach the npm registry).
+        the bridge network cannot reach the npm registry); ``dockerfile``
+        build mode only (the host build packages with ``--network none``).
+    :param docker_build: ``SHIPCREW_DOCKER_BUILD``: ``host`` (default: install
+        and build on the host from the warm package store, package a
+        runtime-only image; :mod:`omnigent.shipcrew.deploy_targets.host_build`)
+        or ``dockerfile`` (the repo's Dockerfile, as CI builds it).
+    :param docker_runtime_image: ``SHIPCREW_DOCKER_RUNTIME_IMAGE``: base of a
+        host-built Next.js standalone image (default distroless Node 22).
+    :param node_heap_mb: ``SHIPCREW_NODE_HEAP_MB``: ``NODE_OPTIONS=
+        --max-old-space-size`` for the host build (``None``: node's default).
     :param public_base_domain: VPS mode: ``https://<mission-slug>.<domain>``
         through Caddy (e.g. ``203.0.113.7.sslip.io``) instead of quick tunnels.
     :param caddyfile: The Caddyfile ``caddy reload`` loads (it must
@@ -125,6 +153,9 @@ class ShipcrewSettings:
     deploy_build_timeout_s: float = 900.0
     deploy_health_timeout_s: float = 90.0
     docker_build_network: str | None = None
+    docker_build: str = "host"
+    docker_runtime_image: str = DEFAULT_RUNTIME_IMAGE
+    node_heap_mb: int | None = None
     public_base_domain: str | None = None
     caddyfile: str = "/etc/caddy/Caddyfile"
     caddy_sites_dir: str | None = None
@@ -206,6 +237,11 @@ class ShipcrewSettings:
             deploy_build_timeout_s=float(env.get("SHIPCREW_DEPLOY_BUILD_TIMEOUT_S") or 900.0),
             deploy_health_timeout_s=float(env.get("SHIPCREW_DEPLOY_HEALTH_TIMEOUT_S") or 90.0),
             docker_build_network=env.get("SHIPCREW_DOCKER_BUILD_NETWORK") or None,
+            docker_build=_docker_build_mode(env.get("SHIPCREW_DOCKER_BUILD")),
+            docker_runtime_image=(
+                env.get("SHIPCREW_DOCKER_RUNTIME_IMAGE") or DEFAULT_RUNTIME_IMAGE
+            ).strip(),
+            node_heap_mb=_env_positive_int("SHIPCREW_NODE_HEAP_MB"),
             public_base_domain=env.get("SHIPCREW_PUBLIC_BASE_DOMAIN") or None,
             caddyfile=env.get("SHIPCREW_CADDYFILE") or "/etc/caddy/Caddyfile",
             caddy_sites_dir=env.get("SHIPCREW_CADDY_SITES_DIR") or None,

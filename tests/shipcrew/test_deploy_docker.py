@@ -85,6 +85,7 @@ def _settings(tmp_path: Path, **fields: Any) -> ShipcrewSettings:
         "deploy_state_dir": tmp_path / "state",
         "deploy_health_timeout_s": 5.0,
         "tunnel_url_timeout_s": 5.0,
+        "docker_build": "dockerfile",  # host builds: test_deploy_host_build.py
         **fields,
     }
     return ShipcrewSettings(**values)
@@ -393,6 +394,9 @@ class TestTeardown:
         assert not any(_pid_alive(p) for p in [*pids, container_pid])
         assert not slug_dir.exists()
         assert target.refresh(MISSION) is None
+        # Untagged leftovers of the mission's builds go too (by label).
+        prune = [c for c in fakes.calls("image") if c[1] == "prune"]
+        assert prune and prune[-1][-1] == f"label=shipcrew.mission={MISSION.id}"
 
 
 class TestTools:
