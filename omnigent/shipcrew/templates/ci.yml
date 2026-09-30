@@ -96,6 +96,15 @@ jobs:
         env: { PM: "${{ steps.pm.outputs.name }}" }
         run: |
           if node -e 'process.exit(require("./package.json").scripts?.build ? 0 : 1)'; then "$PM" run build; else echo "no build script: skipped"; fi
+          # Weight report: the JS every page loads first (Next.js), in the job summary.
+          [ -f .next/build-manifest.json ] && node -e '
+            const fs = require("fs"), zlib = require("zlib"), path = require("path");
+            const m = JSON.parse(fs.readFileSync(".next/build-manifest.json", "utf8"));
+            const files = [...new Set([...(m.rootMainFiles || []), ...((m.pages || {})["/_app"] || [])])];
+            let raw = 0, gz = 0;
+            for (const f of files) { const b = fs.readFileSync(path.join(".next", f)); raw += b.length; gz += zlib.gzipSync(b).length; }
+            console.log(`### Weight\n\n| | size |\n|---|---|\n| First-load JS shared by all routes | ${(gz / 1024).toFixed(1)} kB gzip (${(raw / 1024).toFixed(1)} kB raw, ${files.length} files) |`);
+          ' >> "$GITHUB_STEP_SUMMARY" || true
       - if: steps.pm.outputs.name != ''
         run: ${{ steps.pm.outputs.audit }}
       - name: e2e (production build, preinstalled Chrome)
@@ -103,6 +112,26 @@ jobs:
         env: { PM: "${{ steps.pm.outputs.name }}" }
         run: |
           if node -e 'process.exit(require("./package.json").scripts?.e2e ? 0 : 1)'; then "$PM" run e2e; else echo "no e2e script: skipped"; fi
+      # The production image the docker deploy target builds after the merge: a
+      # broken Dockerfile fails here, not on the live server. Size budget
+      # (repo variable SHIPCREW_IMAGE_BUDGET_MB, default 200 MB) only WARNS by
+      # default: a red check would spend the task's CI-fix attempts and block the
+      # card on a human for a weight regression; set SHIPCREW_IMAGE_BUDGET_ENFORCE=1
+      # to fail instead.
+      - name: docker build + image size budget
+        if: hashFiles('Dockerfile') != ''
+        env:
+          BUDGET_MB: ${{ vars.SHIPCREW_IMAGE_BUDGET_MB || '200' }}
+          ENFORCE: ${{ vars.SHIPCREW_IMAGE_BUDGET_ENFORCE || '0' }}
+        run: |
+          docker build --quiet --tag shipcrew-ci:latest .
+          mb=$(( $(docker image inspect --format '{{.Size}}' shipcrew-ci:latest) / 1000000 ))
+          printf '\n**Production image:** %s MB (budget %s MB)\n' "$mb" "$BUDGET_MB" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$mb" -gt "$BUDGET_MB" ]; then
+            msg="the production image is ${mb} MB, over the ${BUDGET_MB} MB budget (Dockerfile: standalone output, no dev dependencies)"
+            if [ "$ENFORCE" = 1 ]; then echo "::error::$msg"; exit 1; fi
+            echo "::warning::$msg"
+          fi
       - uses: actions/upload-artifact@v4
         if: failure()
         with: { name: playwright-report, path: playwright-report, retention-days: 7, if-no-files-found: ignore }
