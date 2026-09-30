@@ -75,6 +75,7 @@ import {
   ShipButton,
   ShipReportPanel,
 } from "@/board/MissionShip";
+import { LivePreviewChip } from "@/board/MissionPreview";
 import { MissionProjectLink } from "@/board/MissionProjectLink";
 import { NewMissionDialog } from "@/board/NewMissionDialog";
 import { NewTaskForm } from "@/board/NewTaskForm";
@@ -382,6 +383,7 @@ export function BoardPage() {
             <h1 className="text-2xl font-semibold">Board</h1>
             {mission && <MissionStatusChip mission={mission} tasks={tasks} />}
           </div>
+          {mission && <LivePreviewChip mission={mission} className="mt-1" />}
           <div className="flex items-center gap-1.5 text-ui text-muted-foreground">
             {mission ? (
               <span className="truncate font-mono text-xs" title={mission.repo_path}>

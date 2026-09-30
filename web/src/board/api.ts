@@ -337,12 +337,13 @@ function planRunning(missions: readonly Mission[] | undefined): boolean {
       (mission) =>
         mission.plan?.status === "running" ||
         mission.ship?.status === "deploying" ||
-        mission.ship?.status === "verifying",
+        mission.ship?.status === "verifying" ||
+        mission.preview?.status === "deploying",
     ) ?? false
   );
 }
 
-/** Missions; polled while a planner or ship run is in flight so its outcome shows up. */
+/** Missions; polled while a planner, ship or preview deploy is in flight so its outcome shows up. */
 export function useMissions() {
   return useQuery({
     queryKey: missionsQueryKey,
