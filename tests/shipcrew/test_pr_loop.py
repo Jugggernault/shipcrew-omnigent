@@ -1493,3 +1493,50 @@ class TestPushLease:
         assert pr_loop._unsafe_push_branch(dataclasses.replace(ctx, branch="feature/x"))
         good = dataclasses.replace(ctx, branch=f"shipcrew/{task.id[:8]}-add-feature")
         assert pr_loop._unsafe_push_branch(good) is None
+
+
+class TestStaleBranch:
+    async def test_red_ci_on_a_stale_branch_updates_from_main_first(
+        self,
+        service: ShipcrewService,
+        sessions: LoopSessions,
+        repo: Path,
+        scheduler: ShipcrewScheduler,
+        gh_state: Path,
+        tmp_path: Path,
+    ) -> None:
+        # Live run 4: red twice because the branch predated a sibling's merge.
+        # Here the sibling merge is exactly what makes CI green.
+        task, _ = await start(service, sessions, repo)
+        await run_until(scheduler, service, task.id, lambda t: t.pr_number is not None)
+        _push_to_main(tmp_path, "sibling", "ok", "")
+        merged = await run_until(scheduler, service, task.id, status_is("merged"), 20)
+        assert merged.ci_attempts == 0 and sessions.messages == []
+        calls = [c[:2] for c in gh_state_of(gh_state)["calls"]]
+        assert ["pr", "update-branch"] in calls
+
+    async def test_an_up_to_date_branch_gets_the_logs(
+        self,
+        service: ShipcrewService,
+        sessions: LoopSessions,
+        repo: Path,
+        scheduler: ShipcrewScheduler,
+        gh_state: Path,
+        tmp_path: Path,
+    ) -> None:
+        def developer(wt: Path, message: str) -> str:
+            commit(wt, "ok", "", "fix CI")
+            return "PASS"
+
+        sessions.developer = developer
+        task, _ = await start(service, sessions, repo)
+        await run_until(scheduler, service, task.id, lambda t: t.pr_number is not None)
+        _push_to_main(tmp_path, "sibling", "other.txt", "o\n")  # main moved, CI still red
+        red = await run_until(scheduler, service, task.id, lambda t: t.ci_attempts == 1, 20)
+        # the branch was brought up to date before the fix attempt was counted
+        pr = gh_state_of(gh_state)["prs"][str(red.pr_number)]
+        calls = [c[:2] for c in gh_state_of(gh_state)["calls"]]
+        assert ["pr", "update-branch"] in calls and pr["head"] == red.branch
+        wt = sessions.worktrees[task.root_session_id or ""]
+        assert (wt / "other.txt").exists()
+        assert "FAILED: file ok is missing" in sessions.messages[0][1]
