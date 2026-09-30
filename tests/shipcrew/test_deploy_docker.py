@@ -459,3 +459,17 @@ def test_a_loopback_tunnel_url_only_counts_in_local_e2e_mode(tmp_path: Path) -> 
     local = TunnelExposure(tmp_path, cloudflared=lambda: None, allow_local_url=True)
     assert strict._url_patterns == [TUNNEL_URL]
     assert local._url_patterns == [TUNNEL_URL, LOCAL_TUNNEL_URL]
+
+
+def test_a_child_reaped_elsewhere_is_still_alive(tmp_path: Path) -> None:
+    # Live run 5: poll() said 0 (ECHILD) 2 ms after start, the tunnel was declared dead.
+    sup = Supervised(tmp_path / "s.json", tmp_path / "s.log")
+    pid = sup.start(["sleep", "30.5"])
+    try:
+        os.waitpid(pid, os.WNOHANG)  # still running: nothing reaped
+        sup._children[pid].returncode = 0  # what poll() reports after ECHILD
+        assert sup.alive()
+    finally:
+        os.killpg(pid, signal.SIGKILL)
+        os.waitpid(pid, 0)
+    assert not sup.alive()

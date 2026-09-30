@@ -124,8 +124,10 @@ class Supervised:
             return False
         child = self._children.get(pid)
         if child is not None and child.poll() is not None:
+            # Reaped. poll() alone is not proof of death: it reports 0 on ECHILD
+            # (someone else reaped it, or a live run: a 2 ms "dead" tunnel), so
+            # /proc decides below: a reaped pid is gone, a zombie has no cmdline.
             self._children.pop(pid, None)
-            return False
         line = _cmdline(pid)
         return bool(line) and (line == "?" or str(argv[-1]) in (line or ""))
 
