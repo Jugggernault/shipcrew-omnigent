@@ -5,7 +5,7 @@ A ready task starts only when every gate passes:
 1. **deps** — every ``depends_on`` task is ``merged``;
 2. **capacity** — fewer than ``max_parallel`` tasks are agent-active;
 3. **overlap** — no active task in the same repo owns an overlapping path;
-4. **budget** — the summed task cost is below ``max_usd``.
+4. **budget** — the summed task cost of the task's mission is below ``max_usd``.
 
 Each gate returns ``None`` when it passes, or a human-readable reason that the
 scheduler writes to ``blocked_reason``.
@@ -138,6 +138,10 @@ class GateContext:
     def spent_usd(self) -> float:
         return sum(t.cost_usd for t in self.tasks_by_id.values())
 
+    def mission_spent_usd(self, mission_id: str) -> float:
+        """Spend of one mission: the budget is per mission, not across all of them."""
+        return sum(t.cost_usd for t in self.tasks_by_id.values() if t.mission_id == mission_id)
+
 
 def evaluate_gates(task: Task, ctx: GateContext) -> str | None:
     """First failing gate's reason, or ``None`` when the task may start."""
@@ -145,7 +149,7 @@ def evaluate_gates(task: Task, ctx: GateContext) -> str | None:
         deps_gate(task, ctx.tasks_by_id)
         or capacity_gate(len(ctx.agent_active), ctx.max_parallel)
         or overlap_gate(task, ctx.path_holders, ctx.repo_of)
-        or budget_gate(ctx.spent_usd, ctx.max_usd)
+        or budget_gate(ctx.mission_spent_usd(task.mission_id), ctx.max_usd)
     )
 
 

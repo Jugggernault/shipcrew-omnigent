@@ -168,6 +168,12 @@ class TestEvaluateGates:
         task = _t("a", status="ready", owned_paths=["p3/**"])
         assert evaluate_gates(task, self._ctx(done, rev, task)) == "budget: $10.00 spent of $10.00"
 
+    def test_budget_is_per_mission(self) -> None:
+        # Live run 5: finished missions' spend blocked a brand-new mission.
+        other = _t("old", mission_id="m2", status="merged", cost_usd=30.0, owned_paths=["q/**"])
+        task = _t("a", status="ready", owned_paths=["p3/**"])
+        assert evaluate_gates(task, self._ctx(other, task)) is None
+
 
 class TestFindCycle:
     def test_self_dependency(self) -> None:
