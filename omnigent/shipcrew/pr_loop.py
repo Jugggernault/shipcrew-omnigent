@@ -13,7 +13,10 @@ Per card, in order:
    (acceptance checklist, ``Closes #<issue>``), store ``pr_number``/``pr_url``.
 2. **Sync.** The worktree head differs from the PR head: push new developer
    commits (a CI or review fix), or fast-forward to commits GitHub added.
-3. **CI.** ``gh pr checks``: pending waits; red sends the failing logs to the
+3. **CI.** ``gh pr checks``: pending waits; red on a branch that lacks
+   commits of ``origin/<base>`` first updates the branch from main (``gh pr
+   update-branch``; a conflict goes to the integrator) and re-runs CI, with no
+   fix attempt counted; otherwise red sends the failing logs to the
    developer as a new turn (card back to ``running``), at most
    :data:`MAX_CI_FIX_ATTEMPTS` times, then ``intervention``. No checks = green.
 4. **Review.** A fresh read-only reviewer child session per head SHA. Its last
@@ -52,7 +55,7 @@ from typing import TYPE_CHECKING, Any
 
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.shipcrew import gh, main_deps
-from omnigent.shipcrew.branches import task_branch
+from omnigent.shipcrew.branches import BRANCH_PREFIX, task_branch
 from omnigent.shipcrew.decisions import merge_decisions, parse_decisions
 from omnigent.shipcrew.policies import paths_outside_owned
 from omnigent.shipcrew.review_policy import (
@@ -361,6 +364,8 @@ def reviewer_prompt(
         lines += ["", "Acceptance criteria:", *(f"- {a}" for a in task.acceptance)]
     if task.owned_paths:
         lines += ["", "Owned paths: " + ", ".join(f"`{p}`" for p in task.owned_paths)]
+    # The developer's Decisions: where a new dependency must be justified.
+    lines += ["", "Developer decisions:", *(f"- {d}" for d in task.decisions or ["none"])]
     lines += [
         "",
         "## Output format",
@@ -461,6 +466,13 @@ def _is_clean_base_merge(cwd: Path, old: str, new: str, base_ref: str) -> bool:
     merged = _git(["merge-tree", "--write-tree", old, other], cwd, check=False)
     tree = merged.stdout.split("\n", 1)[0].strip() if merged.returncode == 0 else ""
     return bool(tree) and tree == _rev_tree(cwd, new)
+
+
+def _behind_base(cwd: Path, base: str, base_ref: str) -> bool:
+    """Whether ``base_ref`` (freshly fetched) has commits ``HEAD`` lacks."""
+    _fetch(cwd, base)
+    r = _git(["rev-list", "--count", f"HEAD..{base_ref}"], cwd, check=False)
+    return r.returncode == 0 and int(r.stdout.strip() or 0) > 0
 
 
 def _rev_tree(cwd: Path, ref: str) -> str | None:
@@ -820,7 +832,7 @@ class PrLoop:
         if checks.state == "pending":
             return await self._update(task, ci="pending", blocked_reason=None)
         if checks.state == "red":
-            return await self._ci_red(ctx, checks)
+            return await self._ci_red(ctx, checks, pr.head_sha)
         task = await self._update(task, ci="green", blocked_reason=None)
         ctx = _replace(ctx, task)
         if not task.human_approved:
@@ -894,9 +906,12 @@ class PrLoop:
             return await self._block(
                 ctx, f"developer reported PASS but {ctx.branch} has no commits"
             )
+        if (refused := _unsafe_push_branch(ctx)) is not None:
+            return await self._hold(ctx, refused)
         await self._io(
             _git, ["push", "-u", "origin", f"HEAD:refs/heads/{ctx.branch}"], ctx.worktree
         )
+        pushed = await self._io(_rev, ctx.worktree, "HEAD")
         number = await self._io(gh.pr_for_branch, ctx.repo, ctx.branch)
         if number is None:
             number, url = await self._io(
@@ -917,6 +932,7 @@ class PrLoop:
             branch=ctx.branch,
             ci="pending",
             blocked_reason=None,
+            pushed_sha=pushed,
         )
 
     # ── 2. sync ──
@@ -939,6 +955,7 @@ class PrLoop:
                 blocked_reason=None,
                 review_sha=remote if carry else task.review_sha,
                 human_approved=task.human_approved and clean,
+                pushed_sha=remote,
             )
         if not integrated:
             verdict = await self._developer_verdict(ctx)
@@ -948,20 +965,60 @@ class PrLoop:
                 )
             if verdict[0] != "pass":
                 return await self._block(ctx, f"developer did not pass its fix turn: {verdict[1]}")
+        if (refused := _unsafe_push_branch(ctx)) is not None:
+            return await self._hold(ctx, refused)
+        # The task branch is the loop's own: a developer that rebased it (a CI
+        # fix onto main) rewrote it, so the push may replace the PR head, but
+        # only if the remote is still what the loop last pushed or followed.
+        # A human push since then fails the lease and holds the card.
+        lease = task.pushed_sha or remote
         push = await self._io(
-            _git, ["push", "origin", f"HEAD:refs/heads/{ctx.branch}"], ctx.worktree, check=False
+            _git,
+            [
+                "push",
+                f"--force-with-lease=refs/heads/{ctx.branch}:{lease}",
+                "origin",
+                f"HEAD:refs/heads/{ctx.branch}",
+            ],
+            ctx.worktree,
+            check=False,
         )
         if push.returncode:
             detail = (push.stderr or push.stdout).strip()[-500:]
+            if "stale info" in detail or (remote and remote != lease):
+                return await self._hold(
+                    ctx,
+                    f"push of {ctx.branch} refused: the PR branch moved on GitHub since "
+                    f"shipcrew last pushed it (expected {lease[:8]}, found "
+                    f"{(remote or 'unknown')[:8]}); someone else pushed to it. Bring their "
+                    "commits into the task worktree (or drop them on GitHub), then retry.",
+                )
             return await self._hold(ctx, f"push of {ctx.branch} rejected: {detail}")
         # New commits from this worktree (a developer fix, or the integrator's
         # conflict resolution): the head changed, so review and approval start over.
-        return await self._update(task, ci="pending", blocked_reason=None, human_approved=False)
+        return await self._update(
+            task, ci="pending", blocked_reason=None, human_approved=False, pushed_sha=local
+        )
 
     # ── 3. CI ──
 
-    async def _ci_red(self, ctx: _Ctx, checks: gh.ChecksStatus) -> Task:
+    async def _ci_red(self, ctx: _Ctx, checks: gh.ChecksStatus, head: str) -> Task:
         task = ctx.task
+        assert task.pr_number is not None and ctx.worktree is not None
+        if await self._io(_behind_base, ctx.worktree, ctx.base, ctx.base_ref):
+            # Live run 4: CI was red because the branch predated a sibling's
+            # merge (its stub answered 501). Bring main in and re-run CI before
+            # the developer spends a fix attempt on it.
+            outcome, detail = await self._io(gh.update_branch_status, ctx.repo, task.pr_number)
+            if outcome == "conflict":
+                return await self._start_integrator(ctx)
+            if outcome == "ok":
+                after = await self._io(gh.pr_view, ctx.repo, task.pr_number)
+                if after.head_sha and after.head_sha != head:
+                    _logger.info("shipcrew pr loop: %s: branch updated from main", task.id)
+                    return await self._sync_branch(ctx, head, after.head_sha, integrated=True)
+            else:
+                _logger.warning("shipcrew pr loop: %s: update-branch: %s", task.id, detail)
         if task.ci_attempts >= MAX_CI_FIX_ATTEMPTS:
             return await self._hold(
                 ctx,
@@ -1313,6 +1370,17 @@ class PrLoop:
             await self._stop(ctx, task.reviewer_session_id)
             fields["review_sha"] = None
         return await self._send(ctx, human_feedback_prompt(message), **fields)
+
+
+def _unsafe_push_branch(ctx: _Ctx) -> str | None:
+    """Why the loop must not push ``ctx.branch`` (``None``: it is the task's own).
+
+    The loop force-pushes (with a lease) only its task branch
+    ``shipcrew/<id8>-<slug>``, never the base or any other branch.
+    """
+    if ctx.branch == ctx.base or not ctx.branch.startswith(BRANCH_PREFIX):
+        return f"refusing to push {ctx.branch!r}: not a shipcrew task branch"
+    return None
 
 
 def _replace(ctx: _Ctx, task: Task) -> _Ctx:

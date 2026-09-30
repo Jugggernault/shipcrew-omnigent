@@ -37,6 +37,14 @@ _INTERNAL_BASE_URL = "http://127.0.0.1"
 _BUNDLE_SKIP_DIRS = {".git", "__pycache__", "node_modules", ".venv"}
 _RUNNER_ONLINE_TIMEOUT_S = 60.0
 _RUNNER_POLL_S = 0.25
+# A first turn the runner rejects before any agent output (live: claude-sdk's
+# "turn failed (status 204)", code runner_error, a duplicate-delivery race
+# right after session create) is re-sent once after this pause.
+_FIRST_TURN_RETRY_CODE = "runner_error"
+_FIRST_TURN_RETRY_BACKOFF_S = 2.0
+# After the re-send, a still-"failed" snapshot is the stale first failure for
+# this long (the retried turn has not reached the runner yet).
+_FIRST_TURN_RETRY_GRACE_S = 30.0
 _TRUST_LOCK = threading.Lock()
 
 
@@ -129,6 +137,8 @@ class SessionSnapshot:
     pending_ask: dict[str, str] | None = None
     # Its ``elicitation_id``: one intervention per prompt, however often it is polled.
     pending_ask_id: str | None = None
+    # ``last_task_error.code`` (e.g. ``"runner_error"``), when the session failed.
+    error_code: str | None = None
 
 
 class SessionService(Protocol):
@@ -280,6 +290,10 @@ class OmnigentSessionService:
         # One lock per repository around `git worktree add`: parallel starts
         # on the same repo race on its .git (index/config/ref locks).
         self._worktree_locks: dict[str, asyncio.Lock] = {}
+        # First prompt of each session this service created, until the agent
+        # answers: re-sent once if the runner rejects that first turn.
+        # ponytail: in-memory, a restart loses the retry (the failure surfaces).
+        self._first_prompts: dict[str, _FirstPrompt] = {}
 
     def _worktree_lock(self, repo_path: str) -> asyncio.Lock:
         key = posixpath.normpath(repo_path)
@@ -432,6 +446,7 @@ class OmnigentSessionService:
             try:
                 await self._wait_runner_online(client, session_id, headers)
                 await self._post_message(client, session_id, request.prompt, headers)
+                self._first_prompts[session_id] = _FirstPrompt(request.prompt)
             except BaseException:
                 # The caller never learns this id: end the session, or its
                 # runner lingers unowned by any card.
@@ -528,6 +543,7 @@ class OmnigentSessionService:
             raise SessionServiceError(f"prompt dispatch failed: {_error_detail(sent)}")
 
     async def send_message(self, session_id: str, text: str, *, acting_user: str | None) -> None:
+        self._first_prompts.pop(session_id, None)  # a later turn: not a first-turn failure
         async with self._client() as client:
             await self._post_message(client, session_id, text, self._auth_headers(acting_user))
 
@@ -587,6 +603,7 @@ class OmnigentSessionService:
             try:
                 await self._wait_runner_online(client, session_id, headers)
                 await self._post_message(client, session_id, request.prompt, headers)
+                self._first_prompts[session_id] = _FirstPrompt(request.prompt)
             except BaseException:
                 with contextlib.suppress(Exception):
                     await self.stop(session_id, acting_user=request.acting_user)
@@ -625,6 +642,7 @@ class OmnigentSessionService:
     async def stop(self, session_id: str, *, acting_user: str | None) -> None:
         # stop_session kills the harness process (claude's tmux pane) and the
         # host runner launched for it; an interrupt alone leaves both alive.
+        self._first_prompts.pop(session_id, None)
         async with self._client() as client:
             response = await client.post(
                 f"/v1/sessions/{session_id}/events",
@@ -648,6 +666,9 @@ class OmnigentSessionService:
             if response.status_code >= 400:
                 raise SessionServiceError(f"session read failed: {_error_detail(response)}")
             snap = snapshot_from_payload(response.json())
+            if snap.status == "failed" and session_id in self._first_prompts:
+                headers = self._auth_headers(acting_user)
+                return await self._retry_first_turn(client, session_id, snap, headers)
             if snap.status != "idle":
                 return snap
             # An idle root may still be waiting on background agents / shells.
@@ -667,7 +688,72 @@ class OmnigentSessionService:
         if items.status_code >= 400:
             raise SessionServiceError(f"session items read failed: {_error_detail(items)}")
         latest = (items.json().get("data") or [None])[0]
-        return dataclasses.replace(snap, agent_replied=_is_agent_item(latest))
+        replied = _is_agent_item(latest)
+        if replied:
+            self._first_prompts.pop(session_id, None)
+        return dataclasses.replace(snap, agent_replied=replied)
+
+    async def _retry_first_turn(
+        self,
+        client: httpx.AsyncClient,
+        session_id: str,
+        snap: SessionSnapshot,
+        headers: dict[str, str],
+    ) -> SessionSnapshot:
+        """Re-send a first prompt the runner rejected before any agent output, once.
+
+        The session then reads as ``running`` (a plan stays ``running``, a card
+        is not failed); a failure after the retry is reported as is.
+        """
+        first = self._first_prompts[session_id]
+        now = asyncio.get_running_loop().time()
+        if first.retried_at is not None:
+            if now - first.retried_at < _FIRST_TURN_RETRY_GRACE_S and not await self._has_output(
+                client, session_id, headers
+            ):
+                return dataclasses.replace(snap, status="running", error=None, error_code=None)
+            self._first_prompts.pop(session_id, None)
+            return snap
+        if snap.error_code != _FIRST_TURN_RETRY_CODE or await self._has_output(
+            client, session_id, headers
+        ):
+            self._first_prompts.pop(session_id, None)
+            return snap
+        _logger.warning(
+            "shipcrew: first turn of session %s failed (%s); re-sending it once",
+            session_id,
+            snap.error,
+        )
+        await asyncio.sleep(_FIRST_TURN_RETRY_BACKOFF_S)
+        try:
+            await self._post_message(client, session_id, first.text, headers)
+        except SessionServiceError as exc:
+            _logger.warning("shipcrew: first-turn retry of %s failed: %s", session_id, exc)
+            self._first_prompts.pop(session_id, None)
+            return snap
+        first.retried_at = asyncio.get_running_loop().time()
+        return dataclasses.replace(snap, status="running", error=None, error_code=None)
+
+    async def _has_output(
+        self, client: httpx.AsyncClient, session_id: str, headers: dict[str, str]
+    ) -> bool:
+        """Whether the agent produced any transcript item yet (unknown counts as yes)."""
+        items = await client.get(
+            f"/v1/sessions/{session_id}/items",
+            params={"limit": 50, "order": "desc"},
+            headers=headers,
+        )
+        if items.status_code >= 400:
+            return True
+        return any(_is_agent_item(item) for item in items.json().get("data") or [])
+
+
+@dataclass
+class _FirstPrompt:
+    """A session's first prompt, kept for one automatic re-send."""
+
+    text: str
+    retried_at: float | None = None
 
 
 def _pretrust_claude_workspace(workspace: str) -> None:
@@ -783,4 +869,5 @@ def snapshot_from_payload(payload: dict[str, Any]) -> SessionSnapshot:
         pending_ask_id=str(ask_id) if ask_id else None,
         cost_usd=float(cost) if isinstance(cost, int | float) else None,
         error=str(error.get("message") or error) if isinstance(error, dict) else None,
+        error_code=str(error["code"]) if isinstance(error, dict) and error.get("code") else None,
     )

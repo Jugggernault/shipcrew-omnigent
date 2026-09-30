@@ -1408,3 +1408,135 @@ class TestVerdictNudge:
         done = await fresh.require_task(task.id)
         assert done.status == "blocked"
         assert [m[1] for m in sessions.messages] == [pr_loop.VERDICT_NUDGE]
+
+
+# ── round 8: rewritten task branches, stale branches ────────────
+
+
+def _push_to_main(tmp_path: Path, name: str, path: str, content: str) -> str:
+    """A sibling merge: a commit lands on origin/main from another clone."""
+    other = tmp_path / name
+    if not other.exists():
+        git(tmp_path, "clone", "-q", str(tmp_path / "origin.git"), str(other))
+    git(other, "pull", "-q", "origin", "main")
+    sha = commit(other, path, content, f"sibling {path}")
+    git(other, "push", "-q", "origin", "HEAD:main")
+    return sha
+
+
+class TestPushLease:
+    async def test_a_rebased_branch_replaces_the_pr_head(
+        self,
+        service: ShipcrewService,
+        sessions: LoopSessions,
+        repo: Path,
+        scheduler: ShipcrewScheduler,
+        tmp_path: Path,
+    ) -> None:
+        # Live run 4: in its CI-fix turn the developer rebased onto main; a
+        # plain push was rejected (non-fast-forward) and the card was held.
+        def developer(wt: Path, message: str) -> str:
+            _push_to_main(tmp_path, "sibling", "sibling.txt", "s\n")
+            git(wt, "fetch", "-q", "origin", "main")
+            git(wt, "rebase", "-q", "origin/main")
+            commit(wt, "ok", "", "fix CI")
+            return "Rebased and fixed.\nPASS"
+
+        sessions.developer = developer
+        task, wt = await start(service, sessions, repo)
+        opened = await run_until(scheduler, service, task.id, lambda t: t.pr_number is not None)
+        first_head = git(wt, "rev-parse", "HEAD")
+        assert opened.pushed_sha == first_head
+        merged = await run_until(scheduler, service, task.id, status_is("merged"), 20)
+        assert merged.ci_attempts == 1 and not merged.interventions
+        assert (repo / "sibling.txt").exists() and (repo / "ok").exists()
+
+    async def test_a_human_push_since_the_last_push_holds_the_card(
+        self,
+        service: ShipcrewService,
+        sessions: LoopSessions,
+        repo: Path,
+        scheduler: ShipcrewScheduler,
+        tmp_path: Path,
+    ) -> None:
+        human = tmp_path / "human"
+
+        def developer(wt: Path, message: str) -> str:
+            # While the developer fixes CI, a human pushes to the PR branch.
+            branch = git(wt, "rev-parse", "--abbrev-ref", "HEAD")
+            git(tmp_path, "clone", "-q", "-b", branch, str(tmp_path / "origin.git"), str(human))
+            commit(human, "human.txt", "h\n", "human fix")
+            git(human, "push", "-q", "origin", branch)
+            commit(wt, "ok", "", "fix CI")
+            return "PASS"
+
+        sessions.developer = developer
+        task, _ = await start(service, sessions, repo)
+        held = await run_until(scheduler, service, task.id, status_is("intervention"), 20)
+        assert "moved on GitHub since shipcrew last pushed it" in (held.blocked_reason or "")
+        assert "someone else pushed" in (held.blocked_reason or "")
+        remote = git(repo, "ls-remote", "origin", f"refs/heads/{held.branch}").split()[0]
+        assert remote == git(human, "rev-parse", "HEAD")  # the human commit survived
+
+    async def test_the_loop_never_pushes_a_non_task_branch(
+        self,
+        service: ShipcrewService,
+        sessions: LoopSessions,
+        repo: Path,
+        scheduler: ShipcrewScheduler,
+    ) -> None:
+        task, _ = await start(service, sessions, repo, files={"ok": ""})
+        await asyncio.to_thread(service.store.update_task, task.id, branch="main")
+        loop = pr_loop.PrLoop(service)
+        ctx = await loop._context(await service.require_task(task.id))
+        assert pr_loop._unsafe_push_branch(ctx) is not None
+        assert pr_loop._unsafe_push_branch(dataclasses.replace(ctx, branch="feature/x"))
+        good = dataclasses.replace(ctx, branch=f"shipcrew/{task.id[:8]}-add-feature")
+        assert pr_loop._unsafe_push_branch(good) is None
+
+
+class TestStaleBranch:
+    async def test_red_ci_on_a_stale_branch_updates_from_main_first(
+        self,
+        service: ShipcrewService,
+        sessions: LoopSessions,
+        repo: Path,
+        scheduler: ShipcrewScheduler,
+        gh_state: Path,
+        tmp_path: Path,
+    ) -> None:
+        # Live run 4: red twice because the branch predated a sibling's merge.
+        # Here the sibling merge is exactly what makes CI green.
+        task, _ = await start(service, sessions, repo)
+        await run_until(scheduler, service, task.id, lambda t: t.pr_number is not None)
+        _push_to_main(tmp_path, "sibling", "ok", "")
+        merged = await run_until(scheduler, service, task.id, status_is("merged"), 20)
+        assert merged.ci_attempts == 0 and sessions.messages == []
+        calls = [c[:2] for c in gh_state_of(gh_state)["calls"]]
+        assert ["pr", "update-branch"] in calls
+
+    async def test_an_up_to_date_branch_gets_the_logs(
+        self,
+        service: ShipcrewService,
+        sessions: LoopSessions,
+        repo: Path,
+        scheduler: ShipcrewScheduler,
+        gh_state: Path,
+        tmp_path: Path,
+    ) -> None:
+        def developer(wt: Path, message: str) -> str:
+            commit(wt, "ok", "", "fix CI")
+            return "PASS"
+
+        sessions.developer = developer
+        task, _ = await start(service, sessions, repo)
+        await run_until(scheduler, service, task.id, lambda t: t.pr_number is not None)
+        _push_to_main(tmp_path, "sibling", "other.txt", "o\n")  # main moved, CI still red
+        red = await run_until(scheduler, service, task.id, lambda t: t.ci_attempts == 1, 20)
+        # the branch was brought up to date before the fix attempt was counted
+        pr = gh_state_of(gh_state)["prs"][str(red.pr_number)]
+        calls = [c[:2] for c in gh_state_of(gh_state)["calls"]]
+        assert ["pr", "update-branch"] in calls and pr["head"] == red.branch
+        wt = sessions.worktrees[task.root_session_id or ""]
+        assert (wt / "other.txt").exists()
+        assert "FAILED: file ok is missing" in sessions.messages[0][1]

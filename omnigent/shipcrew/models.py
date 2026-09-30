@@ -165,6 +165,11 @@ class SqlTask(ShipcrewBase):
     # Paths outside owned_paths a human accepted a write to (owned-paths ASK):
     # the merge gate does not hold the PR again for them.
     approved_paths: Mapped[list[Any] | None] = mapped_column(JSON, nullable=True)
+    # ── sc0008ps ──
+    # PR head the loop last pushed or followed on the remote: the lease of its
+    # next ``git push --force-with-lease`` (a rewritten branch replaces it, a
+    # human push since then is detected).
+    pushed_sha: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
     __table_args__ = (
         CheckConstraint(_in_check("status", TASK_STATUSES), name="ck_shipcrew_tasks_status"),
