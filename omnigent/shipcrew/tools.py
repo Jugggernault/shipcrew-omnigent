@@ -92,6 +92,32 @@ def _needs_tunnel() -> bool:
     )
 
 
+def _argocd_target() -> bool:
+    return _deploy_target() == "argocd"
+
+
+# Static binaries into ~/.local/bin, no sudo (linux/darwin, amd64/arm64).
+_ARCH = (
+    'a=$(uname -m); case "$a" in x86_64) a=amd64;; aarch64|arm64) a=arm64;; esac; '
+    "os=$(uname -s | tr A-Z a-z); mkdir -p ~/.local/bin; "
+)
+_KUBECTL_INSTALL = (
+    _ARCH + "curl -fsSL -o ~/.local/bin/kubectl "
+    '"https://dl.k8s.io/release/$(curl -fsSL https://dl.k8s.io/release/stable.txt)'
+    '/bin/$os/$a/kubectl" && chmod +x ~/.local/bin/kubectl'
+)
+_ARGOCD_INSTALL = (
+    _ARCH + "curl -fsSL -o ~/.local/bin/argocd "
+    '"https://github.com/argoproj/argo-cd/releases/latest/download/argocd-$os-$a" '
+    "&& chmod +x ~/.local/bin/argocd"
+)
+_K3D_INSTALL = (
+    _ARCH + "curl -fsSL -o ~/.local/bin/k3d "
+    '"https://github.com/k3d-io/k3d/releases/latest/download/k3d-$os-$a" '
+    "&& chmod +x ~/.local/bin/k3d"
+)
+
+
 def registry() -> list[Tool]:
     return [
         Tool(
@@ -181,6 +207,33 @@ def registry() -> list[Tool]:
             ("version",),
             "installed by the VPS setup script (only with SHIPCREW_PUBLIC_BASE_DOMAIN)",
             required=False,
+        ),
+        Tool(
+            "KUBECTL",
+            "kubectl (argocd deploy target)",
+            ("kubectl",),
+            ("version", "--client"),
+            _KUBECTL_INSTALL + "   (or SHIPCREW_DEPLOY_TARGET=vercel)",
+            required=_argocd_target(),
+            install=_KUBECTL_INSTALL,
+        ),
+        Tool(
+            "ARGOCD",
+            "argocd CLI (debugging the argocd target)",
+            ("argocd",),
+            ("version", "--client"),
+            _ARGOCD_INSTALL,
+            required=False,
+            install=_ARGOCD_INSTALL,
+        ),
+        Tool(
+            "K3D",
+            "k3d (local ArgoCD proof cluster)",
+            ("k3d",),
+            ("version",),
+            _K3D_INSTALL,
+            required=False,
+            install=_K3D_INSTALL,
         ),
         Tool(
             "STRIX",

@@ -1,0 +1,22 @@
+# Traefik (bundled with k3s) routes the host; cert-manager issues the TLS
+# certificate (ClusterIssuer "letsencrypt", HTTP-01) - both set up by the VPS installer.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: app
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt
+spec:
+  tls:
+    - hosts: [app.invalid]
+      secretName: app-tls
+  rules:
+    - host: app.invalid
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: app
+                port: { name: http }

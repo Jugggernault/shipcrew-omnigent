@@ -1,0 +1,70 @@
+# Installed by shipcrew (omnigent/shipcrew/gitops_install.py) for the argocd deploy target.
+# Builds the image, pushes it to GHCR with the built-in GITHUB_TOKEN (no secret to add),
+# and for main points the production preview at it:
+#   ghcr.io/<owner>/<repo>:<sha>   (PR previews use the PR head SHA; ArgoCD picks them up)
+#   main -> branch gitops/main = main + one commit "deploy: <sha>" setting newTag.
+# The tag is bumped on gitops/main, never on main: main is protected (required check `ci`),
+# and a bot commit on main would make every open PR out of date.
+name: gitops
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: write
+  packages: write
+concurrency:
+  group: gitops-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  image:
+    # Same-repo PRs only: a fork's token cannot push packages.
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ${{ vars.SHIPCREW_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 30
+    env:
+      SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: "${{ github.event.pull_request.head.sha || github.sha }}" }
+      - id: img
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+      # No Dockerfile in the repo: a generic Node one (install, build, `start` on $PORT).
+      - name: default Dockerfile
+        run: |
+          [ -f Dockerfile ] && exit 0
+          printf '%s\n' node_modules .next .git > .dockerignore
+          cat > Dockerfile <<'DOCKERFILE'
+          FROM node:22-alpine
+          WORKDIR /app
+          ENV NEXT_TELEMETRY_DISABLED=1 CI=1
+          RUN corepack enable
+          COPY . .
+          RUN if [ -f pnpm-lock.yaml ]; then pnpm install --frozen-lockfile; \
+              elif [ -f yarn.lock ]; then yarn install --frozen-lockfile; \
+              elif [ -f package-lock.json ]; then npm ci --no-audit --no-fund; \
+              else npm install --no-audit --no-fund; fi \
+           && npm run build --if-present
+          ENV NODE_ENV=production PORT=3000 HOSTNAME=0.0.0.0
+          EXPOSE 3000
+          CMD ["npm", "start"]
+          DOCKERFILE
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with: { registry: ghcr.io, username: "${{ github.actor }}", password: "${{ secrets.GITHUB_TOKEN }}" }
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.img.outputs.name }}:${{ env.SHA }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: point gitops/main at the new image
+        if: github.event_name == 'push'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -B gitops/main
+          sed -i "s|^\( *newTag:\).*|\1 \"$SHA\"|" deploy/k8s/overlays/main/kustomization.yaml
+          git commit -qam "deploy: $SHA"
+          git push -qf origin gitops/main

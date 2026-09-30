@@ -458,7 +458,13 @@ include = ["omnigent*"]
 [tool.setuptools.package-data]
 "omnigent.db" = ["alembic.ini"]
 "omnigent.db.migrations" = ["script.py.mako"]
-"omnigent.shipcrew" = ["templates/*.yml", "templates/Dockerfile.*", "templates/dockerignore"]
+"omnigent.shipcrew" = [
+    "templates/*.yml",
+    "templates/Dockerfile.*",
+    "templates/dockerignore",
+    "templates/gitops/deploy/k8s/**/*.yaml",
+    "templates/gitops/.github/workflows/*.yml",
+]
 "omnigent.resources.examples" = ["*.yaml", "*.sh", "debby/**/*", "polly/**/*"]
 "omnigent.resources.pi_native" = ["*.js"]
 "omnigent.resources.scripts" = ["*.sh"]
